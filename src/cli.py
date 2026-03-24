@@ -1,0 +1,3174 @@
+"""atc CLI — non-interactive subcommands via Typer + Rich."""
+from __future__ import annotations
+
+import asyncio
+import getpass
+import json as _json
+import sys
+from datetime import datetime
+from enum import Enum
+from pathlib import Path
+from typing import Optional
+
+import click
+import typer
+from rich.console import Console
+from rich.table import Table
+from rich import box
+from rich.prompt import Confirm
+
+sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parent / "lib"))
+
+from config import (
+    Config, load_config,
+    secret_set, secret_delete, secret_get, secrets_list,
+    KEYCHAIN_SERVICE,
+)
+from lib.pihole import (
+    fetch_all_status as pihole_fetch_all,
+    set_blocking_all,
+    list_custom_dns,
+    add_custom_dns,
+    remove_custom_dns,
+    trigger_gravity_all,
+)
+from lib.ha import (
+    get_status as ha_get_status,
+    get_entity_state,
+    call_service as ha_call_service,
+    get_stats as ha_get_stats,
+    list_updates as ha_list_updates,
+)
+from lib.proxmox import (
+    fetch_cluster_status, ClusterStatus, GuestInfo,
+    start_guest, stop_guest, restart_guest,
+    list_backups, BackupFile,
+    list_backup_jobs, BackupJob,
+    run_backup_job, backup_guest, find_backup_storage,
+)
+from lib.dsm import fetch_all_dsm
+from lib.tls import check_all_certs, CertStatus
+from lib.ssh import UpdateTarget, run_update, stream_command
+from screens.scripts import _find_scripts, _get_script_description
+
+console = Console()
+
+
+# ── Output format enum ────────────────────────────────────────────────────────
+
+class _Out(str, Enum):
+    table = "table"   # compact, no borders (default)
+    wide  = "wide"    # full columns with metrics
+    json  = "json"    # raw JSON for scripting
+
+
+# ── AliasedGroup (ported from pepper) ────────────────────────────────────────
+
+class AliasedGroup(click.Group):
+    """Click group that supports per-command aliases shown inline in help."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._aliases: dict[str, str] = {}   # alias -> canonical
+
+    def add_alias(self, alias: str, canonical: str) -> None:
+        self._aliases[alias] = canonical
+
+    def get_command(self, ctx, cmd_name):
+        rv = super().get_command(ctx, cmd_name)
+        if rv is not None:
+            return rv
+        canonical = self._aliases.get(cmd_name)
+        if canonical:
+            return super().get_command(ctx, canonical)
+        return None
+
+    def list_commands(self, ctx):
+        return [c for c in super().list_commands(ctx) if c not in self._aliases]
+
+    def format_commands(self, ctx, formatter):
+        alias_for = {v: k for k, v in self._aliases.items()}
+        commands = []
+        for name in self.list_commands(ctx):
+            cmd = self.commands.get(name)
+            if cmd is None or cmd.hidden:
+                continue
+            alias = alias_for.get(name)
+            display = f"{name} ({alias})" if alias else name
+            commands.append((display, cmd.get_short_help_str(limit=formatter.width)))
+        if commands:
+            with formatter.section("Commands"):
+                formatter.write_dl(commands)
+
+
+app = typer.Typer(
+    name="atc",
+    help="Air Traffic Control — homelab management CLI",
+    no_args_is_help=True,
+    rich_markup_mode="rich",
+    add_completion=False,
+)
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _load(cfg_path: Optional[Path] = None) -> Config:
+    try:
+        return load_config(cfg_path)
+    except FileNotFoundError as e:
+        console.print(f"[red]❌  {e}[/]")
+        raise typer.Exit(1)
+
+
+def _fmt_bytes(b: int) -> str:
+    if b >= 1024 ** 3:
+        return f"{b / 1024**3:.1f}G"
+    if b >= 1024 ** 2:
+        return f"{b / 1024**2:.0f}M"
+    return f"{b / 1024:.0f}K"
+
+
+def _fmt_pct(val: float, warn: float = 0.75, crit: float = 0.90) -> str:
+    pct = val * 100
+    color = "red" if val >= crit else ("yellow" if val >= warn else "green")
+    return f"[{color}]{pct:.0f}%[/]"
+
+
+def _fmt_uptime(s: int) -> str:
+    if s <= 0:
+        return "—"
+    d, r = divmod(s, 86400)
+    h, r = divmod(r, 3600)
+    m = r // 60
+    if d > 0:
+        return f"{d}d {h}h"
+    if h > 0:
+        return f"{h}h {m}m"
+    return f"{m}m"
+
+
+def _guest_tags(guest) -> list[str]:
+    raw = guest.tags or ""
+    return [t.strip().lower() for t in raw.replace(",", ";").split(";") if t.strip()]
+
+
+def _resolve_guests(
+    cluster: ClusterStatus,
+    selector: str,
+    label: Optional[str] = None,
+    require_status: Optional[str] = None,
+) -> list[GuestInfo]:
+    """Resolve guests matching selector (name substring, tag, VMID, or '*').
+
+    `require_status`: if set, pre-filters by 'running' / 'stopped' / etc.
+    `label`: applied on top of the selector as an additional tag filter.
+    """
+    pool = cluster.guests
+    if require_status:
+        pool = [g for g in pool if g.status == require_status]
+
+    if selector == "*":
+        matched = list(pool)
+    elif selector.isdigit():
+        vmid = int(selector)
+        matched = [g for g in pool if g.vmid == vmid]
+    else:
+        sel = selector.lower()
+        by_tag  = [g for g in pool if sel in _guest_tags(g)]
+        by_name = [g for g in pool if sel in g.name.lower()]
+        seen: set[int] = set()
+        matched = []
+        for g in by_tag + by_name:
+            if g.vmid not in seen:
+                seen.add(g.vmid)
+                matched.append(g)
+
+    if label:
+        lf = label.lower()
+        matched = [g for g in matched if lf in _guest_tags(g)]
+
+    return matched
+
+
+# ── JSON serializers ──────────────────────────────────────────────────────────
+
+def _nodes_to_json(cluster: ClusterStatus) -> list[dict]:
+    return [
+        {
+            "name": n.name,
+            "online": n.online,
+            "cpu": round(n.cpu, 4),
+            "mem_used": n.mem_used,
+            "mem_total": n.mem_total,
+            "disk_used": n.disk_used,
+            "disk_total": n.disk_total,
+            "uptime": n.uptime,
+        }
+        for n in cluster.nodes
+    ]
+
+
+def _guests_to_json(cluster: ClusterStatus, guest_type: str | None = None) -> list[dict]:
+    guests = [
+        g for g in cluster.guests
+        if guest_type is None or g.type == guest_type
+    ]
+    return [
+        {
+            "vmid": g.vmid,
+            "name": g.name,
+            "type": g.type,
+            "node": g.node,
+            "status": g.status,
+            "cpu": round(g.cpu, 4),
+            "mem": g.mem,
+            "maxmem": g.maxmem,
+            "uptime": g.uptime,
+            "tags": g.tags,
+        }
+        for g in guests
+    ]
+
+
+def _dsm_to_json(dsm_list) -> list[dict]:
+    result = []
+    for d in dsm_list:
+        entry: dict = {"name": d.name, "online": d.online}
+        if d.online:
+            entry.update({
+                "model": d.model,
+                "dsmVersion": d.dsmVersion,
+                "cpu_percent": d.cpu_percent,
+                "mem_percent": d.mem_percent,
+                "volumes": d.volumes,
+            })
+        else:
+            entry["error"] = d.error
+        result.append(entry)
+    return result
+
+
+# ── Table renderers (wide) ────────────────────────────────────────────────────
+
+def _render_nodes_wide(cluster: ClusterStatus) -> None:
+    guest_counts: dict[str, tuple[int, int]] = {}
+    for g in cluster.guests:
+        vm_c, lxc_c = guest_counts.get(g.node, (0, 0))
+        guest_counts[g.node] = (vm_c + 1, lxc_c) if g.type == "qemu" else (vm_c, lxc_c + 1)
+
+    t = Table(title="Proxmox Nodes", box=box.ROUNDED, show_lines=False)
+    t.add_column("Node", style="bold")
+    t.add_column("Status")
+    t.add_column("CPU", justify="right")
+    t.add_column("Memory", justify="right")
+    t.add_column("Disk", justify="right")
+    t.add_column("VMs", justify="right")
+    t.add_column("LXCs", justify="right")
+    t.add_column("Uptime")
+
+    for node in cluster.nodes:
+        if node.online:
+            status = "[green]● online[/]"
+            cpu = _fmt_pct(node.cpu)
+            mem_pct = node.mem_used / node.mem_total if node.mem_total else 0
+            mem = f"{_fmt_pct(mem_pct)} {_fmt_bytes(node.mem_used)}/{_fmt_bytes(node.mem_total)}"
+            disk_pct = node.disk_used / node.disk_total if node.disk_total else 0
+            disk = f"{_fmt_pct(disk_pct)} {_fmt_bytes(node.disk_used)}/{_fmt_bytes(node.disk_total)}"
+            vms, lxcs = guest_counts.get(node.name, (0, 0))
+            uptime = _fmt_uptime(node.uptime)
+        else:
+            status = "[red]● offline[/]"
+            cpu = mem = disk = uptime = "—"
+            vms = lxcs = 0
+        t.add_row(node.name, status, cpu, mem, disk, str(vms), str(lxcs), uptime)
+
+    console.print(t)
+
+
+def _render_guests_wide(cluster: ClusterStatus, guest_type: str | None) -> None:
+    guests = sorted(
+        [g for g in cluster.guests if guest_type is None or g.type == guest_type],
+        key=lambda g: (g.status != "running", g.type, g.name),
+    )
+    if guest_type == "qemu":
+        label, icon = "Virtual Machines", "🖥 "
+    elif guest_type == "lxc":
+        label, icon = "LXC Containers", "📦"
+    else:
+        label, icon = "Guests", "🖥 "
+
+    t = Table(title=f"{icon} {label}", box=box.ROUNDED, show_lines=False)
+    t.add_column("", width=2)
+    t.add_column("Name", style="bold")
+    t.add_column("Type", width=4)
+    t.add_column("VMID", justify="right")
+    t.add_column("Node")
+    t.add_column("Status")
+    t.add_column("CPU", justify="right")
+    t.add_column("Memory", justify="right")
+    t.add_column("Uptime")
+    t.add_column("Tags", style="dim")
+
+    for g in guests:
+        dot = "[green]●[/]" if g.status == "running" else "[dim]●[/]"
+        kind = "lxc" if g.type == "lxc" else "vm "
+        status = f"[green]{g.status}[/]" if g.status == "running" else f"[dim]{g.status}[/]"
+        cpu = f"{g.cpu * 100:.0f}%" if g.status == "running" else "—"
+        mem = (
+            f"{_fmt_bytes(g.mem)}/{_fmt_bytes(g.maxmem)}"
+            if g.status == "running" and g.maxmem > 0 else "—"
+        )
+        uptime = _fmt_uptime(g.uptime) if g.status == "running" else "—"
+        tags = g.tags.replace(";", " ") if g.tags else "—"
+        t.add_row(dot, g.name, kind, str(g.vmid), g.node, status, cpu, mem, uptime, tags)
+
+    console.print(t)
+
+
+def _render_dsm_wide(dsm_list) -> None:
+    t = Table(title="💾 Synology DSM", box=box.ROUNDED)
+    t.add_column("NAS", style="bold")
+    t.add_column("Status")
+    t.add_column("Model")
+    t.add_column("DSM Version")
+    t.add_column("CPU", justify="right")
+    t.add_column("Memory", justify="right")
+    t.add_column("Volumes")
+
+    for dsm in dsm_list:
+        if dsm.online:
+            status = "[green]● online[/]"
+            cpu = _fmt_pct(dsm.cpu_percent / 100)
+            mem = _fmt_pct(dsm.mem_percent / 100)
+            vols = "  ".join(
+                f"{v['name']} {_fmt_pct(v['percent']/100)} ({v['used_gb']}/{v['total_gb']}G)"
+                for v in dsm.volumes
+            ) or "—"
+            t.add_row(dsm.name, status, dsm.model, dsm.dsmVersion, cpu, mem, vols)
+        else:
+            t.add_row(dsm.name, f"[red]● {dsm.error[:30]}[/]", "—", "—", "—", "—", "—")
+
+    console.print(t)
+
+
+# ── Table renderers (compact / table) ────────────────────────────────────────
+
+def _render_nodes_table(cluster: ClusterStatus) -> None:
+    t = Table(box=box.SIMPLE, show_header=True, pad_edge=False)
+    t.add_column("", width=2)
+    t.add_column("Node", style="bold", min_width=16)
+    t.add_column("CPU", justify="right", min_width=6)
+    t.add_column("Mem", justify="right", min_width=6)
+    t.add_column("Uptime", min_width=8)
+
+    for n in cluster.nodes:
+        if n.online:
+            dot = "[green]●[/]"
+            cpu = _fmt_pct(n.cpu)
+            mem_pct = n.mem_used / n.mem_total if n.mem_total else 0
+            mem = _fmt_pct(mem_pct)
+            uptime = _fmt_uptime(n.uptime)
+        else:
+            dot = "[red]●[/]"
+            cpu = mem = uptime = "[dim]—[/]"
+        t.add_row(dot, n.name, cpu, mem, uptime)
+
+    console.print(t)
+
+
+def _render_guests_table(cluster: ClusterStatus, guest_type: str | None, label_filter: str | None = None) -> None:
+    guests = [
+        g for g in cluster.guests
+        if guest_type is None or g.type == guest_type
+    ]
+    if label_filter:
+        lf = label_filter.lower()
+        guests = [g for g in guests if lf in _guest_tags(g)]
+    guests.sort(key=lambda g: (g.status != "running", g.type, g.name))
+
+    t = Table(box=box.SIMPLE, show_header=True, pad_edge=False)
+    t.add_column("", width=2)
+    t.add_column("ID", justify="right", style="dim", min_width=4)
+    t.add_column("Name", style="bold", min_width=20)
+    t.add_column("Type", width=4)
+    t.add_column("Node", min_width=10)
+    t.add_column("Tags", style="dim", min_width=10)
+
+    for g in guests:
+        dot = "[green]●[/]" if g.status == "running" else "[dim]●[/]"
+        kind = "[cyan]lxc[/]" if g.type == "lxc" else "[blue]vm[/] "
+        tags = g.tags.replace(";", " ") if g.tags else "[dim]—[/]"
+        name = g.name if g.status == "running" else f"[dim]{g.name}[/]"
+        t.add_row(dot, str(g.vmid), name, kind, g.node, tags)
+
+    console.print(t)
+
+
+# ── get ───────────────────────────────────────────────────────────────────────
+
+get_app = typer.Typer(help="Query cluster state — nodes, VMs, LXCs, DSM", no_args_is_help=False, rich_markup_mode="rich")
+app.add_typer(get_app, name="get")
+
+
+@get_app.callback(invoke_without_command=True)
+def get_all(
+    ctx: typer.Context,
+    output: _Out = typer.Option(_Out.table, "-o", help="Output format: table | wide | json"),
+) -> None:
+    """Show everything: nodes, VMs, LXCs, and DSM."""
+    if ctx.invoked_subcommand is not None:
+        return
+    cfg = _load()
+    with console.status("[bold]Fetching cluster state…[/]"):
+        cluster = asyncio.run(fetch_cluster_status(cfg.proxmox))
+    with console.status("[bold]Fetching DSM status…[/]"):
+        dsm_list = asyncio.run(fetch_all_dsm(cfg.dsm_instances))
+
+    if output == _Out.json:
+        console.print_json(_json.dumps({
+            "nodes": _nodes_to_json(cluster),
+            "guests": _guests_to_json(cluster),
+            "dsm": _dsm_to_json(dsm_list),
+        }))
+    elif output == _Out.wide:
+        _render_nodes_wide(cluster)
+        _render_guests_wide(cluster, guest_type="qemu")
+        _render_guests_wide(cluster, guest_type="lxc")
+        _render_dsm_wide(dsm_list)
+    else:
+        _render_nodes_table(cluster)
+        _render_guests_table(cluster, guest_type=None)
+
+
+@get_app.command("nodes")
+def get_nodes(
+    output: _Out = typer.Option(_Out.table, "-o", help="Output format: table | wide | json"),
+) -> None:
+    """List Proxmox hypervisor nodes."""
+    cfg = _load()
+    with console.status("[bold]Fetching node status…[/]"):
+        cluster = asyncio.run(fetch_cluster_status(cfg.proxmox))
+
+    if output == _Out.json:
+        console.print_json(_json.dumps(_nodes_to_json(cluster)))
+    elif output == _Out.wide:
+        _render_nodes_wide(cluster)
+    else:
+        _render_nodes_table(cluster)
+
+
+@get_app.command("vms")
+def get_vms(
+    label: Optional[str] = typer.Option(None, "-l", "--label", help="Filter by tag"),
+    output: _Out = typer.Option(_Out.table, "-o", help="Output format: table | wide | json"),
+) -> None:
+    """List virtual machines."""
+    cfg = _load()
+    with console.status("[bold]Fetching VM status…[/]"):
+        cluster = asyncio.run(fetch_cluster_status(cfg.proxmox))
+
+    if output == _Out.json:
+        guests = _guests_to_json(cluster, "qemu")
+        if label:
+            guests = [g for g in guests if label.lower() in [t.lower() for t in (g.get("tags") or "").replace(",", ";").split(";") if t.strip()]]
+        console.print_json(_json.dumps(guests))
+    elif output == _Out.wide:
+        _render_guests_wide(cluster, "qemu")
+    else:
+        _render_guests_table(cluster, "qemu", label_filter=label)
+
+
+@get_app.command("lxcs")
+def get_lxcs(
+    label: Optional[str] = typer.Option(None, "-l", "--label", help="Filter by tag"),
+    output: _Out = typer.Option(_Out.table, "-o", help="Output format: table | wide | json"),
+) -> None:
+    """List LXC containers."""
+    cfg = _load()
+    with console.status("[bold]Fetching LXC status…[/]"):
+        cluster = asyncio.run(fetch_cluster_status(cfg.proxmox))
+
+    if output == _Out.json:
+        guests = _guests_to_json(cluster, "lxc")
+        if label:
+            guests = [g for g in guests if label.lower() in [t.lower() for t in (g.get("tags") or "").replace(",", ";").split(";") if t.strip()]]
+        console.print_json(_json.dumps(guests))
+    elif output == _Out.wide:
+        _render_guests_wide(cluster, "lxc")
+    else:
+        _render_guests_table(cluster, "lxc", label_filter=label)
+
+
+@get_app.command("hosts")
+def get_hosts(
+    label: Optional[str] = typer.Option(None, "-l", "--label", help="Filter by tag"),
+    output: _Out = typer.Option(_Out.table, "-o", help="Output format: table | wide | json"),
+) -> None:
+    """List all guests — VMs and LXC containers combined."""
+    cfg = _load()
+    with console.status("[bold]Fetching guest status…[/]"):
+        cluster = asyncio.run(fetch_cluster_status(cfg.proxmox))
+
+    if output == _Out.json:
+        guests = _guests_to_json(cluster)
+        if label:
+            guests = [g for g in guests if label.lower() in [t.lower() for t in (g.get("tags") or "").replace(",", ";").split(";") if t.strip()]]
+        console.print_json(_json.dumps(guests))
+    elif output == _Out.wide:
+        _render_guests_wide(cluster, None)
+    else:
+        _render_guests_table(cluster, None, label_filter=label)
+
+
+@get_app.command("ls", hidden=True)
+def get_ls(
+    label: Optional[str] = typer.Option(None, "-l", "--label", help="Filter by tag"),
+    output: _Out = typer.Option(_Out.table, "-o", help="Output format: table | wide | json"),
+) -> None:
+    """Alias for 'get hosts'."""
+    get_hosts(label=label, output=output)
+
+
+@get_app.command("dsm")
+def get_dsm(
+    output: _Out = typer.Option(_Out.table, "-o", help="Output format: table | wide | json"),
+) -> None:
+    """List Synology DSM instances."""
+    cfg = _load()
+    with console.status("[bold]Fetching DSM status…[/]"):
+        dsm_list = asyncio.run(fetch_all_dsm(cfg.dsm_instances))
+
+    if output == _Out.json:
+        console.print_json(_json.dumps(_dsm_to_json(dsm_list)))
+    else:
+        _render_dsm_wide(dsm_list)
+
+
+# ── ps (alias: get hosts) ─────────────────────────────────────────────────────
+
+@app.command("ps", hidden=False)
+def ps_cmd(
+    label: Optional[str] = typer.Option(None, "-l", "--label", help="Filter by tag"),
+    output: _Out = typer.Option(_Out.table, "-o", help="Output format: table | wide | json"),
+) -> None:
+    """List running guests — VMs and LXCs. [dim](alias: get hosts)[/dim]"""
+    get_hosts(label=label, output=output)
+
+
+# ── start / stop / restart ────────────────────────────────────────────────────
+
+def _power_action(
+    selector: str,
+    label: Optional[str],
+    yes: bool,
+    require_status: Optional[str],
+    verb: str,
+    action_fn,
+) -> None:
+    cfg = _load()
+    with console.status("[bold]Fetching cluster state…[/]"):
+        cluster = asyncio.run(fetch_cluster_status(cfg.proxmox))
+
+    matched = _resolve_guests(cluster, selector, label, require_status)
+    if not matched:
+        hint = f" with status '{require_status}'" if require_status else ""
+        console.print(f"[yellow]No guests found matching '{selector}'{hint}[/]")
+        raise typer.Exit(1)
+
+    console.print(f"\nGuests to {verb}:")
+    for g in matched:
+        kind = "lxc" if g.type == "lxc" else "vm"
+        console.print(f"  [cyan]•[/] {g.name} [dim]({kind} #{g.vmid} @ {g.node})[/]")
+
+    if not yes and not Confirm.ask(f"\n{verb.capitalize()} {len(matched)} guest(s)?"):
+        raise typer.Exit(0)
+
+    for g in matched:
+        with console.status(f"[bold]{verb.capitalize()}ing {g.name}…[/]"):
+            ok = action_fn(cfg.proxmox, g.node, g.vmid, g.type)
+        icon = "[green]✓[/]" if ok else "[red]✗[/]"
+        result = f"{verb} issued" if ok else "failed"
+        console.print(f"{icon} {g.name} — {result}")
+
+
+@app.command("start")
+def cmd_start(
+    selector: str = typer.Argument(..., help="Name, tag, VMID, or '*'"),
+    label: Optional[str] = typer.Option(None, "-l", "--label", help="Filter by tag"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation"),
+) -> None:
+    """Start stopped guest(s)."""
+    _power_action(selector, label, yes, "stopped", "start", start_guest)
+
+
+@app.command("stop")
+def cmd_stop(
+    selector: str = typer.Argument(..., help="Name, tag, VMID, or '*'"),
+    label: Optional[str] = typer.Option(None, "-l", "--label", help="Filter by tag"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation"),
+) -> None:
+    """Gracefully shut down guest(s)."""
+    _power_action(selector, label, yes, "running", "stop", stop_guest)
+
+
+@app.command("restart")
+def cmd_restart(
+    selector: str = typer.Argument(..., help="Name, tag, VMID, or '*'"),
+    label: Optional[str] = typer.Option(None, "-l", "--label", help="Filter by tag"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation"),
+) -> None:
+    """Restart running guest(s)."""
+    _power_action(selector, label, yes, "running", "restart", restart_guest)
+
+
+# ── update ────────────────────────────────────────────────────────────────────
+
+update_app = typer.Typer(
+    help="Run apt updates on nodes, VMs, or LXCs",
+    no_args_is_help=True,
+    rich_markup_mode="rich",
+)
+app.add_typer(update_app, name="update")
+
+
+@update_app.command("nodes")
+def update_nodes(
+    name: str = typer.Argument("all", help="Node name or 'all'"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation"),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Show full apt output"),
+) -> None:
+    """Run apt upgrade on Proxmox hypervisor nodes.
+
+    SSH hostname resolved via [bold]node_host_pattern[/] in config.yaml
+    (default: [cyan]{name}[/], e.g. [cyan]pve-{name}.local.example.com[/]).
+    """
+    cfg = _load()
+    with console.status("[bold]Fetching cluster state…[/]"):
+        cluster = asyncio.run(fetch_cluster_status(cfg.proxmox))
+
+    online = [n for n in cluster.nodes if n.online]
+
+    if name == "all":
+        matched = online
+    else:
+        matched = [n for n in online if n.name.lower() == name.lower()]
+        if not matched:
+            matched = [n for n in online if name.lower() in n.name.lower()]
+
+    if not matched:
+        console.print(f"[yellow]No online node found matching '{name}'[/]")
+        raise typer.Exit(1)
+
+    targets = [
+        UpdateTarget(name=n.name, host=cfg.ssh.node_host(n.name), user=cfg.ssh.default_user)
+        for n in matched
+    ]
+    _confirm_and_update(targets, cfg, yes, verbose=verbose)
+
+
+@update_app.command("hosts")
+def update_hosts(
+    selector: str = typer.Argument("*", help="Name (substring), tag, VMID, or '*' for all"),
+    label: Optional[str] = typer.Option(None, "-l", "--label", help="Filter by tag (alternative to selector)"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation"),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Show full apt output"),
+) -> None:
+    """Run apt upgrade on VMs and LXC containers.
+
+    [bold]Selector[/] can be:
+      [cyan]*[/]        — all running guests
+      [cyan]101[/]      — guest by VMID
+      [cyan]pihole[/]   — name substring [dim]or[/] exact tag match
+
+    [bold]-l / --label[/] filters by tag (can combine with [cyan]*[/] selector).
+    """
+    cfg = _load()
+    with console.status("[bold]Fetching cluster state…[/]"):
+        cluster = asyncio.run(fetch_cluster_status(cfg.proxmox))
+
+    running = [g for g in cluster.guests if g.status == "running"]
+
+    if selector == "*":
+        matched = running
+    elif selector.isdigit():
+        vmid = int(selector)
+        matched = [g for g in running if g.vmid == vmid]
+        if not matched:
+            console.print(f"[yellow]No running guest with VMID {vmid}[/]")
+            raise typer.Exit(1)
+    else:
+        sel = selector.lower()
+        by_tag  = [g for g in running if sel in _guest_tags(g)]
+        by_name = [g for g in running if sel in g.name.lower()]
+        seen: set[int] = set()
+        matched = []
+        for g in by_tag + by_name:
+            if g.vmid not in seen:
+                seen.add(g.vmid)
+                matched.append(g)
+
+    # Apply -l label filter on top of selector
+    if label:
+        lf = label.lower()
+        matched = [g for g in matched if lf in _guest_tags(g)]
+
+    if not matched:
+        console.print(f"[yellow]No running guests found matching '{selector}'{' with label ' + repr(label) if label else ''}[/]")
+        raise typer.Exit(1)
+
+    targets = [
+        UpdateTarget(
+            name=f"{g.name} [dim]({'lxc' if g.type == 'lxc' else 'vm'} #{g.vmid} @ {g.node})[/dim]",
+            host=g.name,
+            user=cfg.ssh.default_user,
+        )
+        for g in matched
+    ]
+    _confirm_and_update(targets, cfg, yes, verbose=verbose)
+
+
+def _confirm_and_update(targets: list[UpdateTarget], cfg: Config, yes: bool, verbose: bool = False) -> None:
+    console.print("\nTargets to update:")
+    for t in targets:
+        console.print(f"  [cyan]•[/] {t.name}")
+
+    if not yes:
+        if not Confirm.ask(f"\nRun apt upgrade on {len(targets)} target(s)?"):
+            raise typer.Exit(0)
+
+    cmd = _UPDATE_CMD_VERBOSE if verbose else _UPDATE_CMD_QUIET
+
+    async def _run_all() -> None:
+        for target in targets:
+            console.rule(f"[bold]{target.host}[/]")
+            async for line in stream_command(target.host, cmd, cfg.ssh, user=target.user):
+                console.print(f"  {line}")
+            console.print(f"[green]✓[/] {target.host} done\n")
+
+    asyncio.run(_run_all())
+
+
+_UPDATE_CMD_QUIET = (
+    "DEBIAN_FRONTEND=noninteractive apt-get update -q && "
+    "DEBIAN_FRONTEND=noninteractive apt-get upgrade -y -q && "
+    "apt-get autoremove -y -q"
+)
+
+_UPDATE_CMD_VERBOSE = (
+    "DEBIAN_FRONTEND=noninteractive apt-get update && "
+    "DEBIAN_FRONTEND=noninteractive apt-get upgrade -y && "
+    "apt-get autoremove -y"
+)
+
+
+# ── backup ────────────────────────────────────────────────────────────────────
+
+backup_app = typer.Typer(
+    help="List and trigger Proxmox backups",
+    no_args_is_help=True,
+    rich_markup_mode="rich",
+)
+app.add_typer(backup_app, name="backup")
+
+
+@backup_app.command("list")
+def backup_list(
+    label: Optional[str] = typer.Option(None, "-l", "--label", help="Filter by guest tag"),
+    output: _Out = typer.Option(_Out.table, "-o", help="Output format: table | wide | json"),
+) -> None:
+    """List backup files across all cluster nodes.
+
+    [bold]table[/] (default): latest backup per guest.
+    [bold]wide[/]: every individual backup file.
+    """
+    cfg = _load()
+    with console.status("[bold]Fetching cluster state…[/]"):
+        cluster = asyncio.run(fetch_cluster_status(cfg.proxmox))
+    online_nodes = [n.name for n in cluster.nodes if n.online]
+    with console.status("[bold]Fetching backups…[/]"):
+        backups = list_backups(cfg.proxmox, online_nodes)
+
+    name_map = {g.vmid: g.name for g in cluster.guests}
+
+    if label:
+        lf = label.lower()
+        tagged = {g.vmid for g in cluster.guests if lf in _guest_tags(g)}
+        backups = [b for b in backups if b.vmid in tagged]
+
+    if output == _Out.json:
+        console.print_json(_json.dumps([
+            {
+                "vmid": b.vmid,
+                "name": name_map.get(b.vmid, f"vmid-{b.vmid}"),
+                "storage": b.storage,
+                "volid": b.volid,
+                "size": b.size,
+                "ctime": b.ctime,
+                "format": b.fmt,
+                "notes": b.notes,
+            }
+            for b in backups
+        ]))
+        return
+
+    if output == _Out.wide:
+        t = Table(title="Backups", box=box.ROUNDED)
+        t.add_column("VMID", justify="right", style="dim")
+        t.add_column("Name", style="bold")
+        t.add_column("Date")
+        t.add_column("Size", justify="right")
+        t.add_column("Storage")
+        t.add_column("Format", style="dim")
+        for b in backups:
+            dt = datetime.fromtimestamp(b.ctime).strftime("%Y-%m-%d %H:%M") if b.ctime else "—"
+            t.add_row(str(b.vmid), name_map.get(b.vmid, f"vmid-{b.vmid}"), dt,
+                      _fmt_bytes(b.size), b.storage, b.fmt)
+        console.print(t)
+        return
+
+    # Compact: latest backup per VM
+    grouped: dict[int, list[BackupFile]] = {}
+    for b in backups:
+        grouped.setdefault(b.vmid, []).append(b)
+
+    t = Table(box=box.SIMPLE, show_header=True, pad_edge=False)
+    t.add_column("ID", justify="right", style="dim", min_width=4)
+    t.add_column("Name", style="bold", min_width=20)
+    t.add_column("Latest Backup", min_width=16)
+    t.add_column("Size", justify="right", min_width=6)
+    t.add_column("Count", justify="right", min_width=5)
+    t.add_column("Storage", style="dim")
+
+    for vmid in sorted(grouped):
+        files = grouped[vmid]  # sorted by -ctime already
+        latest = files[0]
+        dt = datetime.fromtimestamp(latest.ctime).strftime("%Y-%m-%d %H:%M") if latest.ctime else "—"
+        t.add_row(str(vmid), name_map.get(vmid, f"vmid-{vmid}"), dt,
+                  _fmt_bytes(latest.size), str(len(files)), latest.storage)
+    console.print(t)
+
+
+@backup_app.command("ls", hidden=True)
+def backup_ls(
+    label: Optional[str] = typer.Option(None, "-l", "--label", help="Filter by guest tag"),
+    output: _Out = typer.Option(_Out.table, "-o", help="Output format: table | wide | json"),
+) -> None:
+    """Alias for 'list'."""
+    backup_list(label=label, output=output)
+
+
+@backup_app.command("jobs")
+def backup_jobs() -> None:
+    """List scheduled backup jobs."""
+    cfg = _load()
+    with console.status("[bold]Fetching backup jobs…[/]"):
+        jobs = list_backup_jobs(cfg.proxmox)
+
+    if not jobs:
+        console.print("[dim]No scheduled backup jobs found.[/]")
+        return
+
+    t = Table(box=box.SIMPLE, show_header=True, pad_edge=False)
+    t.add_column("", width=2)
+    t.add_column("ID", style="bold", min_width=16)
+    t.add_column("Schedule", min_width=14)
+    t.add_column("Storage", min_width=10)
+    t.add_column("VMs")
+    t.add_column("Node", style="dim")
+    t.add_column("Comment", style="dim")
+
+    for j in jobs:
+        dot = "[green]●[/]" if j.enabled else "[dim]●[/]"
+        node_str = j.node or "[dim]all[/]"
+        t.add_row(dot, j.id, j.schedule, j.storage, j.vmids, node_str, j.comment or "—")
+    console.print(t)
+    console.print(f"\n[dim]Run a job now: [bold]atc backup trigger <id>[/][/]")
+
+
+@backup_app.command("trigger")
+def backup_trigger(
+    job_id: str = typer.Argument(..., help="Job ID from 'atc backup jobs'"),
+) -> None:
+    """Trigger an immediate run of a scheduled backup job."""
+    cfg = _load()
+    with console.status(f"[bold]Triggering job '{job_id}'…[/]"):
+        ok = run_backup_job(cfg.proxmox, job_id)
+    if ok:
+        console.print(f"[green]✓[/] Job [cyan]{job_id}[/] started.")
+    else:
+        console.print(f"[red]✗[/] Failed to trigger '{job_id}'. Check the ID with [bold]atc backup jobs[/].")
+        raise typer.Exit(1)
+
+
+@backup_app.command("run")
+def backup_run(
+    selector: str = typer.Argument(..., help="Name, tag, VMID, or '*'"),
+    label: Optional[str] = typer.Option(None, "-l", "--label", help="Filter by tag"),
+    storage: Optional[str] = typer.Option(None, "--storage", "-s", help="Backup storage (auto-detected if omitted)"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation"),
+) -> None:
+    """Create an immediate backup of guest(s)."""
+    cfg = _load()
+    with console.status("[bold]Fetching cluster state…[/]"):
+        cluster = asyncio.run(fetch_cluster_status(cfg.proxmox))
+
+    matched = _resolve_guests(cluster, selector, label, require_status="running")
+    if not matched:
+        console.print(f"[yellow]No running guests found matching '{selector}'[/]")
+        raise typer.Exit(1)
+
+    console.print("\nGuests to back up:")
+    for g in matched:
+        kind = "lxc" if g.type == "lxc" else "vm"
+        console.print(f"  [cyan]•[/] {g.name} [dim]({kind} #{g.vmid} @ {g.node})[/]")
+
+    if not yes and not Confirm.ask(f"\nBack up {len(matched)} guest(s)?"):
+        raise typer.Exit(0)
+
+    for g in matched:
+        stor = storage
+        if not stor:
+            with console.status(f"[bold]Finding backup storage on {g.node}…[/]"):
+                stor = find_backup_storage(cfg.proxmox, g.node)
+            if not stor:
+                console.print(f"[red]✗[/] {g.name} — no backup storage found on {g.node}")
+                continue
+
+        with console.status(f"[bold]Backing up {g.name} → {stor}…[/]"):
+            upid = backup_guest(cfg.proxmox, g.node, g.vmid, stor)
+        if upid:
+            console.print(f"[green]✓[/] {g.name} — task started [dim]({upid})[/]")
+        else:
+            console.print(f"[red]✗[/] {g.name} — failed to start backup")
+
+
+# ── run ───────────────────────────────────────────────────────────────────────
+
+@app.command("run")
+def run_script(
+    name: Optional[str] = typer.Argument(None, help="Script name or partial path. Omit to list all."),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Run with bash -v (echo each command)"),
+) -> None:
+    """Run a script from the repo. Omit NAME to list available scripts."""
+    cfg = _load()
+    scripts_dir = cfg.resolved_scripts_dir
+    scripts = _find_scripts(scripts_dir)
+
+    if not name:
+        _list_scripts(scripts, scripts_dir)
+        return
+
+    matches = [
+        s for s in scripts
+        if name.lower() in s.name.lower() or name.lower() in str(s.relative_to(scripts_dir)).lower()
+    ]
+
+    if not matches:
+        console.print(f"[red]No script found matching '{name}'[/]")
+        console.print("Run [bold]atc run[/] (no args) to list available scripts.")
+        raise typer.Exit(1)
+
+    if len(matches) > 1:
+        console.print("[yellow]Multiple matches:[/]")
+        _list_scripts(matches, scripts_dir)
+        console.print("Be more specific.")
+        raise typer.Exit(1)
+
+    script = matches[0]
+    rel = script.relative_to(scripts_dir)
+    console.rule(f"[bold]{rel}[/]")
+
+    import subprocess
+    cmd = ["bash", "-v", str(script)] if verbose else ["bash", str(script)]
+    result = subprocess.run(cmd, cwd=str(script.parent))
+    if result.returncode != 0:
+        console.print(f"\n[red]Exit code: {result.returncode}[/]")
+        raise typer.Exit(result.returncode)
+
+
+def _list_scripts(scripts: list[Path], scripts_dir: Path) -> None:
+    t = Table(title="Available Scripts", box=box.SIMPLE)
+    t.add_column("Script", style="cyan")
+    t.add_column("Description", style="dim")
+    for s in scripts:
+        try:
+            rel = s.relative_to(scripts_dir)
+        except ValueError:
+            rel = s
+        desc = _get_script_description(s)
+        t.add_row(str(rel), desc)
+    console.print(t)
+
+
+# ── secrets ───────────────────────────────────────────────────────────────────
+
+secrets_app = typer.Typer(help="Manage secrets stored in the system keychain", no_args_is_help=False, rich_markup_mode="rich")
+app.add_typer(secrets_app, name="secrets")
+
+
+@secrets_app.callback(invoke_without_command=True)
+def secrets_default(ctx: typer.Context) -> None:
+    """List all secrets stored for atc."""
+    if ctx.invoked_subcommand is None:
+        _secrets_list()
+
+
+@secrets_app.command("list")
+def _secrets_list() -> None:
+    """List all secret keys stored in the keychain."""
+    entries = secrets_list()
+    if not entries:
+        console.print(f"[dim]No secrets stored yet for service '{KEYCHAIN_SERVICE}'.[/]")
+        console.print("Secrets are created automatically on first use of a [bold]keychain:<key>[/] value in config.yaml.")
+        return
+
+    t = Table(title=f"Keychain secrets (service: '{KEYCHAIN_SERVICE}')", box=box.ROUNDED)
+    t.add_column("Key", style="cyan bold")
+    t.add_column("Value (masked)")
+    for key, masked in entries:
+        t.add_row(key, masked)
+    console.print(t)
+
+
+@secrets_app.command("set")
+def secrets_set(
+    key: str = typer.Argument(..., help="Secret key name"),
+    value: Optional[str] = typer.Argument(None, help="Value (prompted securely if omitted)"),
+) -> None:
+    """Set or update a secret in the keychain."""
+    if value is None:
+        value = getpass.getpass(f"Value for '{key}': ").strip()
+        if not value:
+            console.print("[red]Empty value — aborted.[/]")
+            raise typer.Exit(1)
+    secret_set(key, value)
+    console.print(f"[green]✓[/] Stored [cyan]{key!r}[/] in keychain.")
+
+
+@secrets_app.command("delete")
+def secrets_delete(
+    key: str = typer.Argument(..., help="Secret key to remove"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation"),
+) -> None:
+    """Delete a secret from the keychain."""
+    if not yes:
+        if not Confirm.ask(f"Delete secret '{key}'?"):
+            raise typer.Exit(0)
+    if secret_delete(key):
+        console.print(f"[green]✓[/] Deleted [cyan]{key!r}[/].")
+    else:
+        console.print(f"[red]Key '{key}' not found.[/]")
+        raise typer.Exit(1)
+
+
+@secrets_app.command("get")
+def secrets_get_cmd(
+    key: str = typer.Argument(..., help="Secret key to retrieve"),
+) -> None:
+    """Print a secret value (use carefully — prints to stdout)."""
+    val = secret_get(key)
+    if val is None:
+        console.print(f"[red]Key '{key}' not found.[/]")
+        raise typer.Exit(1)
+    console.print(val)
+
+
+@secrets_app.command("ls", hidden=True)
+def secrets_ls() -> None:
+    """Alias for 'list'."""
+    _secrets_list()
+
+
+@secrets_app.command("rm", hidden=True)
+def secrets_rm(
+    key: str = typer.Argument(..., help="Secret key to remove"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation"),
+) -> None:
+    """Alias for 'delete'."""
+    secrets_delete(key=key, yes=yes)
+
+
+# ── pihole ────────────────────────────────────────────────────────────────────
+
+pihole_app = typer.Typer(
+    help="Manage Pi-hole instances",
+    no_args_is_help=True,
+    rich_markup_mode="rich",
+)
+app.add_typer(pihole_app, name="pihole")
+
+pihole_dns_app = typer.Typer(
+    help="Manage custom local DNS records (primary instance, sync propagates)",
+    no_args_is_help=True,
+    rich_markup_mode="rich",
+)
+pihole_app.add_typer(pihole_dns_app, name="dns")
+
+
+
+def _pihole_instances(cfg) -> list:
+    if not cfg.pihole_instances:
+        console.print("[red]No pihole instances configured in config.yaml[/]")
+        raise typer.Exit(1)
+    return cfg.pihole_instances
+
+
+def _pihole_primary(cfg):
+    instances = _pihole_instances(cfg)
+    primary = next((p for p in instances if p.primary), instances[0])
+    return primary
+
+
+def _fmt_blocking(status) -> str:
+    if not status.blocking:
+        if status.timer is not None:
+            return f"[yellow]paused ({status.timer}s remaining)[/]"
+        return "[yellow]paused[/]"
+    return "[green]blocking[/]"
+
+
+@pihole_app.command("status")
+def pihole_status() -> None:
+    """Show status of all Pi-hole instances."""
+    cfg = _load()
+    instances = _pihole_instances(cfg)
+    with console.status("[bold]Querying Pi-hole instances…[/]"):
+        statuses = asyncio.run(pihole_fetch_all(instances))
+
+    t = Table(box=box.SIMPLE, show_header=True, pad_edge=False)
+    t.add_column("", width=2)
+    t.add_column("Instance", style="bold", min_width=14)
+    t.add_column("Host", style="dim", min_width=14)
+    t.add_column("Blocking", min_width=20)
+    t.add_column("Queries", justify="right", min_width=8)
+    t.add_column("Blocked", justify="right", min_width=8)
+    t.add_column("Block%", justify="right", min_width=6)
+    t.add_column("Version", style="dim")
+
+    for s in statuses:
+        if s.online:
+            dot = "[green]●[/]"
+            blocking = _fmt_blocking(s)
+            queries = f"{s.queries_today:,}"
+            blocked = f"{s.blocked_today:,}"
+            pct = f"{s.blocked_pct:.1f}%"
+            ver = s.version or "—"
+        else:
+            dot = "[red]●[/]"
+            blocking = f"[red]offline[/]"
+            queries = blocked = pct = ver = "[dim]—[/]"
+        primary_mark = " [dim](primary)[/]" if getattr(next(
+            (i for i in instances if i.name == s.name), None), "primary", False
+        ) else ""
+        t.add_row(dot, f"{s.name}{primary_mark}", s.host, blocking, queries, blocked, pct, ver)
+
+    online = [s for s in statuses if s.online]
+    if online:
+        total_q = sum(s.queries_today for s in online)
+        total_b = sum(s.blocked_today for s in online)
+        avg_pct = sum(s.blocked_pct for s in online) / len(online)
+        t.add_section()
+        t.add_row(
+            "", "[bold]TOTAL[/]", "", "",
+            f"[bold]{total_q:,}[/]",
+            f"[bold]{total_b:,}[/]",
+            f"[bold]{avg_pct:.1f}%[/]",
+            "",
+        )
+
+    console.print(t)
+
+
+@pihole_app.command("pause")
+def pihole_pause(
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation"),
+) -> None:
+    """Pause DNS blocking indefinitely on ALL instances."""
+    cfg = _load()
+    instances = _pihole_instances(cfg)
+
+    names = ", ".join(i.name for i in instances)
+    console.print(f"Pausing blocking on: [bold]{names}[/]")
+    if not yes and not Confirm.ask("Continue?"):
+        raise typer.Exit(0)
+
+    with console.status("[bold]Pausing…[/]"):
+        results = asyncio.run(set_blocking_all(instances, enabled=False))
+
+    for inst, (ok, err) in zip(instances, results):
+        icon = "[green]✓[/]" if ok else "[red]✗[/]"
+        msg = "blocking paused" if ok else f"failed — {err}"
+        console.print(f"{icon} {inst.name} — {msg}")
+
+
+@pihole_app.command("unpause")
+def pihole_unpause(
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation"),
+) -> None:
+    """Re-enable DNS blocking on ALL instances."""
+    cfg = _load()
+    instances = _pihole_instances(cfg)
+
+    names = ", ".join(i.name for i in instances)
+    console.print(f"Enabling blocking on: [bold]{names}[/]")
+    if not yes and not Confirm.ask("Continue?"):
+        raise typer.Exit(0)
+
+    with console.status("[bold]Enabling…[/]"):
+        results = asyncio.run(set_blocking_all(instances, enabled=True))
+
+    for inst, (ok, err) in zip(instances, results):
+        icon = "[green]✓[/]" if ok else "[red]✗[/]"
+        msg = "blocking enabled" if ok else f"failed — {err}"
+        console.print(f"{icon} {inst.name} — {msg}")
+
+
+@pihole_dns_app.command("list")
+def pihole_dns_list(
+    output: _Out = typer.Option(_Out.table, "-o", help="Output format: table | json"),
+) -> None:
+    """List custom local DNS records (reads from primary instance)."""
+    cfg = _load()
+    primary = _pihole_primary(cfg)
+
+    with console.status(f"[bold]Fetching DNS records from {primary.name}…[/]"):
+        records = asyncio.run(list_custom_dns(primary))
+
+    if output == _Out.json:
+        console.print_json(_json.dumps(records))
+        return
+
+    if not records:
+        console.print(f"[dim]No custom DNS records on {primary.name}.[/]")
+        return
+
+    t = Table(box=box.SIMPLE, show_header=True, pad_edge=False)
+    t.add_column("Domain", style="bold", min_width=30)
+    t.add_column("IP", min_width=15)
+
+    for r in sorted(records, key=lambda x: x.get("domain", "")):
+        t.add_row(r.get("domain", "?"), r.get("ip", "?"))
+
+    console.print(t)
+    console.print(f"\n[dim]{len(records)} record(s) — source: {primary.name}[/]")
+
+
+@pihole_dns_app.command("add")
+def pihole_dns_add(
+    domain: str = typer.Argument(..., help="Fully-qualified domain name, e.g. myhost.local"),
+    ip: str = typer.Argument(..., help="IP address to resolve to"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation"),
+) -> None:
+    """Add a custom local DNS record (primary instance; sync propagates)."""
+    cfg = _load()
+    primary = _pihole_primary(cfg)
+
+    console.print(f"Adding DNS: [bold]{domain}[/] → [cyan]{ip}[/] on [bold]{primary.name}[/]")
+    if not yes and not Confirm.ask("Continue?"):
+        raise typer.Exit(0)
+
+    with console.status("[bold]Adding record…[/]"):
+        ok, err = asyncio.run(add_custom_dns(primary, domain, ip))
+
+    if ok:
+        console.print(f"[green]✓[/] {domain} → {ip} added.")
+    else:
+        console.print(f"[red]✗[/] Failed — {err}")
+        raise typer.Exit(1)
+
+
+@pihole_dns_app.command("remove")
+def pihole_dns_remove(
+    domain: str = typer.Argument(..., help="Domain to remove"),
+    ip: str = typer.Argument(..., help="IP address of the record to remove"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation"),
+) -> None:
+    """Remove a custom local DNS record (primary instance)."""
+    cfg = _load()
+    primary = _pihole_primary(cfg)
+
+    console.print(f"Removing DNS: [bold]{domain}[/] → [cyan]{ip}[/] from [bold]{primary.name}[/]")
+    if not yes and not Confirm.ask("Continue?"):
+        raise typer.Exit(0)
+
+    with console.status("[bold]Removing record…[/]"):
+        ok, err = asyncio.run(remove_custom_dns(primary, domain, ip))
+
+    if ok:
+        console.print(f"[green]✓[/] {domain} removed.")
+    else:
+        console.print(f"[red]✗[/] Failed — {err}")
+        raise typer.Exit(1)
+
+
+@pihole_app.command("gravity")
+def pihole_gravity(
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation"),
+) -> None:
+    """Trigger a gravity (blocklist) update on ALL instances."""
+    cfg = _load()
+    instances = _pihole_instances(cfg)
+
+    names = ", ".join(i.name for i in instances)
+    console.print(f"Running gravity update on: [bold]{names}[/]")
+    if not yes and not Confirm.ask("Continue?"):
+        raise typer.Exit(0)
+
+    with console.status("[bold]Triggering gravity update…[/]"):
+        results = asyncio.run(trigger_gravity_all(instances))
+
+    for inst, (ok, err) in zip(instances, results):
+        icon = "[green]✓[/]" if ok else "[red]✗[/]"
+        msg = "gravity update triggered" if ok else f"failed — {err}"
+        console.print(f"{icon} {inst.name} — {msg}")
+
+    console.print("\n[dim]Updates run in the background on each instance.[/]")
+
+
+# ── ha ────────────────────────────────────────────────────────────────────────
+
+ha_app = typer.Typer(
+    help="Manage Home Assistant",
+    no_args_is_help=True,
+    rich_markup_mode="rich",
+)
+app.add_typer(ha_app, name="ha")
+
+
+def _ha(cfg) -> object:
+    if cfg.ha is None:
+        console.print("[red]No homeassistant section in config.yaml[/]")
+        raise typer.Exit(1)
+    return cfg.ha
+
+
+@ha_app.command("status")
+def ha_status() -> None:
+    """Show Home Assistant version and state."""
+    cfg = _load()
+    ha_cfg = _ha(cfg)
+    with console.status("[bold]Querying Home Assistant…[/]"):
+        s = ha_get_status(ha_cfg)
+
+    if s.online:
+        state_color = "green" if s.state == "RUNNING" else "yellow"
+        console.print(f"[green]●[/] Home Assistant [bold]{s.version}[/]")
+        console.print(f"  State:    [{state_color}]{s.state}[/]")
+        if s.location:
+            console.print(f"  Location: {s.location}")
+        console.print(f"  URL:      [dim]{ha_cfg.base_url}[/]")
+    else:
+        console.print(f"[red]●[/] Home Assistant — offline")
+        console.print(f"  [dim]{s.error}[/]")
+        raise typer.Exit(1)
+
+
+@ha_app.command("get")
+def ha_get(
+    entity_id: str = typer.Argument(..., help="Entity ID, e.g. sensor.loft_temperature"),
+) -> None:
+    """Get the current state and attributes of an entity."""
+    cfg = _load()
+    ha_cfg = _ha(cfg)
+    try:
+        s = get_entity_state(ha_cfg, entity_id)
+    except Exception as e:
+        console.print(f"[red]✗[/] {e}")
+        raise typer.Exit(1)
+
+    unit = s.attributes.get("unit_of_measurement", "")
+    friendly = s.attributes.get("friendly_name", "")
+    state_str = f"{s.state}{(' ' + unit) if unit else ''}"
+
+    console.print(f"[bold]{entity_id}[/]" + (f"  [dim]{friendly}[/]" if friendly else ""))
+    console.print(f"  State:   [cyan]{state_str}[/]")
+
+    skip = {"unit_of_measurement", "friendly_name"}
+    attrs = {k: v for k, v in s.attributes.items() if k not in skip}
+    if attrs:
+        console.print("  Attributes:")
+        for k, v in attrs.items():
+            console.print(f"    [dim]{k}:[/] {v}")
+
+    if s.last_changed:
+        console.print(f"  Changed: [dim]{s.last_changed[:19].replace('T', ' ')}[/]")
+
+
+@ha_app.command("turn-on")
+def ha_turn_on(
+    entity_id: str = typer.Argument(..., help="Entity ID to turn on"),
+) -> None:
+    """Turn on an entity (switch, light, fan, etc.)."""
+    cfg = _load()
+    ha_cfg = _ha(cfg)
+    try:
+        ha_call_service(ha_cfg, "homeassistant", "turn_on", {"entity_id": entity_id})
+        console.print(f"[green]✓[/] Turned on [bold]{entity_id}[/]")
+    except Exception as e:
+        console.print(f"[red]✗[/] {e}")
+        raise typer.Exit(1)
+
+
+@ha_app.command("turn-off")
+def ha_turn_off(
+    entity_id: str = typer.Argument(..., help="Entity ID to turn off"),
+) -> None:
+    """Turn off an entity (switch, light, fan, etc.)."""
+    cfg = _load()
+    ha_cfg = _ha(cfg)
+    try:
+        ha_call_service(ha_cfg, "homeassistant", "turn_off", {"entity_id": entity_id})
+        console.print(f"[green]✓[/] Turned off [bold]{entity_id}[/]")
+    except Exception as e:
+        console.print(f"[red]✗[/] {e}")
+        raise typer.Exit(1)
+
+
+@ha_app.command("call")
+def ha_call(
+    service: str = typer.Argument(..., help="domain.service, e.g. light.turn_on"),
+    entity_id: Optional[str] = typer.Argument(None, help="Entity ID (optional)"),
+    data: Optional[str] = typer.Option(None, "--data", "-d", help='Extra JSON data, e.g. \'{"brightness": 128}\''),
+) -> None:
+    """Call a Home Assistant service."""
+    cfg = _load()
+    ha_cfg = _ha(cfg)
+
+    if "." not in service:
+        console.print("[red]Service must be in domain.service format, e.g. light.turn_on[/]")
+        raise typer.Exit(1)
+
+    domain, svc = service.split(".", 1)
+    payload: dict = {}
+    if entity_id:
+        payload["entity_id"] = entity_id
+    if data:
+        try:
+            payload.update(_json.loads(data))
+        except _json.JSONDecodeError as e:
+            console.print(f"[red]Invalid JSON in --data: {e}[/]")
+            raise typer.Exit(1)
+
+    try:
+        changed = ha_call_service(ha_cfg, domain, svc, payload)
+        console.print(f"[green]✓[/] Called [bold]{service}[/]" + (f" on {entity_id}" if entity_id else ""))
+        if changed:
+            console.print(f"  [dim]{len(changed)} state(s) affected[/]")
+    except Exception as e:
+        console.print(f"[red]✗[/] {e}")
+        raise typer.Exit(1)
+
+
+@ha_app.command("reload")
+def ha_reload(
+    domain: Optional[str] = typer.Argument(
+        None,
+        help="Domain to reload (automation, script, template, …). Omit for all.",
+    ),
+) -> None:
+    """Reload YAML configuration — all or a specific domain."""
+    cfg = _load()
+    ha_cfg = _ha(cfg)
+
+    if domain:
+        svc_domain, svc_name = domain, "reload"
+        label = f"{domain} YAML"
+    else:
+        svc_domain, svc_name = "homeassistant", "reload_all"
+        label = "all YAML configuration"
+
+    try:
+        ha_call_service(ha_cfg, svc_domain, svc_name)
+        console.print(f"[green]✓[/] Reloaded {label}.")
+    except Exception as e:
+        console.print(f"[red]✗[/] {e}")
+        raise typer.Exit(1)
+
+
+@ha_app.command("stats")
+def ha_stats() -> None:
+    """Show configured sensor stats (power, temperature, humidity, etc.)."""
+    cfg = _load()
+    ha_cfg = _ha(cfg)
+
+    if not ha_cfg.stats:
+        console.print("[yellow]No stats configured. Add a 'stats' list under 'homeassistant' in config.yaml.[/]")
+        raise typer.Exit(1)
+
+    with console.status("[bold]Fetching stats…[/]"):
+        results = ha_get_stats(ha_cfg)
+
+    t = Table(box=box.SIMPLE, show_header=False, pad_edge=False)
+    t.add_column("Name", style="bold", min_width=20)
+    t.add_column("Value", min_width=12)
+    t.add_column("Entity", style="dim")
+
+    for r in results:
+        t.add_row(r.cfg.name, r.display, r.cfg.entity)
+
+    console.print(t)
+
+
+@ha_app.command("restart")
+def ha_restart(
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation"),
+) -> None:
+    """Restart the Home Assistant core."""
+    cfg = _load()
+    ha_cfg = _ha(cfg)
+
+    console.print("[yellow]⚠[/]  This will restart Home Assistant.")
+    if not yes and not Confirm.ask("Restart Home Assistant core?"):
+        raise typer.Exit(0)
+
+    try:
+        ha_call_service(ha_cfg, "homeassistant", "restart")
+        console.print("[green]✓[/] Restart initiated.")
+    except Exception as e:
+        console.print(f"[red]✗[/] {e}")
+        raise typer.Exit(1)
+
+
+@ha_app.command("updates")
+def ha_updates() -> None:
+    """List pending updates (core, supervisor, OS, HACS, integrations, add-ons)."""
+    cfg = _load()
+    ha_cfg = _ha(cfg)
+    with console.status("[bold]Fetching update entities…[/]"):
+        try:
+            updates = ha_list_updates(ha_cfg, pending_only=True)
+        except Exception as e:
+            console.print(f"[red]✗[/] {e}")
+            raise typer.Exit(1)
+
+    if not updates:
+        console.print("[green]✓[/] All up to date.")
+        return
+
+    t = Table(box=box.SIMPLE, show_header=True, pad_edge=False)
+    t.add_column("Category", style="dim", min_width=12)
+    t.add_column("Name", style="bold", min_width=24)
+    t.add_column("Installed", justify="right", min_width=10)
+    t.add_column("Available", justify="right", style="yellow", min_width=10)
+    t.add_column("Entity ID", style="dim")
+
+    for u in sorted(updates, key=lambda x: (x.short_category, x.title)):
+        t.add_row(u.short_category, u.title, u.installed_version or "—", u.latest_version or "—", u.entity_id)
+
+    console.print(t)
+    console.print(f"[dim]{len(updates)} update(s) available. Run [bold]atc ha update --all[/] to install all.[/]")
+
+
+@ha_app.command("update")
+def ha_update(
+    entity_id: Optional[str] = typer.Argument(None, help="Specific update entity ID (e.g. update.home_assistant_core_update)"),
+    all_: bool = typer.Option(False, "--all", help="Install all pending updates"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation"),
+) -> None:
+    """Install a specific update or all pending updates."""
+    cfg = _load()
+    ha_cfg = _ha(cfg)
+
+    if not entity_id and not all_:
+        console.print("[yellow]Specify an entity ID or pass --all.[/]  Run [bold]atc ha updates[/] to list pending.")
+        raise typer.Exit(1)
+
+    with console.status("[bold]Fetching update entities…[/]"):
+        try:
+            pending = ha_list_updates(ha_cfg, pending_only=True)
+        except Exception as e:
+            console.print(f"[red]✗[/] {e}")
+            raise typer.Exit(1)
+
+    if all_:
+        targets = pending
+    else:
+        targets = [u for u in pending if u.entity_id == entity_id]
+        if not targets:
+            # Maybe entity exists but is already up to date — check explicitly
+            console.print(f"[yellow]No pending update found for[/] [bold]{entity_id}[/]")
+            raise typer.Exit(1)
+
+    if not targets:
+        console.print("[green]✓[/] Nothing to update.")
+        return
+
+    console.print(f"Installing [bold]{len(targets)}[/] update(s):")
+    for u in targets:
+        console.print(f"  [dim]•[/] [bold]{u.title}[/]  {u.installed_version} → [yellow]{u.latest_version}[/]")
+
+    if not yes and not Confirm.ask("Proceed?"):
+        raise typer.Exit(0)
+
+    errors = []
+    for u in targets:
+        try:
+            ha_call_service(ha_cfg, "update", "install", {"entity_id": u.entity_id})
+            console.print(f"[green]✓[/] {u.title}")
+        except Exception as e:
+            console.print(f"[red]✗[/] {u.title}: {e}")
+            errors.append(u.entity_id)
+
+    if errors:
+        raise typer.Exit(1)
+
+
+# ── certs ─────────────────────────────────────────────────────────────────────
+
+@app.command("certs")
+def cmd_certs() -> None:
+    """Show TLS certificate expiry for all configured endpoints."""
+    cfg = _load()
+    if not cfg.tls_checks:
+        console.print("[yellow]No TLS checks configured. Add a 'tls:' section to config.yaml.[/]")
+        raise typer.Exit(0)
+
+    with console.status("[bold]Checking certificates…[/]"):
+        results: list[CertStatus] = asyncio.run(check_all_certs(cfg.tls_checks))
+
+    t = Table(box=box.SIMPLE_HEAD)
+    t.add_column("Name", style="cyan", no_wrap=True)
+    t.add_column("Host:Port", style="dim")
+    t.add_column("Subject")
+    t.add_column("Expires")
+    t.add_column("Days Left", justify="right")
+
+    for r in results:
+        host_port = f"{r.host}:{r.port}"
+        if not r.ok:
+            t.add_row(r.name, host_port, "—", "—", f"[red]ERR: {r.error[:35]}[/]")
+            continue
+        expiry_str = r.expiry.strftime("%Y-%m-%d") if r.expiry else "—"
+        if r.days_left <= 14:
+            days_str = f"[red bold]{r.days_left}d ⚠[/]"
+        elif r.days_left <= 30:
+            days_str = f"[yellow]{r.days_left}d[/]"
+        else:
+            days_str = f"[green]{r.days_left}d[/]"
+        t.add_row(r.name, host_port, r.subject, expiry_str, days_str)
+
+    console.print(t)
+
+
+# ── tree ──────────────────────────────────────────────────────────────────────
+
+# Aliases shown inline in tree: {group_name: {canonical_cmd: alias}}
+_GROUP_ALIASES: dict[str, dict[str, str]] = {
+    "get":     {"hosts": "ls"},
+    "secrets": {"list": "ls", "delete": "rm"},
+    "backup":  {"list": "ls"},
+    "pihole/dns": {"list": "ls"},
+    "seerr":   {"list": "ls"},
+}
+
+
+@app.command("tree")
+def show_tree() -> None:
+    """Show all commands and their arguments as a tree."""
+    from rich.tree import Tree as RichTree
+
+    click_app = typer.main.get_command(app)
+
+    def _param_label(param: click.Parameter) -> str:
+        if isinstance(param, click.Argument):
+            name = param.name or ""
+            return f"[yellow]\\[{name}][/]" if not param.required else f"[yellow]<{name}>[/]"
+        if isinstance(param, click.Option):
+            opts = "/".join(param.opts)
+            if param.is_flag:
+                return f"[dim]{opts}[/]"
+            type_name = param.type.name if hasattr(param.type, "name") else "value"
+            return f"[dim]{opts} <{type_name}>[/]"
+        return ""
+
+    def _add_commands(node: RichTree, group: click.Group, group_name: str = "") -> None:
+        # alias_for: canonical_name -> alias_name (e.g. "hosts" -> "ls")
+        alias_for = _GROUP_ALIASES.get(group_name, {})
+
+        for name, cmd in sorted(group.commands.items()):  # type: ignore[union-attr]
+            if cmd.hidden:
+                continue  # hidden = alias, shown inline on its canonical command
+            help_text = (cmd.help or "").split("\n")[0]
+            alias_str = f" [dim]({alias_for[name]})[/dim]" if name in alias_for else ""
+
+            if isinstance(cmd, click.Group):
+                branch = node.add(f"[bold cyan]{name}[/]{alias_str}  [dim]{help_text}[/]")
+                _add_commands(branch, cmd, name)
+            else:
+                args = [_param_label(p) for p in cmd.params if isinstance(p, click.Argument)]
+                opts = [_param_label(p) for p in cmd.params if isinstance(p, click.Option) and "--help" not in p.opts]
+                parts = " ".join(args + opts)
+                label = f"[bold cyan]{name}[/]{alias_str}"
+                if parts:
+                    label += f"  {parts}"
+                if help_text:
+                    label += f"  [dim]{help_text}[/]"
+                node.add(label)
+
+    root = RichTree("[bold]atc[/]  [dim]Air Traffic Control — homelab management CLI[/]")
+    _add_commands(root, click_app)  # type: ignore[arg-type]
+
+    console.print(root)
+
+
+# ── media ─────────────────────────────────────────────────────────────────────
+
+media_app = typer.Typer(
+    help="Media pipeline: Seerr · Radarr · Sonarr · Plex",
+    no_args_is_help=True,
+    rich_markup_mode="rich",
+)
+app.add_typer(media_app, name="media")
+
+
+# ── pipeline ──────────────────────────────────────────────────────────────────
+
+from lib.arr import (
+    get_movie_by_id, get_movie_by_tmdb, get_series_by_id, get_series_by_title,
+    get_queue as arr_get_queue, get_movie_import_date,
+    ArrMovieRecord, ArrSeriesRecord,
+)
+from lib.plex import (
+    find_media as plex_find_media,
+    get_server_info as plex_get_server_info,
+    list_libraries as plex_list_libraries,
+    scan_library as plex_scan_library,
+    analyze_library as plex_analyze_library,
+    empty_trash as plex_empty_trash,
+    clean_bundles as plex_clean_bundles,
+    _section_key as plex_section_key,
+)
+
+
+def _fmt_bytes(b: int) -> str:
+    if b == 0:
+        return "0 B"
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if b < 1024:
+            return f"{b:.1f} {unit}"
+        b /= 1024
+    return f"{b:.1f} PB"
+
+
+def _mini_bar(pct: float, width: int = 12) -> str:
+    filled = round(pct / 100 * width)
+    return "█" * filled + "░" * (width - filled)
+
+
+def _pipeline_row(
+    step: int, label: str, icon: str, style: str, summary: str, detail: str = ""
+) -> None:
+    detail_str = f" [dim]· {detail}[/]" if detail else ""
+    console.print(
+        f"  [dim]{step}.[/] [dim]{label:<17}[/] [{style}]{icon}[/]  [{style}]{summary}[/]{detail_str}"
+    )
+
+
+def _stage_seerr(r) -> tuple[str, str, str, str]:
+    """Returns (icon, style, summary, detail) for the Seerr stage."""
+    code = r.media_status_code
+    req = r.request_status_code
+    by_date = " · ".join(p for p in [r.request_by, r.request_date] if p)
+
+    def _season_str(progress: bool = False) -> str:
+        """Season count label for TV shows.
+
+        progress=True  → "avail/total seasons · avail_eps/req_eps eps"
+        progress=False → "req seasons · req_eps eps" (what entered the pipeline)
+        Falls back gracefully when counts aren't populated yet.
+        """
+        if r.media_type != "tv":
+            return ""
+        parts: list[str] = []
+        if progress:
+            if r.seasons_total:
+                parts.append(f"{r.seasons_available}/{r.seasons_total} seasons")
+            req_eps = r.episodes_requested or r.episodes_total
+            if req_eps:
+                parts.append(f"{r.episodes_available}/{req_eps} eps")
+        else:
+            n_seasons = r.seasons_requested or r.seasons_total
+            if n_seasons:
+                parts.append(f"{n_seasons} seasons")
+            n_eps = r.episodes_requested or r.episodes_total
+            if n_eps:
+                parts.append(f"{n_eps} eps")
+        return " · ".join(parts)
+
+    if r.seerr_media_id == 0:
+        return "·", "dim", "Not requested", ""
+    if code == 5:
+        detail = " · ".join(p for p in [_season_str(progress=True), by_date] if p)
+        return "✓", "green", "Available", detail
+    if code == 4:
+        detail = " · ".join(p for p in [_season_str(progress=True), by_date] if p)
+        return "✓", "cyan", "Partially available", detail
+    if req == 3:
+        detail = " · ".join(p for p in [_season_str(), by_date] if p)
+        return "✗", "red", "Declined", detail
+    if req == 2:
+        detail = " · ".join(p for p in [_season_str(), by_date] if p)
+        return "⟳", "cyan", "Approved — processing", detail
+    if req == 1:
+        detail = " · ".join(p for p in [_season_str(), by_date] if p)
+        return "·", "yellow", "Pending approval", detail
+    if code == 3:
+        detail = " · ".join(p for p in [_season_str(), by_date] if p)
+        return "⟳", "cyan", "Requested — processing", detail
+    if r.seerr_media_id != 0:
+        detail = " · ".join(p for p in [_season_str(), by_date] if p)
+        return "⟳", "dim", "Requested", detail
+    return "?", "dim", "Unknown", ""
+
+
+def _stage_arr(record) -> tuple[str, str, str, str]:
+    """Returns (icon, style, summary, detail) for the Radarr/Sonarr stage."""
+    if isinstance(record, ArrMovieRecord):
+        if record.has_file:
+            parts = [p for p in [record.quality, _fmt_bytes(record.size_bytes) if record.size_bytes else ""] if p]
+            return "✓", "green", "Has file", " · ".join(parts)
+        if record.monitored:
+            return "⟳", "yellow", "Monitored — missing", ""
+        return "·", "dim", "Not monitored", ""
+    # ArrSeriesRecord
+    if record.episode_file_count > 0:
+        eps = f"{record.episode_file_count}/{record.episode_count} eps"
+        pct = f"{record.percent:.0f}%"
+        style = "green" if record.percent >= 100 else "cyan"
+        return "✓", style, eps, pct
+    if record.monitored:
+        return "⟳", "yellow", "Monitored — no files", ""
+    return "·", "dim", "Not monitored", ""
+
+
+def _stage_download(queue_items, arr_record, import_date: str) -> tuple[str, str, str, str]:
+    """Returns (icon, style, summary, detail) for the download stage."""
+    if queue_items:
+        item = queue_items[0]
+        state = (item.tracked_state or "").lower()
+        if "import" in state:
+            return "⟳", "cyan", "Importing…", ""
+        if "failed" in state or item.status in ("warning", "error"):
+            return "✗", "red", "Failed", (item.error_message or "")[:80]
+        # Seeding: torrent client still uploading after import
+        # Detected when: explicit completed status, size_left==0, or files already
+        # exist in the arr library (most reliable — sizeleft stays full during seeding)
+        already_imported = (
+            (isinstance(arr_record, ArrMovieRecord) and arr_record.has_file)
+            or (isinstance(arr_record, ArrSeriesRecord) and arr_record.episode_file_count > 0)
+            or bool(import_date)
+        )
+        if item.status == "completed" or item.size_left == 0 or already_imported:
+            size_str = _fmt_bytes(item.size_bytes) if item.size_bytes else ""
+            return "⬆", "yellow", f"Seeding{' · ' + size_str if size_str else ''}", ""
+        pct = item.progress_pct
+        bar = _mini_bar(pct)
+        parts: list[str] = [f"{pct:.1f}% {bar}"]
+        if item.size_bytes:
+            parts.append(f"{_fmt_bytes(item.size_bytes - item.size_left)} / {_fmt_bytes(item.size_bytes)}")
+        if item.time_left:
+            parts.append(f"ETA {item.time_left}")
+        return "⟳", "cyan", " · ".join(parts), ""
+
+    if import_date:
+        return "✓", "green", "Imported", import_date
+    if isinstance(arr_record, ArrMovieRecord) and arr_record.has_file:
+        return "✓", "green", "Imported", arr_record.date_added or ""
+    if isinstance(arr_record, ArrSeriesRecord) and arr_record.episode_file_count > 0:
+        return "✓", "green", "Files imported", ""
+    return "·", "dim", "—", ""
+
+
+def _render_plex_row(plex_match, plex_err: str = "") -> None:
+    """Render stage 4 Plex row from a PlexMatch (or error string)."""
+    if plex_err:
+        _pipeline_row(4, "Plex", "?", "yellow", "Error", plex_err)
+        return
+    if plex_match is None:
+        _pipeline_row(4, "Plex", "·", "dim", "Not checked", "")
+        return
+    if plex_match.error:
+        _pipeline_row(4, "Plex", "?", "yellow", "Error", plex_match.error)
+        return
+    if not plex_match.found:
+        _pipeline_row(4, "Plex", "✗", "red", "Not in Plex", "")
+        return
+    parts = [f'library "{plex_match.library}"']
+    if plex_match.episode_count:
+        parts.append(f"{plex_match.episode_count} eps")
+    if plex_match.added_at:
+        parts.append(f"added {plex_match.added_at}")
+    _pipeline_row(4, "Plex", "✓", "green", "Available", " · ".join(parts))
+
+
+def _seerr_pick(cfg, query: str):
+    """Search Seerr and return the chosen SeerrSearchResult, or None on cancel."""
+    if cfg.seerr is None:
+        console.print("[red]No seerr section in config.yaml[/]")
+        return None
+    with console.status("[bold]Searching Seerr…[/]"):
+        try:
+            results = seerr_search(cfg.seerr, query)
+        except Exception as e:
+            console.print(f"[red]Search error:[/] {e}")
+            return None
+    if not results:
+        console.print("[dim]No results.[/]")
+        return None
+    if len(results) == 1:
+        return results[0]
+    t = Table(box=box.SIMPLE, show_header=True, pad_edge=False)
+    t.add_column("#", justify="right", style="dim", width=3)
+    t.add_column("Type", style="dim")
+    t.add_column("Title", style="bold")
+    t.add_column("Year")
+    t.add_column("Status")
+    for i, r in enumerate(results[:10], 1):
+        t.add_row(str(i), r.media_type, r.title, r.year, r.status)
+    console.print(t)
+    n = typer.prompt("Pick a number", type=int, default=1)
+    if not 1 <= n <= min(len(results), 10):
+        console.print("[red]Invalid choice[/]")
+        return None
+    return results[n - 1]
+
+
+def _display_pipeline(cfg, pick) -> None:
+    """Render all 4 pipeline stages for a SeerrSearchResult."""
+    is_movie = pick.media_type == "movie"
+    arr_cfg  = cfg.radarr if is_movie else cfg.sonarr
+    arr_label = "Radarr" if is_movie else "Sonarr"
+
+    console.print()
+    console.print(f"  [bold]{pick.title}[/] [dim]({pick.year}) · {pick.media_type} · TMDB {pick.id}[/]")
+    console.print()
+
+    # ── Stage 1: Seerr ────────────────────────────────────────────────────────
+    if not is_movie and cfg.seerr is not None and pick.seerr_media_id != 0:
+        with console.status("[bold]Fetching season details…[/]"):
+            seerr_enrich_tv_seasons(cfg.seerr, pick)
+    icon, style, summary, detail = _stage_seerr(pick)
+    _pipeline_row(1, "Seerr Request", icon, style, summary, detail)
+
+    # ── Stage 2: Radarr / Sonarr ──────────────────────────────────────────────
+    arr_record = None
+    arr_queue: list = []
+    import_date = ""
+
+    if arr_cfg is None:
+        _pipeline_row(2, arr_label, "·", "dim", "Not configured", "add to config.yaml")
+    else:
+        with console.status(f"[bold]Querying {arr_label}…[/]"):
+            try:
+                if is_movie:
+                    arr_record = get_movie_by_tmdb(arr_cfg, pick.id)
+                else:
+                    if pick.external_service_id:
+                        arr_record = get_series_by_id(arr_cfg, pick.external_service_id)
+                    if arr_record is None:
+                        arr_record = get_series_by_title(arr_cfg, pick.title)
+                arr_queue = arr_get_queue(arr_cfg)
+                if arr_record and is_movie:
+                    import_date = get_movie_import_date(arr_cfg, arr_record.arr_id)
+            except Exception as e:
+                console.print(f"  [dim]  ({arr_label} error: {e})[/]")
+
+        if arr_record is None:
+            _pipeline_row(2, arr_label, "✗", "dim", "Not in library", "")
+        else:
+            icon, style, summary, detail = _stage_arr(arr_record)
+            _pipeline_row(2, arr_label, icon, style, summary, detail)
+
+    # ── Stage 3: Download ─────────────────────────────────────────────────────
+    queue_items = []
+    if arr_record and arr_queue:
+        if is_movie and isinstance(arr_record, ArrMovieRecord):
+            queue_items = [q for q in arr_queue if q.movie_id == arr_record.arr_id]
+        elif not is_movie and isinstance(arr_record, ArrSeriesRecord):
+            queue_items = [q for q in arr_queue if q.series_id == arr_record.arr_id]
+
+    icon, style, summary, detail = _stage_download(queue_items, arr_record, import_date)
+    _pipeline_row(3, "Download", icon, style, summary, detail)
+
+    # ── Stage 4: Plex ─────────────────────────────────────────────────────────
+    if cfg.plex is None:
+        _pipeline_row(4, "Plex", "·", "dim", "Not configured", "add plex: to config.yaml")
+    else:
+        with console.status("[bold]Checking Plex…[/]"):
+            try:
+                plex_year = int(pick.year or 0)
+                plex_match = plex_find_media(cfg.plex, pick.title, pick.media_type, year=plex_year)
+                if not plex_match.found and plex_year:
+                    plex_match = plex_find_media(cfg.plex, pick.title, pick.media_type, year=0)
+            except Exception as e:
+                plex_match = None
+                plex_err = str(e)
+
+        _render_plex_row(plex_match, plex_err if plex_match is None else "")
+
+    console.print()
+
+
+def _display_pipeline_from_calendar(cfg, item) -> None:
+    """Render the pipeline for a CalendarMovie or CalendarEpisode.
+
+    Bypasses Seerr search disambiguation — arr item is already known.
+    Seerr is queried silently (exact title match) only for request status.
+    """
+    from lib.arr import CalendarMovie as _CM, CalendarEpisode as _CE
+    is_movie   = isinstance(item, _CM)
+    arr_cfg    = cfg.radarr if is_movie else cfg.sonarr
+    arr_label  = "Radarr" if is_movie else "Sonarr"
+    media_type = "movie"  if is_movie else "tv"
+    title      = item.title if is_movie else item.series_title
+
+    console.print()
+    if is_movie:
+        console.print(f"  [bold]{item.title}[/] [dim]({item.year}) · movie[/]")
+    else:
+        ep_tag = f"S{item.season:02d}E{item.episode:02d}"
+        console.print(f"  [bold]{item.series_title}[/] [dim]· tv · {ep_tag} {item.title}[/]")
+    console.print()
+
+    # ── Stage 1: Seerr (silent — no disambiguation prompt) ────────────────────
+    if cfg.seerr is None:
+        _pipeline_row(1, "Seerr Request", "·", "dim", "Not configured", "")
+        seerr_result = None
+    else:
+        seerr_result = None
+        try:
+            with console.status("[bold]Checking Seerr…[/]"):
+                results = seerr_search(cfg.seerr, title)
+            # Prefer exact title match of correct type; fall back to first of correct type
+            seerr_result = next(
+                (r for r in results if r.media_type == media_type and r.title.lower() == title.lower()),
+                next((r for r in results if r.media_type == media_type), None),
+            )
+        except Exception:
+            pass
+        if seerr_result is None:
+            _pipeline_row(1, "Seerr Request", "·", "dim", "Not requested", "")
+        else:
+            if media_type == "tv" and seerr_result.seerr_media_id != 0:
+                with console.status("[bold]Fetching season details…[/]"):
+                    seerr_enrich_tv_seasons(cfg.seerr, seerr_result)
+            icon, style, summary, detail = _stage_seerr(seerr_result)
+            _pipeline_row(1, "Seerr Request", icon, style, summary, detail)
+
+    # ── Stage 2: Arr (use known IDs — no extra search needed) ─────────────────
+    arr_record = None
+    arr_queue: list = []
+    import_date = ""
+
+    if arr_cfg is None:
+        _pipeline_row(2, arr_label, "·", "dim", "Not configured", "add to config.yaml")
+    else:
+        with console.status(f"[bold]Querying {arr_label}…[/]"):
+            try:
+                if is_movie:
+                    arr_record = get_movie_by_id(arr_cfg, item.arr_id) if item.arr_id else None
+                    if arr_record is None and item.tmdb_id:
+                        arr_record = get_movie_by_tmdb(arr_cfg, item.tmdb_id)
+                else:
+                    arr_record = get_series_by_id(arr_cfg, item.series_id) if item.series_id else None
+                    if arr_record is None:
+                        arr_record = get_series_by_title(arr_cfg, title)
+                arr_queue = arr_get_queue(arr_cfg)
+                if arr_record and is_movie:
+                    import_date = get_movie_import_date(arr_cfg, arr_record.arr_id)
+            except Exception as e:
+                console.print(f"  [dim]  ({arr_label} error: {e})[/]")
+
+        if arr_record is None:
+            _pipeline_row(2, arr_label, "✗", "dim", "Not in library", "")
+        else:
+            icon, style, summary, detail = _stage_arr(arr_record)
+            _pipeline_row(2, arr_label, icon, style, summary, detail)
+
+    # ── Stage 3: Download ─────────────────────────────────────────────────────
+    queue_items = []
+    if arr_record and arr_queue:
+        if is_movie and isinstance(arr_record, ArrMovieRecord):
+            queue_items = [q for q in arr_queue if q.movie_id == arr_record.arr_id]
+        elif not is_movie and isinstance(arr_record, ArrSeriesRecord):
+            queue_items = [q for q in arr_queue if q.series_id == arr_record.arr_id]
+
+    icon, style, summary, detail = _stage_download(queue_items, arr_record, import_date)
+    _pipeline_row(3, "Download", icon, style, summary, detail)
+
+    # ── Stage 4: Plex ─────────────────────────────────────────────────────────
+    if cfg.plex is None:
+        _pipeline_row(4, "Plex", "·", "dim", "Not configured", "add plex: to config.yaml")
+    else:
+        with console.status("[bold]Checking Plex…[/]"):
+            try:
+                plex_match = plex_find_media(cfg.plex, title, media_type)
+            except Exception as e:
+                plex_match = None
+                plex_err = str(e)
+
+        _render_plex_row(plex_match, plex_err if plex_match is None else "")
+
+    console.print()
+
+
+@media_app.command("pipeline")
+def pipeline_cmd(
+    query: str = typer.Argument(..., help="Movie or TV show title to look up"),
+) -> None:
+    """Show the complete media pipeline: request → *arr → download → Plex."""
+    cfg  = _load()
+    pick = _seerr_pick(cfg, query)
+    if pick is None:
+        raise typer.Exit(1)
+    _display_pipeline(cfg, pick)
+
+
+# ── radarr / sonarr ───────────────────────────────────────────────────────────
+
+from lib.search_state import load_state as _load_search_state
+from lib.arr import (
+    get_status as arr_get_status,
+    radarr_scan, radarr_search_missing, radarr_search_movies,
+    sonarr_scan, sonarr_search_missing, sonarr_search_episodes,
+    get_episode_id,
+    get_today_imports as arr_get_today_imports,
+)
+
+
+def _arr_result(cmd) -> None:
+    """Print the result of a dispatched Servarr command."""
+    console.print(
+        f"[green]✓[/] Command [bold]{cmd.name}[/] queued "
+        f"(id={cmd.command_id}, status={cmd.status})"
+        + (f" — {cmd.message}" if cmd.message else "")
+    )
+
+
+# ── radarr ────────────────────────────────────────────────────────────────────
+
+radarr_app = typer.Typer(
+    help="Manage Radarr (movies)",
+    no_args_is_help=True,
+    rich_markup_mode="rich",
+)
+media_app.add_typer(radarr_app, name="radarr")
+
+
+def _radarr(cfg: Config):
+    if cfg.radarr is None:
+        console.print("[red]No radarr section in config.yaml[/]")
+        raise typer.Exit(1)
+    return cfg.radarr
+
+
+@radarr_app.command("status")
+def radarr_status_cmd() -> None:
+    """Show Radarr version and connectivity."""
+    cfg = _load()
+    with console.status("[bold]Querying Radarr…[/]"):
+        s = arr_get_status(_radarr(cfg))
+    if s.online:
+        console.print(f"[green]✓[/] {s.app_name} {s.version} online")
+    else:
+        console.print(f"[red]✗[/] Radarr offline: {s.error}")
+
+
+@radarr_app.command("scan")
+def radarr_scan_cmd() -> None:
+    """Trigger a full library rescan."""
+    cfg = _load()
+    with console.status("[bold]Triggering Radarr scan…[/]"):
+        try:
+            _arr_result(radarr_scan(_radarr(cfg)))
+        except Exception as e:
+            console.print(f"[red]Error:[/] {e}")
+            raise typer.Exit(1)
+
+
+@radarr_app.command("search-missing")
+def radarr_search_missing_cmd(
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation prompt"),
+) -> None:
+    """Search for all missing movies."""
+    if not yes:
+        if not Confirm.ask("Trigger missing movies search? (may be slow)"):
+            raise typer.Exit(0)
+    cfg = _load()
+    state = _load_search_state(cfg.config_path)
+    allowed, reason = state.can_search("missing_movies", broad=True)
+    if not allowed:
+        console.print(f"[yellow]⏸[/] Search throttled — {reason}")
+        raise typer.Exit(0)
+    with console.status("[bold]Triggering Radarr missing search…[/]"):
+        try:
+            _arr_result(radarr_search_missing(_radarr(cfg)))
+            state.record_search("missing_movies", broad=True)
+        except Exception as e:
+            console.print(f"[red]Error:[/] {e}")
+            raise typer.Exit(1)
+
+
+# ── sonarr ────────────────────────────────────────────────────────────────────
+
+sonarr_app = typer.Typer(
+    help="Manage Sonarr (TV shows)",
+    no_args_is_help=True,
+    rich_markup_mode="rich",
+)
+media_app.add_typer(sonarr_app, name="sonarr")
+
+
+def _sonarr(cfg: Config):
+    if cfg.sonarr is None:
+        console.print("[red]No sonarr section in config.yaml[/]")
+        raise typer.Exit(1)
+    return cfg.sonarr
+
+
+@sonarr_app.command("status")
+def sonarr_status_cmd() -> None:
+    """Show Sonarr version and connectivity."""
+    cfg = _load()
+    with console.status("[bold]Querying Sonarr…[/]"):
+        s = arr_get_status(_sonarr(cfg))
+    if s.online:
+        console.print(f"[green]✓[/] {s.app_name} {s.version} online")
+    else:
+        console.print(f"[red]✗[/] Sonarr offline: {s.error}")
+
+
+@sonarr_app.command("scan")
+def sonarr_scan_cmd() -> None:
+    """Trigger a full library rescan."""
+    cfg = _load()
+    with console.status("[bold]Triggering Sonarr scan…[/]"):
+        try:
+            _arr_result(sonarr_scan(_sonarr(cfg)))
+        except Exception as e:
+            console.print(f"[red]Error:[/] {e}")
+            raise typer.Exit(1)
+
+
+@sonarr_app.command("search-missing")
+def sonarr_search_missing_cmd(
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation prompt"),
+) -> None:
+    """Search for all missing monitored episodes."""
+    if not yes:
+        if not Confirm.ask("Trigger missing episodes search? (may be slow)"):
+            raise typer.Exit(0)
+    cfg = _load()
+    state = _load_search_state(cfg.config_path)
+    allowed, reason = state.can_search("missing_episodes", broad=True)
+    if not allowed:
+        console.print(f"[yellow]⏸[/] Search throttled — {reason}")
+        raise typer.Exit(0)
+    with console.status("[bold]Triggering Sonarr missing search…[/]"):
+        try:
+            _arr_result(sonarr_search_missing(_sonarr(cfg)))
+            state.record_search("missing_episodes", broad=True)
+        except Exception as e:
+            console.print(f"[red]Error:[/] {e}")
+            raise typer.Exit(1)
+
+
+# ── seerr ─────────────────────────────────────────────────────────────────────
+
+from lib.seerr import (
+    search as seerr_search,
+    request_media as seerr_request_media,
+    list_requests as seerr_list_requests,
+    enrich_tv_seasons as seerr_enrich_tv_seasons,
+    MEDIA_TYPE_MOVIE, MEDIA_TYPE_TV,
+)
+
+seerr_app = typer.Typer(
+    help="Search and request media via Seerr",
+    no_args_is_help=True,
+    rich_markup_mode="rich",
+)
+media_app.add_typer(seerr_app, name="seerr")
+
+
+def _seerr(cfg: Config):
+    if cfg.seerr is None:
+        console.print("[red]No seerr section in config.yaml[/]")
+        raise typer.Exit(1)
+    return cfg.seerr
+
+
+@seerr_app.command("search")
+def seerr_search_cmd(
+    query: str = typer.Argument(..., help="Movie or TV show title to search for"),
+    output: _Out = typer.Option(_Out.table, "-o", help="Output format"),
+) -> None:
+    """Search for movies and TV shows."""
+    cfg = _load()
+    sc = _seerr(cfg)
+
+    with console.status("[bold]Searching…[/]"):
+        try:
+            results = seerr_search(sc, query)
+        except Exception as e:
+            console.print(f"[red]Error:[/] {e}")
+            raise typer.Exit(1)
+
+    if not results:
+        console.print("[dim]No results.[/]")
+        return
+
+    if output == _Out.json:
+        console.print_json(_json.dumps([
+            {"id": r.id, "type": r.media_type, "title": r.title, "year": r.year,
+             "overview": r.overview, "status": r.status}
+            for r in results
+        ]))
+        return
+
+    t = Table(box=box.SIMPLE, show_header=True, pad_edge=False)
+    t.add_column("ID", justify="right", style="dim")
+    t.add_column("Type", style="dim")
+    t.add_column("Title", style="bold")
+    t.add_column("Year")
+    t.add_column("Status")
+    if output == _Out.wide:
+        t.add_column("Overview")
+
+    for r in results:
+        status_style = {
+            "available": "green",
+            "pending": "yellow",
+            "processing": "cyan",
+            "partially available": "cyan",
+        }.get(r.status, "dim")
+        row = [str(r.id), r.media_type, r.title, r.year,
+               f"[{status_style}]{r.status}[/]"]
+        if output == _Out.wide:
+            row.append(r.overview)
+        t.add_row(*row)
+
+    console.print(t)
+    console.print(f"[dim]{len(results)} result(s) — use ID with [bold]atc media seerr request <id> --type movie|tv[/][/]")
+
+
+@seerr_app.command("request")
+def seerr_request_cmd(
+    tmdb_id: int = typer.Argument(..., help="TMDB ID from search results"),
+    media_type: str = typer.Option(..., "--type", "-t", help="'movie' or 'tv'"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation prompt"),
+) -> None:
+    """Request a movie or TV show by TMDB ID."""
+    if media_type not in (MEDIA_TYPE_MOVIE, MEDIA_TYPE_TV):
+        console.print(f"[red]--type must be 'movie' or 'tv'[/]")
+        raise typer.Exit(1)
+
+    cfg = _load()
+    sc = _seerr(cfg)
+
+    if not yes:
+        confirmed = Confirm.ask(f"Request [bold]{media_type}[/] with TMDB ID [bold]{tmdb_id}[/]?")
+        if not confirmed:
+            raise typer.Exit(0)
+
+    with console.status("[bold]Submitting request…[/]"):
+        try:
+            result = seerr_request_media(sc, tmdb_id, media_type)
+        except Exception as e:
+            console.print(f"[red]Error:[/] {e}")
+            raise typer.Exit(1)
+
+    console.print(
+        f"[green]✓[/] Requested [bold]{result.title}[/] "
+        f"(#{result.request_id}) — status: [bold]{result.status}[/]"
+    )
+
+
+def _seerr_list_body(
+    show_all: bool,
+    tv_only: bool,
+    movies_only: bool,
+    processing_only: bool,
+    output: _Out,
+) -> None:
+    cfg = _load()
+    sc = _seerr(cfg)
+
+    with console.status("[bold]Fetching requests…[/]"):
+        try:
+            reqs = seerr_list_requests(sc)
+        except Exception as e:
+            console.print(f"[red]Error:[/] {e}")
+            raise typer.Exit(1)
+
+    if not show_all:
+        reqs = [r for r in reqs if r.media_status_code != 5]
+    if tv_only:
+        reqs = [r for r in reqs if r.media_type == "tv"]
+    if movies_only:
+        reqs = [r for r in reqs if r.media_type == "movie"]
+    if processing_only:
+        reqs = [r for r in reqs if r.request_status_code == 2 and r.media_status_code != 5]
+
+    if not reqs:
+        console.print("[dim]No requests.[/]")
+        return
+
+    if output == _Out.json:
+        console.print_json(_json.dumps([
+            {
+                "id": r.request_id, "type": r.media_type, "title": r.title,
+                "tmdb_id": r.tmdb_id, "request_status": r.request_status,
+                "media_status": r.media_status, "requested_by": r.requested_by,
+                "created_at": r.created_at,
+            }
+            for r in reqs
+        ]))
+        return
+
+    _REQ_STYLE = {"pending": "yellow", "approved": "green", "declined": "red", "failed": "red"}
+    _MED_STYLE = {
+        "available": "green", "partially available": "cyan",
+        "processing": "cyan", "pending": "yellow",
+    }
+
+    t = Table(box=box.SIMPLE, show_header=True, pad_edge=False)
+    t.add_column("#", justify="right", style="dim")
+    t.add_column("Type", style="dim")
+    t.add_column("Title", style="bold")
+    t.add_column("Req'd By")
+    t.add_column("Date")
+    t.add_column("Request")
+    t.add_column("Media")
+
+    for r in reqs:
+        req_s = _REQ_STYLE.get(r.request_status, "dim")
+        med_s = _MED_STYLE.get(r.media_status, "dim")
+        t.add_row(
+            str(r.request_id),
+            r.media_type,
+            r.title,
+            r.requested_by,
+            r.created_at,
+            f"[{req_s}]{r.request_status}[/]",
+            f"[{med_s}]{r.media_status}[/]",
+        )
+
+    console.print(t)
+    console.print(f"[dim]{len(reqs)} request(s)[/]")
+
+
+@seerr_app.command("list")
+def seerr_list_cmd(
+    show_all: bool = typer.Option(False, "--all", "-a", help="Include fulfilled (available) requests"),
+    tv_only: bool = typer.Option(False, "--tv", "-t", help="Series only"),
+    movies_only: bool = typer.Option(False, "--movies", "-m", help="Movies only"),
+    processing_only: bool = typer.Option(False, "--processing", "-p", help="Approved and in-flight (not yet available)"),
+    output: _Out = typer.Option(_Out.table, "-o", help="Output format"),
+) -> None:
+    """List media requests. Unfulfilled only by default.
+
+    [dim]Filters: [bold]-t[/] tv  [bold]-m[/] movies  [bold]-p[/] processing  [bold]-a[/] all[/]
+    """
+    _seerr_list_body(show_all, tv_only, movies_only, processing_only, output)
+
+
+@seerr_app.command("ls", hidden=True)
+def seerr_ls_cmd(
+    show_all: bool = typer.Option(False, "--all", "-a", help="Include fulfilled (available) requests"),
+    tv_only: bool = typer.Option(False, "--tv", "-t", help="Series only"),
+    movies_only: bool = typer.Option(False, "--movies", "-m", help="Movies only"),
+    processing_only: bool = typer.Option(False, "--processing", "-p", help="Approved and in-flight (not yet available)"),
+    output: _Out = typer.Option(_Out.table, "-o", help="Output format"),
+) -> None:
+    """Alias for [bold]list[/]."""
+    _seerr_list_body(show_all, tv_only, movies_only, processing_only, output)
+
+
+# ── media calendar ────────────────────────────────────────────────────────────
+
+from datetime import date as _date, timedelta as _timedelta
+from lib.arr import (
+    get_radarr_calendar, get_sonarr_calendar,
+    CalendarMovie, CalendarEpisode,
+)
+
+
+@media_app.command("calendar")
+def media_calendar_cmd(
+    days: int = typer.Argument(10, help="Days to show: positive = ahead, negative = past (default 10)"),
+    radarr: bool = typer.Option(False, "--radarr", help="Show only movies"),
+    sonarr: bool = typer.Option(False, "--sonarr", help="Show only TV episodes"),
+) -> None:
+    """Show Radarr and Sonarr releases. Positive days = upcoming, negative = past."""
+    cfg = _load()
+    show_all = not any([radarr, sonarr])
+
+    today = _date.today()
+    if days >= 0:
+        start, end = today, today + _timedelta(days=days)
+    else:
+        start, end = today + _timedelta(days=days), today
+
+    movies:   list[CalendarMovie]   = []
+    episodes: list[CalendarEpisode] = []
+
+    if (show_all or radarr) and cfg.radarr:
+        with console.status("[bold]Fetching Radarr calendar…[/]"):
+            movies = get_radarr_calendar(cfg.radarr, start, end)
+    elif show_all or radarr:
+        console.print("[dim]Radarr not configured — skipping[/]")
+
+    if (show_all or sonarr) and cfg.sonarr:
+        with console.status("[bold]Fetching Sonarr calendar…[/]"):
+            episodes = get_sonarr_calendar(cfg.sonarr, start, end)
+    elif show_all or sonarr:
+        console.print("[dim]Sonarr not configured — skipping[/]")
+
+    if not movies and not episodes:
+        if days >= 0:
+            console.print(f"[dim]Nothing scheduled in the next {days} day(s).[/]")
+        else:
+            console.print(f"[dim]Nothing found in the past {abs(days)} day(s).[/]")
+        return
+
+    # Merge and group by date; keep a flat numbered list for selection
+    from collections import defaultdict
+    by_date: dict[str, list] = defaultdict(list)
+    for m in movies:
+        by_date[m.release_date].append(m)
+    for e in episodes:
+        by_date[e.air_date].append(e)
+
+    console.print()
+    if days >= 0:
+        console.print(f"  [bold]Upcoming releases[/] [dim]— next {days} day(s) · {start} → {end}[/]")
+    else:
+        console.print(f"  [bold]Past releases[/] [dim]— last {abs(days)} day(s) · {start} → {end}[/]")
+    console.print()
+
+    numbered: list = []   # flat ordered list matching displayed numbers
+    for day in sorted(by_date):
+        d = _date.fromisoformat(day)
+        label = d.strftime("%a %b %d")
+        if d == today:
+            label += " [bold yellow](today)[/]"
+        elif d == today + _timedelta(days=1):
+            label += " [dim](tomorrow)[/]"
+        elif d == today - _timedelta(days=1):
+            label += " [dim](yesterday)[/]"
+        console.print(f"  [bold cyan]{label}[/]")
+        for item in by_date[day]:
+            numbered.append(item)
+            n = len(numbered)
+            if isinstance(item, CalendarMovie):
+                icon  = "[green]✓[/]" if item.has_file else "[dim]·[/]"
+                rtype = f"[dim]{item.release_type}[/]"
+                console.print(f"    [dim]{n:>2}.[/] {icon}  [bold]{item.title}[/] [dim]({item.year})[/]  {rtype}  [dim]movie[/]")
+            else:
+                icon  = "[green]✓[/]" if item.has_file else "[dim]·[/]"
+                ep    = f"[dim]S{item.season:02d}E{item.episode:02d}[/]"
+                console.print(f"    [dim]{n:>2}.[/] {icon}  [bold]{item.series_title}[/]  {ep}  [dim]{item.title}[/]")
+        console.print()
+
+    raw = typer.prompt(
+        "Enter # for pipeline details (or Enter to skip)",
+        default="",
+        show_default=False,
+    ).strip()
+    if not raw:
+        return
+    try:
+        choice = int(raw)
+    except ValueError:
+        console.print("[red]Not a number — skipping.[/]")
+        return
+    if not 1 <= choice <= len(numbered):
+        console.print("[red]Out of range — skipping.[/]")
+        return
+
+    _display_pipeline_from_calendar(cfg, numbered[choice - 1])
+
+
+# ── media status ──────────────────────────────────────────────────────────────
+
+import httpx as _httpx
+
+
+@media_app.command("status")
+def media_status_cmd(
+    radarr: bool = typer.Option(False, "--radarr", help="Show only Radarr"),
+    sonarr: bool = typer.Option(False, "--sonarr", help="Show only Sonarr"),
+    seerr: bool  = typer.Option(False, "--seerr",  help="Show only Seerr"),
+    plex:  bool  = typer.Option(False, "--plex",   help="Show only Plex"),
+) -> None:
+    """Show connectivity status for all media services."""
+    cfg = _load()
+    # No flags = show all
+    show_all = not any([radarr, sonarr, seerr, plex])
+
+    def _row(name: str, ok: bool, detail: str) -> None:
+        icon  = "[green]✓[/]" if ok else "[red]✗[/]"
+        style = "green" if ok else "red"
+        console.print(f"  {icon}  [bold]{name:<10}[/]  [{style}]{detail}[/]")
+
+    if show_all or radarr:
+        if cfg.radarr is None:
+            _row("Radarr", False, "not configured")
+        else:
+            with console.status("Querying Radarr…"):
+                s = arr_get_status(cfg.radarr)
+            _row("Radarr", s.online, f"{s.app_name} {s.version}" if s.online else s.error)
+
+    if show_all or sonarr:
+        if cfg.sonarr is None:
+            _row("Sonarr", False, "not configured")
+        else:
+            with console.status("Querying Sonarr…"):
+                s = arr_get_status(cfg.sonarr)
+            _row("Sonarr", s.online, f"{s.app_name} {s.version}" if s.online else s.error)
+
+    if show_all or seerr:
+        if cfg.seerr is None:
+            _row("Seerr", False, "not configured")
+        else:
+            try:
+                with console.status("Querying Seerr…"):
+                    r = _httpx.get(
+                        f"{cfg.seerr.base_url}/api/v1/settings/public",
+                        verify=cfg.seerr.verify_ssl, timeout=10,
+                    )
+                if r.is_success:
+                    version = r.json().get("applicationVersion", "")
+                    _row("Seerr", True, f"v{version}" if version else "online")
+                else:
+                    _row("Seerr", False, f"HTTP {r.status_code}")
+            except Exception as e:
+                _row("Seerr", False, str(e))
+
+    if show_all or plex:
+        if cfg.plex is None:
+            _row("Plex", False, "not configured")
+        else:
+            try:
+                with console.status("Querying Plex…"):
+                    r = _httpx.get(
+                        f"{cfg.plex.base_url}/identity",
+                        headers={"Accept": "application/json"},
+                        verify=cfg.plex.verify_ssl, timeout=10,
+                    )
+                if r.is_success:
+                    version = (r.json().get("MediaContainer") or {}).get("version", "")
+                    _row("Plex", True, f"v{version}" if version else "online")
+                else:
+                    _row("Plex", False, f"HTTP {r.status_code}")
+            except Exception as e:
+                _row("Plex", False, str(e))
+
+
+# ── media today ───────────────────────────────────────────────────────────────
+
+
+@media_app.command("today")
+def media_today_cmd() -> None:
+    """Today's media — scheduled releases, requests, and downloads with file details."""
+    cfg = _load()
+    today = _date.today()
+
+    import re as _re
+    _year_sfx = _re.compile(r"\s*\((\d{4})\)$")
+
+    def _strip_year(raw: str) -> tuple[str, int]:
+        m = _year_sfx.search(raw)
+        return (raw[:m.start()], int(m.group(1))) if m else (raw, 0)
+
+    # ── 1. Fetch ────────────────────────────────────────────────────────────────
+    cal_movies: list[CalendarMovie] = []
+    cal_episodes: list[CalendarEpisode] = []
+    radarr_queue: list = []
+    sonarr_queue: list = []
+    radarr_imports: list = []
+    sonarr_imports: list = []
+    seerr_reqs: list = []
+
+    if cfg.radarr:
+        with console.status("[bold]Fetching Radarr…[/]"):
+            cal_movies = get_radarr_calendar(cfg.radarr, today, today)
+            radarr_queue = arr_get_queue(cfg.radarr)
+            radarr_imports = arr_get_today_imports(cfg.radarr, today)
+    if cfg.sonarr:
+        with console.status("[bold]Fetching Sonarr…[/]"):
+            cal_episodes = get_sonarr_calendar(cfg.sonarr, today, today)
+            sonarr_queue = arr_get_queue(cfg.sonarr)
+            sonarr_imports = arr_get_today_imports(cfg.sonarr, today)
+    if cfg.seerr:
+        try:
+            with console.status("[bold]Fetching Seerr…[/]"):
+                all_seerr = seerr_list_requests(cfg.seerr)
+            seerr_reqs = [r for r in all_seerr if r.created_at == today.isoformat()]
+        except Exception:
+            pass
+
+    all_imports = radarr_imports + sonarr_imports
+
+    # ── 2. Header ───────────────────────────────────────────────────────────────
+    console.print()
+    console.print(f"  [bold]Today[/] [dim]— {today}[/]")
+
+    # ── 3. Releases ─────────────────────────────────────────────────────────────
+    console.print()
+    console.print("  [bold]Releases[/]")
+    if cal_movies:
+        console.print("  [cyan]Movies[/]")
+        for m in cal_movies:
+            in_q = bool(m.arr_id and any(q.movie_id == m.arr_id for q in radarr_queue))
+            if m.has_file:
+                status = "[green]downloaded[/]"
+            elif in_q:
+                q_item = next((q for q in radarr_queue if q.movie_id == m.arr_id), None)
+                pct = f" {q_item.progress_pct:.0f}%" if q_item else ""
+                status = f"[cyan]downloading{pct}[/]"
+            else:
+                status = "[dim]not found[/]"
+            console.print(f"    [bold]{m.title}[/] [dim]({m.year}) · {m.release_type}[/]  [dim]—[/] {status}")
+    if cal_episodes:
+        console.print("  [cyan]TV[/]")
+        for e in cal_episodes:
+            title, _ = _strip_year(e.series_title)
+            ep = f"S{e.season:02d}E{e.episode:02d}"
+            in_q = bool(e.series_id and any(q.series_id == e.series_id for q in sonarr_queue))
+            if e.has_file:
+                status = "[green]downloaded[/]"
+            elif in_q:
+                status = "[cyan]downloading[/]"
+            else:
+                status = "[dim]not found[/]"
+            console.print(f"    [bold]{title}[/]  [dim]{ep} {e.title}[/]  [dim]—[/] {status}")
+    if not cal_movies and not cal_episodes:
+        console.print("  [dim]Nothing scheduled for today.[/]")
+
+    # ── 4. Requests ─────────────────────────────────────────────────────────────
+    console.print()
+    console.print("  [bold]Requests[/]")
+    req_movies = [r for r in seerr_reqs if r.media_type == "movie"]
+    req_tv     = [r for r in seerr_reqs if r.media_type != "movie"]
+
+    def _req_line(req) -> str:
+        # Media moving past "unknown" means the request was acted on, even if
+        # Jellyseerr left the approval status as "pending" (auto-approve quirk).
+        approved = req.request_status_code >= 2 or req.media_status_code > 1
+        rs_color = "green" if approved else "yellow"
+        rs_label = "approved" if approved else req.request_status
+        ms_color = {5: "green", 4: "yellow", 3: "cyan"}.get(req.media_status_code, "dim")
+        by = f"  [dim]by {req.requested_by}[/]" if req.requested_by else ""
+        return f"[{rs_color}]{rs_label}[/] [dim]·[/] [{ms_color}]{req.media_status}[/]{by}"
+
+    if req_movies:
+        console.print("  [cyan]Movies[/]")
+        for r in req_movies:
+            console.print(f"    [bold]{r.title}[/]  {_req_line(r)}")
+    if req_tv:
+        console.print("  [cyan]TV[/]")
+        for r in req_tv:
+            console.print(f"    [bold]{r.title}[/]  {_req_line(r)}")
+    if not seerr_reqs:
+        console.print("  [dim]No requests today.[/]")
+
+    # ── 5. Downloads ─────────────────────────────────────────────────────────────
+    console.print()
+    console.print("  [bold]Downloads[/]")
+    dl_movies = [imp for imp in all_imports if imp.media_type == "movie"]
+    dl_tv     = [imp for imp in all_imports if imp.media_type == "episode"]
+
+    # Plex — batch unique titles to avoid N+1
+    plex_cache: dict[str, "PlexMatch"] = {}
+    if cfg.plex and (dl_movies or dl_tv):
+        seen: set[str] = set()
+        to_check: list[tuple[str, str, int]] = []
+        for imp in dl_movies:
+            clean, yr = _strip_year(imp.title)
+            if clean.lower() not in seen:
+                seen.add(clean.lower())
+                to_check.append((clean, "movie", yr or imp.year))
+        for imp in dl_tv:
+            clean, yr = _strip_year(imp.title)
+            if clean.lower() not in seen:
+                seen.add(clean.lower())
+                to_check.append((clean, "tv", yr or imp.year))
+        for title, mtype, year in to_check:
+            with console.status(f"[bold]Checking Plex for [cyan]{title}[/]…[/]"):
+                match = plex_find_media(cfg.plex, title, mtype, year)
+                if not match.found and year:
+                    match = plex_find_media(cfg.plex, title, mtype, 0)
+            plex_cache[title.lower()] = match
+
+    def _plex_tag(raw_title: str) -> str:
+        if not cfg.plex:
+            return ""
+        clean, _ = _strip_year(raw_title)
+        m = plex_cache.get(clean.lower())
+        if m is None:
+            return ""
+        return "  [green]✓ Plex[/]" if m.found else "  [dim]· not in Plex[/]"
+
+    def _file_meta(imp) -> str:
+        parts = [p for p in [imp.quality, _fmt_bytes(imp.size_bytes) if imp.size_bytes else ""] if p]
+        return f"  [dim]{' · '.join(parts)}[/]" if parts else ""
+
+    if dl_movies:
+        console.print("  [cyan]Movies[/]")
+        for imp in dl_movies:
+            clean, yr = _strip_year(imp.title)
+            year_str = f" ({yr or imp.year})" if (yr or imp.year) else ""
+            console.print(f"    [bold]{clean}[/][dim]{year_str}[/]{_file_meta(imp)}{_plex_tag(imp.title)}")
+    if dl_tv:
+        console.print("  [cyan]TV[/]")
+        for imp in dl_tv:
+            clean, _ = _strip_year(imp.title)
+            ep = f"S{imp.season:02d}E{imp.episode:02d}"
+            ep_title = f" · {imp.episode_title}" if imp.episode_title else ""
+            console.print(f"    [bold]{clean}[/]  [dim]{ep}{ep_title}[/]{_file_meta(imp)}{_plex_tag(imp.title)}")
+    if not dl_movies and not dl_tv:
+        console.print("  [dim]Nothing downloaded today.[/]")
+
+    console.print()
+
+
+@media_app.command("search-today")
+def media_search_today_cmd(
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation prompt"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Show what would be searched without triggering"),
+) -> None:
+    """Search for today's calendar releases that haven't been downloaded yet.
+
+    Fetches today's Radarr/Sonarr calendar, skips items already downloaded or
+    actively queued, then fires a single batch search per service — one
+    MoviesSearch command and one EpisodeSearch command.  Uses the search-state
+    cooldown so re-running within the cooldown window won't hammer indexers.
+    """
+    cfg = _load()
+    today = _date.today()
+    search_state = _load_search_state(cfg.config_path)
+
+    import re as _re
+    _year_sfx = _re.compile(r"\s*\((\d{4})\)$")
+
+    def _strip_year(raw: str) -> tuple[str, int]:
+        m = _year_sfx.search(raw)
+        return (raw[:m.start()], int(m.group(1))) if m else (raw, 0)
+
+    # ── Fetch ─────────────────────────────────────────────────────────────────
+    cal_movies: list[CalendarMovie] = []
+    cal_episodes: list[CalendarEpisode] = []
+    radarr_queue: list = []
+    sonarr_queue: list = []
+
+    if cfg.radarr:
+        with console.status("[bold]Fetching Radarr calendar…[/]"):
+            cal_movies = get_radarr_calendar(cfg.radarr, today, today)
+            radarr_queue = arr_get_queue(cfg.radarr)
+    if cfg.sonarr:
+        with console.status("[bold]Fetching Sonarr calendar…[/]"):
+            cal_episodes = get_sonarr_calendar(cfg.sonarr, today, today)
+            sonarr_queue = arr_get_queue(cfg.sonarr)
+
+    # ── Filter to actionable items ────────────────────────────────────────────
+    # movie: (arr_id, title, year, release_type, skip_reason)
+    movie_rows: list[tuple[int, str, int, str, str]] = []
+    for m in cal_movies:
+        if not m.monitored:
+            movie_rows.append((m.arr_id, m.title, m.year, m.release_type, "unmonitored"))
+        elif m.has_file:
+            movie_rows.append((m.arr_id, m.title, m.year, m.release_type, "downloaded"))
+        elif m.arr_id and any(q.movie_id == m.arr_id for q in radarr_queue):
+            movie_rows.append((m.arr_id, m.title, m.year, m.release_type, "in queue"))
+        else:
+            ok, reason = search_state.can_search(f"movie:{m.arr_id}")
+            skip = "" if ok else f"cooldown ({reason})"
+            movie_rows.append((m.arr_id, m.title, m.year, m.release_type, skip))
+
+    # episode: (episode_id, series_title, season, ep_num, ep_title, skip_reason)
+    episode_rows: list[tuple[int, str, int, int, str, str]] = []
+    for e in cal_episodes:
+        title, _ = _strip_year(e.series_title)
+        if not e.monitored:
+            episode_rows.append((e.episode_id, title, e.season, e.episode, e.title, "unmonitored"))
+        elif e.has_file:
+            episode_rows.append((e.episode_id, title, e.season, e.episode, e.title, "downloaded"))
+        elif e.series_id and any(q.series_id == e.series_id for q in sonarr_queue):
+            episode_rows.append((e.episode_id, title, e.season, e.episode, e.title, "in queue"))
+        else:
+            ok, reason = (search_state.can_search(f"episode:{e.episode_id}") if e.episode_id
+                          else (True, ""))
+            skip = "" if ok else f"cooldown ({reason})"
+            episode_rows.append((e.episode_id, title, e.season, e.episode, e.title, skip))
+
+    movies_to_search = [arr_id for arr_id, *_, skip in movie_rows if not skip and arr_id]
+    episodes_to_search = [ep_id for ep_id, *_, skip in episode_rows if not skip and ep_id]
+
+    # ── Display plan ──────────────────────────────────────────────────────────
+    console.print()
+    console.print(f"  [bold]search-today[/] [dim]— {today}[/]")
+
+    if not cal_movies and not cal_episodes:
+        console.print()
+        console.print("  [dim]Nothing on the calendar for today.[/]")
+        console.print()
+        return
+
+    console.print()
+    if movie_rows:
+        console.print("  [cyan]Movies[/]")
+        for arr_id, title, year, release_type, skip in movie_rows:
+            label = f"[dim]{release_type}[/]" if release_type else ""
+            if skip:
+                mark = "[dim]·[/]"
+                note = f"  [dim]— {skip}[/]"
+            else:
+                mark = "[yellow]→[/]"
+                note = ""
+            console.print(f"    {mark} [bold]{title}[/] [dim]({year})[/]  {label}{note}")
+
+    if episode_rows:
+        console.print("  [cyan]TV[/]")
+        for ep_id, title, season, ep_num, ep_title, skip in episode_rows:
+            ep = f"S{season:02d}E{ep_num:02d}"
+            ep_str = f" [dim]· {ep_title}[/]" if ep_title else ""
+            if skip:
+                mark = "[dim]·[/]"
+                note = f"  [dim]— {skip}[/]"
+            else:
+                mark = "[yellow]→[/]"
+                note = ""
+            console.print(f"    {mark} [bold]{title}[/]  [dim]{ep}[/]{ep_str}{note}")
+
+    console.print()
+
+    if not movies_to_search and not episodes_to_search:
+        console.print("  [dim]Nothing to search — all items are downloaded, queued, or on cooldown.[/]")
+        console.print()
+        return
+
+    nm = len(movies_to_search)
+    ne = len(episodes_to_search)
+    parts = []
+    if nm:
+        parts.append(f"{nm} movie{'s' if nm != 1 else ''}")
+    if ne:
+        parts.append(f"{ne} episode{'s' if ne != 1 else ''}")
+    summary = " and ".join(parts)
+
+    if dry_run:
+        console.print(f"  [dim]Dry run — would search {summary}.[/]")
+        console.print()
+        return
+
+    if not yes:
+        confirm = typer.confirm(f"  Trigger search for {summary}?", default=False)
+        if not confirm:
+            console.print("  [dim]Aborted.[/]")
+            console.print()
+            return
+
+    # ── Fire searches ─────────────────────────────────────────────────────────
+    if movies_to_search and cfg.radarr:
+        try:
+            radarr_search_movies(cfg.radarr, movies_to_search)
+            for mid in movies_to_search:
+                search_state.record_search(f"movie:{mid}")
+            console.print(f"  [green]✓[/] Radarr: search triggered for {nm} movie{'s' if nm != 1 else ''}.")
+        except Exception as exc:
+            console.print(f"  [red]✗[/] Radarr search failed: {exc}")
+
+    if episodes_to_search and cfg.sonarr:
+        try:
+            sonarr_search_episodes(cfg.sonarr, episodes_to_search)
+            for eid in episodes_to_search:
+                search_state.record_search(f"episode:{eid}")
+            console.print(f"  [green]✓[/] Sonarr: search triggered for {ne} episode{'s' if ne != 1 else ''}.")
+        except Exception as exc:
+            console.print(f"  [red]✗[/] Sonarr search failed: {exc}")
+
+    console.print()
+
+
+# ── plex ──────────────────────────────────────────────────────────────────────
+
+plex_app = typer.Typer(
+    help="Manage Plex Media Server",
+    no_args_is_help=True,
+    rich_markup_mode="rich",
+)
+media_app.add_typer(plex_app, name="plex")
+
+
+def _plex(cfg: Config):
+    if cfg.plex is None:
+        console.print("[red]No plex section in config.yaml[/]")
+        raise typer.Exit(1)
+    return cfg.plex
+
+
+@plex_app.command("status")
+def plex_status_cmd() -> None:
+    """Show Plex server version and connectivity."""
+    cfg = _load()
+    with console.status("[bold]Querying Plex…[/]"):
+        info = plex_get_server_info(_plex(cfg))
+    if info.error:
+        console.print(f"[red]✗[/] Plex offline: {info.error}")
+    else:
+        name = f" ({info.friendly_name})" if info.friendly_name else ""
+        console.print(f"[green]✓[/] Plex v{info.version}{name}")
+        if info.machine_id:
+            console.print(f"  [dim]machine ID: {info.machine_id}[/]")
+
+
+@plex_app.command("libraries")
+def plex_libraries_cmd() -> None:
+    """List all Plex library sections."""
+    cfg = _load()
+    with console.status("[bold]Fetching Plex libraries…[/]"):
+        libs = plex_list_libraries(_plex(cfg))
+    if isinstance(libs, str):
+        console.print(f"[red]Error:[/] {libs}")
+        raise typer.Exit(1)
+    t = Table(box=box.SIMPLE_HEAD, show_edge=False)
+    t.add_column("ID",    style="dim",   no_wrap=True)
+    t.add_column("Title", style="bold")
+    t.add_column("Type")
+    t.add_column("Items", justify="right")
+    for lib in libs:
+        t.add_row(str(lib.key), lib.title, lib.lib_type, str(lib.count))
+    console.print(t)
+
+
+@plex_app.command("scan")
+def plex_scan_cmd(
+    library: Optional[str] = typer.Argument(
+        None, help="Library name or ID to scan (omit for all libraries)"
+    ),
+) -> None:
+    """Trigger a filesystem scan on one or all Plex libraries."""
+    cfg = _load()
+    pc = _plex(cfg)
+
+    if library is None:
+        with console.status("[bold]Fetching libraries…[/]"):
+            libs = plex_list_libraries(pc)
+        if isinstance(libs, str):
+            console.print(f"[red]Error:[/] {libs}")
+            raise typer.Exit(1)
+        for lib in libs:
+            with console.status(f"[bold]Scanning [cyan]{lib.title}[/]…[/]"):
+                err = plex_scan_library(pc, lib.key)
+            if err:
+                console.print(f"[red]✗[/] {lib.title}: {err}")
+            else:
+                console.print(f"[green]✓[/] Scan queued for [bold]{lib.title}[/] (id={lib.key})")
+    else:
+        key = plex_section_key(pc, library)
+        if isinstance(key, str):
+            console.print(f"[red]Error:[/] {key}")
+            raise typer.Exit(1)
+        with console.status(f"[bold]Scanning library {key}…[/]"):
+            err = plex_scan_library(pc, key)
+        if err:
+            console.print(f"[red]✗[/] {err}")
+            raise typer.Exit(1)
+        console.print(f"[green]✓[/] Scan queued for library id={key}")
+
+
+@plex_app.command("analyze")
+def plex_analyze_cmd(
+    library: Optional[str] = typer.Argument(
+        None, help="Library name or ID to analyze (omit for all libraries)"
+    ),
+) -> None:
+    """Trigger media analysis (thumbnails, chapter images) on one or all libraries."""
+    cfg = _load()
+    pc = _plex(cfg)
+
+    if library is None:
+        with console.status("[bold]Fetching libraries…[/]"):
+            libs = plex_list_libraries(pc)
+        if isinstance(libs, str):
+            console.print(f"[red]Error:[/] {libs}")
+            raise typer.Exit(1)
+        for lib in libs:
+            with console.status(f"[bold]Analyzing [cyan]{lib.title}[/]…[/]"):
+                err = plex_analyze_library(pc, lib.key)
+            if err:
+                console.print(f"[red]✗[/] {lib.title}: {err}")
+            else:
+                console.print(f"[green]✓[/] Analysis queued for [bold]{lib.title}[/] (id={lib.key})")
+    else:
+        key = plex_section_key(pc, library)
+        if isinstance(key, str):
+            console.print(f"[red]Error:[/] {key}")
+            raise typer.Exit(1)
+        with console.status(f"[bold]Analyzing library {key}…[/]"):
+            err = plex_analyze_library(pc, key)
+        if err:
+            console.print(f"[red]✗[/] {err}")
+            raise typer.Exit(1)
+        console.print(f"[green]✓[/] Analysis queued for library id={key}")
+
+
+@plex_app.command("empty-trash")
+def plex_empty_trash_cmd(
+    library: Optional[str] = typer.Argument(
+        None, help="Library name or ID (omit for all libraries)"
+    ),
+) -> None:
+    """Empty the Plex trash for one or all libraries."""
+    cfg = _load()
+    pc = _plex(cfg)
+
+    if library is None:
+        with console.status("[bold]Fetching libraries…[/]"):
+            libs = plex_list_libraries(pc)
+        if isinstance(libs, str):
+            console.print(f"[red]Error:[/] {libs}")
+            raise typer.Exit(1)
+        for lib in libs:
+            with console.status(f"[bold]Emptying trash for [cyan]{lib.title}[/]…[/]"):
+                err = plex_empty_trash(pc, lib.key)
+            if err:
+                console.print(f"[red]✗[/] {lib.title}: {err}")
+            else:
+                console.print(f"[green]✓[/] Trash emptied for [bold]{lib.title}[/]")
+    else:
+        key = plex_section_key(pc, library)
+        if isinstance(key, str):
+            console.print(f"[red]Error:[/] {key}")
+            raise typer.Exit(1)
+        with console.status(f"[bold]Emptying trash for library {key}…[/]"):
+            err = plex_empty_trash(pc, key)
+        if err:
+            console.print(f"[red]✗[/] {err}")
+            raise typer.Exit(1)
+        console.print(f"[green]✓[/] Trash emptied for library id={key}")
+
+
+@plex_app.command("clean-bundles")
+def plex_clean_bundles_cmd() -> None:
+    """Clean up orphaned metadata bundles (server-wide)."""
+    cfg = _load()
+    with console.status("[bold]Cleaning Plex bundles…[/]"):
+        err = plex_clean_bundles(_plex(cfg))
+    if err:
+        console.print(f"[red]✗[/] {err}")
+        raise typer.Exit(1)
+    console.print("[green]✓[/] Bundle clean queued")
+
+
+# ── radar ─────────────────────────────────────────────────────────────────────
+
+@app.command("radar")
+def launch_tui() -> None:
+    """Launch the interactive TUI dashboard."""
+    cfg = _load()
+    from main import HomelabApp
+    HomelabApp(cfg).run()
