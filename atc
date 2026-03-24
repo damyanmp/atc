@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# atc — Air Traffic Control for your homelab
+# Usage: atc [command] [args...]
+#   atc tui              Launch interactive TUI
+#   atc check [target]   Check status of nodes/vms/lxcs/dsm
+#   atc update lxc|vm    Run apt upgrades on guests
+#   atc run [script]     Browse and run repo scripts
+#   atc secrets          Manage keychain secrets
+#
+# Symlink to ~/bin:  ln -s $(pwd)/atc ~/bin/atc
+
+set -euo pipefail
+
+# Resolve symlinks so SCRIPT_DIR always points to the real infrastructure/cli/ directory.
+_SOURCE="${BASH_SOURCE[0]}"
+while [[ -L "$_SOURCE" ]]; do _SOURCE="$(readlink "$_SOURCE")"; done
+SCRIPT_DIR="$(cd "$(dirname "$_SOURCE")" && pwd)"
+
+if ! command -v uv &>/dev/null; then
+    echo "Error: 'uv' is required but not installed."
+    echo "Install with: curl -LsSf https://astral.sh/uv/install.sh | sh"
+    exit 1
+fi
+
+if [[ ! -f "$SCRIPT_DIR/config.yaml" ]]; then
+    echo "Error: config.yaml not found."
+    echo "Copy the template and fill in your values:"
+    echo "  cp $SCRIPT_DIR/config.yaml.example $SCRIPT_DIR/config.yaml"
+    exit 1
+fi
+
+exec uv run --project "$SCRIPT_DIR" python "$SCRIPT_DIR/src/main.py" "$@"
