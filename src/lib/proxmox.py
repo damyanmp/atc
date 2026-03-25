@@ -6,6 +6,7 @@ and guests automatically — no need to query each node separately.
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -45,6 +46,26 @@ class GuestInfo:
 class ClusterStatus:
     nodes: list[NodeStatus] = field(default_factory=list)
     guests: list[GuestInfo] = field(default_factory=list)
+
+
+@dataclass
+class GuestDetail:
+    vmid: int
+    name: str
+    node: str
+    type: str           # "qemu" or "lxc"
+    status: str
+    cpu_usage: float    # 0.0–1.0 current utilisation
+    cpu_cores: int      # allocated vCPUs
+    mem_used: int       # bytes
+    mem_total: int      # bytes
+    disk_used: int      # bytes
+    disk_total: int     # bytes
+    ips: list[str]
+    uptime: int         # seconds
+    tags: str
+    ostype: str = ""
+    error: str = ""
 
 
 def _connect(cfg: ProxmoxClusterConfig) -> ProxmoxAPI:
@@ -109,8 +130,21 @@ async def fetch_cluster_status(cfg: ProxmoxClusterConfig) -> ClusterStatus:
     return await loop.run_in_executor(None, _fetch_cluster, cfg)
 
 
+async def fetch_guest_ips(cfg: ProxmoxClusterConfig, guests: list[GuestInfo]) -> dict[int, str]:
+    """Fetch IPs for all running guests in parallel. Returns {vmid: ip}."""
+    running = [g for g in guests if g.status == "running"]
+    loop = asyncio.get_event_loop()
+
+    async def _get(g: GuestInfo) -> tuple[int, str]:
+        ip = await loop.run_in_executor(None, get_node_ip, cfg, g.node, g.vmid, g.type)
+        return g.vmid, ip or ""
+
+    results = await asyncio.gather(*[_get(g) for g in running])
+    return {vmid: ip for vmid, ip in results if ip}
+
+
 def get_node_ip(cfg: ProxmoxClusterConfig, node: str, vmid: int, guest_type: str) -> str | None:
-    """Try to get the IP of a running guest via QEMU guest agent or LXC network."""
+    """Try to get the IP of a running guest via QEMU guest agent or LXC network interfaces."""
     try:
         px = _connect(cfg)
         if guest_type == "qemu":
@@ -120,9 +154,86 @@ def get_node_ip(cfg: ProxmoxClusterConfig, node: str, vmid: int, guest_type: str
                     ip = addr.get("ip-address", "")
                     if addr.get("ip-address-type") == "ipv4" and not ip.startswith("127."):
                         return ip
+        elif guest_type == "lxc":
+            for iface in px.nodes(node).lxc(vmid).interfaces.get():
+                inet = iface.get("inet", "")
+                if inet and not inet.startswith("127."):
+                    return inet.split("/")[0]
     except Exception:
         pass
     return None
+
+
+def fetch_guest_detail(
+    cfg: ProxmoxClusterConfig, node: str, vmid: int, guest_type: str
+) -> GuestDetail:
+    """Fetch detailed runtime stats and config for a single VM or LXC."""
+    try:
+        px = _connect(cfg)
+        if guest_type == "lxc":
+            status = px.nodes(node).lxc(vmid).status.current.get()
+            config = px.nodes(node).lxc(vmid).config.get()
+            ips: list[str] = []
+            try:
+                for iface in px.nodes(node).lxc(vmid).interfaces.get():
+                    inet = iface.get("inet", "")
+                    if inet and not inet.startswith("127."):
+                        ips.append(inet.split("/")[0])
+            except Exception:
+                pass
+        else:  # qemu
+            status = px.nodes(node).qemu(vmid).status.current.get()
+            config = px.nodes(node).qemu(vmid).config.get()
+            ips = []
+            try:
+                result = px.nodes(node).qemu(vmid).agent("network-get-interfaces").get()
+                for iface in result.get("result", []):
+                    for addr in iface.get("ip-addresses", []):
+                        ip = addr.get("ip-address", "")
+                        if addr.get("ip-address-type") == "ipv4" and not ip.startswith("127."):
+                            ips.append(ip)
+            except Exception:
+                pass
+
+        cpu_cores = int(config.get("cores", config.get("cpus", 1)))
+        name = status.get("name", config.get("hostname", f"{guest_type}-{vmid}"))
+        tags = status.get("tags", config.get("tags", ""))
+
+        return GuestDetail(
+            vmid=vmid,
+            name=name,
+            node=node,
+            type=guest_type,
+            status=status.get("status", "unknown"),
+            cpu_usage=float(status.get("cpu", 0)),
+            cpu_cores=cpu_cores,
+            mem_used=int(status.get("mem", 0)),
+            mem_total=int(status.get("maxmem", 0)),
+            disk_used=int(status.get("disk", 0)),
+            disk_total=int(status.get("maxdisk", 0)),
+            ips=ips,
+            uptime=int(status.get("uptime", 0)),
+            tags=tags,
+            ostype=config.get("ostype", ""),
+        )
+    except Exception as e:
+        return GuestDetail(
+            vmid=vmid,
+            name=f"{guest_type}-{vmid}",
+            node=node,
+            type=guest_type,
+            status="unknown",
+            cpu_usage=0.0,
+            cpu_cores=0,
+            mem_used=0,
+            mem_total=0,
+            disk_used=0,
+            disk_total=0,
+            ips=[],
+            uptime=0,
+            tags="",
+            error=str(e),
+        )
 
 
 def start_guest(cfg: ProxmoxClusterConfig, node: str, vmid: int, guest_type: str) -> bool:
@@ -289,3 +400,42 @@ def find_backup_storage(cfg: ProxmoxClusterConfig, node: str) -> str | None:
     except Exception:
         pass
     return None
+
+
+# ── SSH key injection ──────────────────────────────────────────────────────────
+
+def push_ssh_key_qemu(
+    cfg: ProxmoxClusterConfig,
+    node: str,
+    vmid: int,
+    pubkey: str,
+) -> tuple[bool, str]:
+    """Inject an SSH public key into a QEMU VM via the guest agent exec API.
+
+    Requires qemu-guest-agent running inside the VM.
+    Returns (success, message).
+    """
+    key = pubkey.strip()
+    script = (
+        "mkdir -p /root/.ssh && "
+        "chmod 700 /root/.ssh && "
+        f"grep -qxF '{key}' /root/.ssh/authorized_keys 2>/dev/null "
+        f"|| echo '{key}' >> /root/.ssh/authorized_keys && "
+        "chmod 600 /root/.ssh/authorized_keys"
+    )
+    try:
+        px = _connect(cfg)
+        result = px.nodes(node).qemu(vmid).agent("exec").post(**{"command": ["bash", "-c", script]})
+        pid = result.get("pid")
+        if pid is None:
+            return False, "guest agent exec returned no pid"
+        for _ in range(60):
+            st = px.nodes(node).qemu(vmid).agent("exec-status").get(pid=pid)
+            if st.get("exited"):
+                ec = int(st.get("exitcode", 1))
+                err = st.get("err-data", "")
+                return ec == 0, (err.strip() or f"exit: {ec}")
+            time.sleep(0.5)
+        return False, "timeout waiting for guest agent exec"
+    except Exception as e:
+        return False, str(e)
