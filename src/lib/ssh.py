@@ -31,11 +31,12 @@ async def run_command(
 ) -> CommandResult:
     """Run a single command on a remote host and return the full output."""
     effective_user = user or ssh_cfg.default_user
+    known_hosts = None if not ssh_cfg.verify_host_keys else asyncssh.read_known_hosts("~/.ssh/known_hosts")
     try:
         async with asyncssh.connect(
             host,
             username=effective_user,
-            known_hosts=None,         # homelab: skip host key verification
+            known_hosts=known_hosts,
             connect_timeout=ssh_cfg.connect_timeout,
         ) as conn:
             result = await conn.run(command, check=False)
@@ -64,11 +65,12 @@ async def stream_command(
 ) -> AsyncIterator[str]:
     """Stream command output line by line from a remote host."""
     effective_user = user or ssh_cfg.default_user
+    known_hosts = None if not ssh_cfg.verify_host_keys else asyncssh.read_known_hosts("~/.ssh/known_hosts")
     try:
         async with asyncssh.connect(
             host,
             username=effective_user,
-            known_hosts=None,
+            known_hosts=known_hosts,
             connect_timeout=ssh_cfg.connect_timeout,
         ) as conn:
             async with conn.create_process(command) as process:
