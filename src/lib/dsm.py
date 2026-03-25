@@ -6,7 +6,10 @@ from dataclasses import dataclass, field
 
 import httpx
 
-from config import DSMConfig
+from config import DSMConfig, KEYCHAIN_SERVICE
+
+# DSM session identifier — groups all requests from this tool in DSM logs
+_SESSION = KEYCHAIN_SERVICE
 
 # DSM error code 403 = 2FA required
 _ERR_2FA = 403
@@ -36,7 +39,7 @@ async def _login(client: httpx.AsyncClient, cfg: DSMConfig, otp_code: str = "") 
         "method": "login",
         "account": cfg.user,
         "passwd": cfg.password,
-        "session": "homelab-cli",
+        "session": _SESSION,
         "format": "sid",
     }
     if otp_code:
@@ -80,7 +83,7 @@ async def _logout(client: httpx.AsyncClient, cfg: DSMConfig, sid: str) -> None:
                 "api": "SYNO.API.Auth",
                 "version": "1",
                 "method": "logout",
-                "session": "homelab-cli",
+                "session": _SESSION,
                 "_sid": sid,
             },
             timeout=5,
