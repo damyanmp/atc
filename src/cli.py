@@ -5,6 +5,7 @@ import asyncio
 import getpass
 import json as _json
 import sys
+import time
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
@@ -15,7 +16,10 @@ import typer
 from rich.console import Console
 from rich.table import Table
 from rich import box
-from rich.prompt import Confirm
+from rich.panel import Panel
+from rich.prompt import Confirm, Prompt
+from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, MofNCompleteColumn
+from rich.text import Text
 
 sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(Path(__file__).parent / "lib"))
@@ -23,6 +27,7 @@ sys.path.insert(0, str(Path(__file__).parent / "lib"))
 from config import (
     Config, load_config,
     secret_set, secret_delete, secret_get, secrets_list,
+    save_guest_user,
     KEYCHAIN_SERVICE,
 )
 from lib.pihole import (
@@ -41,15 +46,18 @@ from lib.ha import (
     list_updates as ha_list_updates,
 )
 from lib.proxmox import (
-    fetch_cluster_status, ClusterStatus, GuestInfo,
+    fetch_cluster_status, fetch_guest_ips, ClusterStatus, GuestInfo,
+    fetch_guest_detail, GuestDetail,
+    get_node_ip,
     start_guest, stop_guest, restart_guest,
     list_backups, BackupFile,
     list_backup_jobs, BackupJob,
     run_backup_job, backup_guest, find_backup_storage,
+    push_ssh_key_qemu,
 )
 from lib.dsm import fetch_all_dsm
 from lib.tls import check_all_certs, CertStatus
-from lib.ssh import UpdateTarget, run_update, stream_command
+from lib.ssh import UpdateTarget, run_update, run_command, stream_command
 from screens.scripts import _find_scripts, _get_script_description
 
 console = Console()
@@ -153,6 +161,11 @@ def _guest_tags(guest) -> list[str]:
     return [t.strip().lower() for t in raw.replace(",", ";").split(";") if t.strip()]
 
 
+def _shell_quote(s: str) -> str:
+    """Wrap a string in single quotes, escaping any embedded single quotes."""
+    return "'" + s.replace("'", "'\\''") + "'"
+
+
 def _resolve_guests(
     cluster: ClusterStatus,
     selector: str,
@@ -209,7 +222,11 @@ def _nodes_to_json(cluster: ClusterStatus) -> list[dict]:
     ]
 
 
-def _guests_to_json(cluster: ClusterStatus, guest_type: str | None = None) -> list[dict]:
+def _guests_to_json(
+    cluster: ClusterStatus,
+    guest_type: str | None = None,
+    ip_map: dict[int, str] | None = None,
+) -> list[dict]:
     guests = [
         g for g in cluster.guests
         if guest_type is None or g.type == guest_type
@@ -221,6 +238,7 @@ def _guests_to_json(cluster: ClusterStatus, guest_type: str | None = None) -> li
             "type": g.type,
             "node": g.node,
             "status": g.status,
+            "ip": (ip_map or {}).get(g.vmid, ""),
             "cpu": round(g.cpu, 4),
             "mem": g.mem,
             "maxmem": g.maxmem,
@@ -286,7 +304,11 @@ def _render_nodes_wide(cluster: ClusterStatus) -> None:
     console.print(t)
 
 
-def _render_guests_wide(cluster: ClusterStatus, guest_type: str | None) -> None:
+def _render_guests_wide(
+    cluster: ClusterStatus,
+    guest_type: str | None,
+    ip_map: dict[int, str] | None = None,
+) -> None:
     guests = sorted(
         [g for g in cluster.guests if guest_type is None or g.type == guest_type],
         key=lambda g: (g.status != "running", g.type, g.name),
@@ -304,6 +326,7 @@ def _render_guests_wide(cluster: ClusterStatus, guest_type: str | None) -> None:
     t.add_column("Type", width=4)
     t.add_column("VMID", justify="right")
     t.add_column("Node")
+    t.add_column("IP")
     t.add_column("Status")
     t.add_column("CPU", justify="right")
     t.add_column("Memory", justify="right")
@@ -321,7 +344,8 @@ def _render_guests_wide(cluster: ClusterStatus, guest_type: str | None) -> None:
         )
         uptime = _fmt_uptime(g.uptime) if g.status == "running" else "—"
         tags = g.tags.replace(";", " ") if g.tags else "—"
-        t.add_row(dot, g.name, kind, str(g.vmid), g.node, status, cpu, mem, uptime, tags)
+        ip = (ip_map or {}).get(g.vmid, "[dim]—[/]") or "[dim]—[/]"
+        t.add_row(dot, g.name, kind, str(g.vmid), g.node, ip, status, cpu, mem, uptime, tags)
 
     console.print(t)
 
@@ -377,7 +401,12 @@ def _render_nodes_table(cluster: ClusterStatus) -> None:
     console.print(t)
 
 
-def _render_guests_table(cluster: ClusterStatus, guest_type: str | None, label_filter: str | None = None) -> None:
+def _render_guests_table(
+    cluster: ClusterStatus,
+    guest_type: str | None,
+    label_filter: str | None = None,
+    ip_map: dict[int, str] | None = None,
+) -> None:
     guests = [
         g for g in cluster.guests
         if guest_type is None or g.type == guest_type
@@ -393,6 +422,7 @@ def _render_guests_table(cluster: ClusterStatus, guest_type: str | None, label_f
     t.add_column("Name", style="bold", min_width=20)
     t.add_column("Type", width=4)
     t.add_column("Node", min_width=10)
+    t.add_column("IP", min_width=15)
     t.add_column("Tags", style="dim", min_width=10)
 
     for g in guests:
@@ -400,7 +430,8 @@ def _render_guests_table(cluster: ClusterStatus, guest_type: str | None, label_f
         kind = "[cyan]lxc[/]" if g.type == "lxc" else "[blue]vm[/] "
         tags = g.tags.replace(";", " ") if g.tags else "[dim]—[/]"
         name = g.name if g.status == "running" else f"[dim]{g.name}[/]"
-        t.add_row(dot, str(g.vmid), name, kind, g.node, tags)
+        ip = (ip_map or {}).get(g.vmid, "[dim]—[/]") or "[dim]—[/]"
+        t.add_row(dot, str(g.vmid), name, kind, g.node, ip, tags)
 
     console.print(t)
 
@@ -414,31 +445,43 @@ app.add_typer(get_app, name="get")
 @get_app.callback(invoke_without_command=True)
 def get_all(
     ctx: typer.Context,
+    tag: Optional[str] = typer.Option(None, "-t", "--tag", help="Show detail for all hosts with this tag"),
     output: _Out = typer.Option(_Out.table, "-o", help="Output format: table | wide | json"),
 ) -> None:
-    """Show everything: nodes, VMs, LXCs, and DSM."""
+    """Show everything: nodes, VMs, LXCs, and DSM.
+
+    Use [cyan]-t <tag>[/] to show detail panels for all hosts matching a tag.
+    """
     if ctx.invoked_subcommand is not None:
         return
+
+    # -t without a selector: detail panels for all matching guests
+    if tag:
+        run_get_detail("*", tag, output.value)
+        return
+
     cfg = _load()
     with console.status("[bold]Fetching cluster state…[/]"):
         cluster = asyncio.run(fetch_cluster_status(cfg.proxmox))
+    with console.status("[bold]Fetching guest IPs…[/]"):
+        ip_map = asyncio.run(fetch_guest_ips(cfg.proxmox, cluster.guests))
     with console.status("[bold]Fetching DSM status…[/]"):
         dsm_list = asyncio.run(fetch_all_dsm(cfg.dsm_instances))
 
     if output == _Out.json:
         console.print_json(_json.dumps({
             "nodes": _nodes_to_json(cluster),
-            "guests": _guests_to_json(cluster),
+            "guests": _guests_to_json(cluster, ip_map=ip_map),
             "dsm": _dsm_to_json(dsm_list),
         }))
     elif output == _Out.wide:
         _render_nodes_wide(cluster)
-        _render_guests_wide(cluster, guest_type="qemu")
-        _render_guests_wide(cluster, guest_type="lxc")
+        _render_guests_wide(cluster, guest_type="qemu", ip_map=ip_map)
+        _render_guests_wide(cluster, guest_type="lxc", ip_map=ip_map)
         _render_dsm_wide(dsm_list)
     else:
         _render_nodes_table(cluster)
-        _render_guests_table(cluster, guest_type=None)
+        _render_guests_table(cluster, guest_type=None, ip_map=ip_map)
 
 
 @get_app.command("nodes")
@@ -467,16 +510,18 @@ def get_vms(
     cfg = _load()
     with console.status("[bold]Fetching VM status…[/]"):
         cluster = asyncio.run(fetch_cluster_status(cfg.proxmox))
+    with console.status("[bold]Fetching guest IPs…[/]"):
+        ip_map = asyncio.run(fetch_guest_ips(cfg.proxmox, cluster.guests))
 
     if output == _Out.json:
-        guests = _guests_to_json(cluster, "qemu")
+        guests = _guests_to_json(cluster, "qemu", ip_map=ip_map)
         if label:
             guests = [g for g in guests if label.lower() in [t.lower() for t in (g.get("tags") or "").replace(",", ";").split(";") if t.strip()]]
         console.print_json(_json.dumps(guests))
     elif output == _Out.wide:
-        _render_guests_wide(cluster, "qemu")
+        _render_guests_wide(cluster, "qemu", ip_map=ip_map)
     else:
-        _render_guests_table(cluster, "qemu", label_filter=label)
+        _render_guests_table(cluster, "qemu", label_filter=label, ip_map=ip_map)
 
 
 @get_app.command("lxcs")
@@ -488,16 +533,18 @@ def get_lxcs(
     cfg = _load()
     with console.status("[bold]Fetching LXC status…[/]"):
         cluster = asyncio.run(fetch_cluster_status(cfg.proxmox))
+    with console.status("[bold]Fetching guest IPs…[/]"):
+        ip_map = asyncio.run(fetch_guest_ips(cfg.proxmox, cluster.guests))
 
     if output == _Out.json:
-        guests = _guests_to_json(cluster, "lxc")
+        guests = _guests_to_json(cluster, "lxc", ip_map=ip_map)
         if label:
             guests = [g for g in guests if label.lower() in [t.lower() for t in (g.get("tags") or "").replace(",", ";").split(";") if t.strip()]]
         console.print_json(_json.dumps(guests))
     elif output == _Out.wide:
-        _render_guests_wide(cluster, "lxc")
+        _render_guests_wide(cluster, "lxc", ip_map=ip_map)
     else:
-        _render_guests_table(cluster, "lxc", label_filter=label)
+        _render_guests_table(cluster, "lxc", label_filter=label, ip_map=ip_map)
 
 
 @get_app.command("hosts")
@@ -509,16 +556,18 @@ def get_hosts(
     cfg = _load()
     with console.status("[bold]Fetching guest status…[/]"):
         cluster = asyncio.run(fetch_cluster_status(cfg.proxmox))
+    with console.status("[bold]Fetching guest IPs…[/]"):
+        ip_map = asyncio.run(fetch_guest_ips(cfg.proxmox, cluster.guests))
 
     if output == _Out.json:
-        guests = _guests_to_json(cluster)
+        guests = _guests_to_json(cluster, ip_map=ip_map)
         if label:
             guests = [g for g in guests if label.lower() in [t.lower() for t in (g.get("tags") or "").replace(",", ";").split(";") if t.strip()]]
         console.print_json(_json.dumps(guests))
     elif output == _Out.wide:
-        _render_guests_wide(cluster, None)
+        _render_guests_wide(cluster, None, ip_map=ip_map)
     else:
-        _render_guests_table(cluster, None, label_filter=label)
+        _render_guests_table(cluster, None, label_filter=label, ip_map=ip_map)
 
 
 @get_app.command("ls", hidden=True)
@@ -543,6 +592,258 @@ def get_dsm(
         console.print_json(_json.dumps(_dsm_to_json(dsm_list)))
     else:
         _render_dsm_wide(dsm_list)
+
+
+# ── get <selector> — detail view (guests and nodes) ──────────────────────────
+
+def _render_node_detail(node: "NodeStatus") -> None:
+    rows: list[str] = []
+    dot = "[green]●[/]" if node.online else "[red]○[/]"
+    rows.append(f"  [bold]Status[/]    {dot} {'online' if node.online else 'offline'}")
+    rows.append(f"  [bold]Type[/]      node")
+    rows.append(f"  [bold]Uptime[/]    {_fmt_uptime(node.uptime)}")
+    rows.append("")
+
+    if node.online:
+        rows.append(f"  [bold]CPU[/]       {_fmt_pct(node.cpu)}")
+        if node.mem_total:
+            mem_pct = node.mem_used / node.mem_total
+            rows.append(
+                f"  [bold]Memory[/]    {_fmt_pct(mem_pct)}"
+                f"  {_fmt_bytes(node.mem_used)} / {_fmt_bytes(node.mem_total)}"
+            )
+        if node.disk_total:
+            disk_pct = node.disk_used / node.disk_total
+            rows.append(
+                f"  [bold]Disk[/]      {_fmt_pct(disk_pct)}"
+                f"  {_fmt_bytes(node.disk_used)} / {_fmt_bytes(node.disk_total)}"
+            )
+
+    if node.error:
+        rows.append(f"\n  [red]Error: {node.error}[/]")
+
+    console.print(Panel(
+        "\n".join(rows),
+        title=f"[bold]{node.name}[/]",
+        expand=False,
+        padding=(0, 1),
+    ))
+
+
+def _render_guest_detail(detail: GuestDetail) -> None:
+    dot = "[green]●[/]" if detail.status == "running" else "[dim]○[/]"
+    kind = "LXC" if detail.type == "lxc" else "VM"
+
+    rows: list[str] = []
+    rows.append(f"  [bold]Status[/]    {dot} {detail.status}")
+    rows.append(f"  [bold]Type[/]      {kind} [dim]#{detail.vmid}[/]")
+    rows.append(f"  [bold]Node[/]      {detail.node}")
+    rows.append(f"  [bold]Uptime[/]    {_fmt_uptime(detail.uptime)}")
+    rows.append("")
+
+    cores_label = f"{detail.cpu_cores} core{'s' if detail.cpu_cores != 1 else ''}"
+    rows.append(f"  [bold]CPU[/]       {_fmt_pct(detail.cpu_usage)}  ({cores_label} allocated)")
+
+    if detail.mem_total:
+        mem_pct = detail.mem_used / detail.mem_total
+        rows.append(
+            f"  [bold]Memory[/]    {_fmt_pct(mem_pct)}"
+            f"  {_fmt_bytes(detail.mem_used)} / {_fmt_bytes(detail.mem_total)}"
+        )
+
+    if detail.disk_total:
+        disk_pct = detail.disk_used / detail.disk_total
+        rows.append(
+            f"  [bold]Disk[/]      {_fmt_pct(disk_pct)}"
+            f"  {_fmt_bytes(detail.disk_used)} / {_fmt_bytes(detail.disk_total)}"
+        )
+
+    rows.append("")
+    ip_str = "  ".join(detail.ips) if detail.ips else "[dim]—[/]"
+    rows.append(f"  [bold]IP(s)[/]     {ip_str}")
+
+    if detail.ostype:
+        rows.append(f"  [bold]OS[/]        {detail.ostype}")
+
+    if detail.tags:
+        rows.append(f"  [bold]Tags[/]      {detail.tags}")
+
+    if detail.error:
+        rows.append(f"\n  [red]Error: {detail.error}[/]")
+
+    console.print(Panel(
+        "\n".join(rows),
+        title=f"[bold]{detail.name}[/]",
+        expand=False,
+        padding=(0, 1),
+    ))
+
+
+def _guest_detail_to_json(detail: GuestDetail) -> dict:
+    return {
+        "vmid": detail.vmid,
+        "name": detail.name,
+        "node": detail.node,
+        "type": detail.type,
+        "status": detail.status,
+        "cpu_usage": round(detail.cpu_usage, 4),
+        "cpu_cores": detail.cpu_cores,
+        "mem_used": detail.mem_used,
+        "mem_total": detail.mem_total,
+        "disk_used": detail.disk_used,
+        "disk_total": detail.disk_total,
+        "ips": detail.ips,
+        "uptime": detail.uptime,
+        "tags": detail.tags,
+        "ostype": detail.ostype,
+        **({"error": detail.error} if detail.error else {}),
+    }
+
+
+def run_get_detail(selector: str, tag: Optional[str], output: str = "table") -> None:
+    """Resolve selector → node or guest(s) and render detail panel(s).
+
+    Called from main.py's patched 'get' group for unknown subcommand names,
+    and also from the get_all callback when -t is used without a subcommand.
+    """
+    cfg = _load()
+    with console.status("[bold]Fetching cluster state…[/]"):
+        cluster = asyncio.run(fetch_cluster_status(cfg.proxmox))
+
+    # Node match takes priority (nodes have no VMID)
+    sel_lower = selector.lower()
+    node_match = next((n for n in cluster.nodes if n.name.lower() == sel_lower), None)
+    if node_match:
+        if output == "json":
+            console.print_json(_json.dumps({
+                "name": node_match.name, "online": node_match.online,
+                "cpu": round(node_match.cpu, 4),
+                "mem_used": node_match.mem_used, "mem_total": node_match.mem_total,
+                "disk_used": node_match.disk_used, "disk_total": node_match.disk_total,
+                "uptime": node_match.uptime,
+            }))
+        else:
+            _render_node_detail(node_match)
+        return
+
+    # Guest match
+    matched = _resolve_guests(cluster, selector, label=tag)
+    if not matched:
+        hint = f" with tag '{tag}'" if (tag and not selector) else f" matching '{selector}'"
+        console.print(f"[yellow]No hosts found{hint}.[/]")
+        raise SystemExit(1)
+
+    results: list[GuestDetail] = []
+    for g in matched:
+        with console.status(f"[bold]Fetching details for {g.name}…[/]"):
+            results.append(fetch_guest_detail(cfg.proxmox, g.node, g.vmid, g.type))
+
+    if output == "json":
+        console.print_json(_json.dumps([_guest_detail_to_json(d) for d in results]))
+    else:
+        for detail in results:
+            _render_guest_detail(detail)
+
+
+def run_update_hosts(
+    selector: str,
+    tag: Optional[str],
+    yes: bool = False,
+    verbose: bool = False,
+) -> None:
+    """Resolve selector → running guest(s) and run apt upgrade via SSH.
+
+    Called from main.py's patched 'update' group for unknown subcommand names,
+    and also from the update_hosts Typer command.
+    """
+    cfg = _load()
+    with console.status("[bold]Fetching cluster state…[/]"):
+        cluster = asyncio.run(fetch_cluster_status(cfg.proxmox))
+
+    matched = _resolve_guests(cluster, selector, tag, require_status="running")
+    if not matched:
+        hint = f" with tag {repr(tag)}" if tag else ""
+        console.print(f"[yellow]No running guests found matching '{selector}'{hint}[/]")
+        raise SystemExit(1)
+
+    with console.status("[bold]Resolving guest IPs…[/]"):
+        ips = {g.name: get_node_ip(cfg.proxmox, g.node, g.vmid, g.type) for g in matched}
+
+    # Separate HA OS guest (matched by IP) from regular apt targets
+    ha_guest: GuestInfo | None = None
+    ssh_guests: list[GuestInfo] = []
+    for g in matched:
+        if cfg.ha and ips.get(g.name) == cfg.ha.host:
+            ha_guest = g
+        else:
+            ssh_guests.append(g)
+
+    targets = []
+    for g in ssh_guests:
+        user = cfg.ssh.guest_user(g.name)
+        if user is None:
+            user = Prompt.ask(
+                f"SSH user for [cyan]{g.name}[/]",
+                default=cfg.ssh.default_user,
+            )
+            save_guest_user(cfg.config_path, g.name, user)
+            cfg.ssh.guest_users[g.name] = user
+        targets.append(UpdateTarget(
+            name=f"{g.name} [dim]({'lxc' if g.type == 'lxc' else 'vm'} #{g.vmid} @ {g.node})[/dim]",
+            host=ips[g.name] or g.name,
+            user=user,
+        ))
+
+    if targets:
+        _confirm_and_update(targets, cfg, yes, verbose=verbose)
+
+    if ha_guest:
+        _update_ha_via_api(ha_guest, cfg, yes)
+
+
+def run_backup_run(
+    selector: str,
+    tag: Optional[str],
+    storage: Optional[str] = None,
+    yes: bool = False,
+) -> None:
+    """Resolve selector → running guest(s) and trigger vzdump backups.
+
+    Called from main.py's patched 'backup' group for unknown subcommand names,
+    and also from the backup_run Typer command.
+    """
+    cfg = _load()
+    with console.status("[bold]Fetching cluster state…[/]"):
+        cluster = asyncio.run(fetch_cluster_status(cfg.proxmox))
+
+    matched = _resolve_guests(cluster, selector, tag, require_status="running")
+    if not matched:
+        console.print(f"[yellow]No running guests found matching '{selector}'[/]")
+        raise SystemExit(1)
+
+    console.print("\nGuests to back up:")
+    for g in matched:
+        kind = "lxc" if g.type == "lxc" else "vm"
+        console.print(f"  [cyan]•[/] {g.name} [dim]({kind} #{g.vmid} @ {g.node})[/]")
+
+    if not yes and not Confirm.ask(f"\nBack up {len(matched)} guest(s)?"):
+        raise SystemExit(0)
+
+    for g in matched:
+        stor = storage
+        if not stor:
+            with console.status(f"[bold]Finding backup storage on {g.node}…[/]"):
+                stor = find_backup_storage(cfg.proxmox, g.node)
+            if not stor:
+                console.print(f"[red]✗[/] {g.name} — no backup storage found on {g.node}")
+                continue
+
+        with console.status(f"[bold]Backing up {g.name} → {stor}…[/]"):
+            upid = backup_guest(cfg.proxmox, g.node, g.vmid, stor)
+        if upid:
+            console.print(f"[green]✓[/] {g.name} — task started [dim]({upid})[/]")
+        else:
+            console.print(f"[red]✗[/] {g.name} — failed to start backup")
 
 
 # ── ps (alias: get hosts) ─────────────────────────────────────────────────────
@@ -683,49 +984,15 @@ def update_hosts(
 
     [bold]-l / --label[/] filters by tag (can combine with [cyan]*[/] selector).
     """
-    cfg = _load()
-    with console.status("[bold]Fetching cluster state…[/]"):
-        cluster = asyncio.run(fetch_cluster_status(cfg.proxmox))
+    run_update_hosts(selector, label, yes, verbose)
 
-    running = [g for g in cluster.guests if g.status == "running"]
 
-    if selector == "*":
-        matched = running
-    elif selector.isdigit():
-        vmid = int(selector)
-        matched = [g for g in running if g.vmid == vmid]
-        if not matched:
-            console.print(f"[yellow]No running guest with VMID {vmid}[/]")
-            raise typer.Exit(1)
-    else:
-        sel = selector.lower()
-        by_tag  = [g for g in running if sel in _guest_tags(g)]
-        by_name = [g for g in running if sel in g.name.lower()]
-        seen: set[int] = set()
-        matched = []
-        for g in by_tag + by_name:
-            if g.vmid not in seen:
-                seen.add(g.vmid)
-                matched.append(g)
-
-    # Apply -l label filter on top of selector
-    if label:
-        lf = label.lower()
-        matched = [g for g in matched if lf in _guest_tags(g)]
-
-    if not matched:
-        console.print(f"[yellow]No running guests found matching '{selector}'{' with label ' + repr(label) if label else ''}[/]")
-        raise typer.Exit(1)
-
-    targets = [
-        UpdateTarget(
-            name=f"{g.name} [dim]({'lxc' if g.type == 'lxc' else 'vm'} #{g.vmid} @ {g.node})[/dim]",
-            host=g.name,
-            user=cfg.ssh.default_user,
-        )
-        for g in matched
-    ]
-    _confirm_and_update(targets, cfg, yes, verbose=verbose)
+def _parse_exit(lines: list[str]) -> bool:
+    """Return True if the update command exited 0 (reads __ATC_EXIT__:N marker)."""
+    for line in reversed(lines):
+        if line.startswith(_EXIT_MARKER + ":"):
+            return line.split(":", 1)[1].strip() == "0"
+    return False  # marker missing = SSH error or unexpected termination
 
 
 def _confirm_and_update(targets: list[UpdateTarget], cfg: Config, yes: bool, verbose: bool = False) -> None:
@@ -737,29 +1004,300 @@ def _confirm_and_update(targets: list[UpdateTarget], cfg: Config, yes: bool, ver
         if not Confirm.ask(f"\nRun apt upgrade on {len(targets)} target(s)?"):
             raise typer.Exit(0)
 
-    cmd = _UPDATE_CMD_VERBOSE if verbose else _UPDATE_CMD_QUIET
+    base_cmd = _UPDATE_CMD_VERBOSE if verbose else _UPDATE_CMD_QUIET
+
+    def _cmd_for(target: UpdateTarget) -> str:
+        if target.user != "root":
+            return f'sudo bash -c "{base_cmd}"'
+        return base_cmd
+
+    # (target, success, needs_reboot, failed_units, output_lines)
+    results: list[tuple[UpdateTarget, bool, bool, list[str], list[str]]] = []
+
+    async def _post_checks(target: UpdateTarget) -> tuple[bool, list[str]]:
+        reboot_r = await run_command(
+            target.host,
+            "test -f /var/run/reboot-required && cat /var/run/reboot-required.pkgs 2>/dev/null || true",
+            cfg.ssh, user=target.user,
+        )
+        failed_r = await run_command(
+            target.host,
+            "systemctl --failed --no-legend 2>/dev/null | awk '{print ($1~/\\./) ? $1 : $2}'",
+            cfg.ssh, user=target.user,
+        )
+        needs_reboot = bool(reboot_r.stdout.strip())
+        _NOISE_UNITS = {"motd-news.service", "apt-news.service", "ua-timer.service"}
+        failed_units = [
+            u for u in failed_r.stdout.strip().splitlines()
+            if u and u not in _NOISE_UNITS
+        ]
+        return needs_reboot, failed_units
 
     async def _run_all() -> None:
-        for target in targets:
-            console.rule(f"[bold]{target.host}[/]")
-            async for line in stream_command(target.host, cmd, cfg.ssh, user=target.user):
-                console.print(f"  {line}")
-            console.print(f"[green]✓[/] {target.host} done\n")
+        if verbose:
+            for target in targets:
+                guest_name = Text.from_markup(target.name).plain
+                console.rule(f"[bold]{guest_name}[/] [dim]({target.host})[/]")
+                lines: list[str] = []
+                async for line in stream_command(target.host, _cmd_for(target), cfg.ssh, user=target.user):
+                    lines.append(line)
+                    if not line.startswith(_EXIT_MARKER):
+                        console.print(f"  {line}")
+                success = _parse_exit(lines)
+                needs_reboot, failed_units = await _post_checks(target)
+                icon = "❌" if not success or failed_units else ("⚠️ " if needs_reboot else "✅")
+                console.print(f"\n{icon} {guest_name} ({target.host}) done\n")
+                results.append((target, success, needs_reboot, failed_units, lines))
+        else:
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(bar_width=20),
+                MofNCompleteColumn(),
+                TextColumn("[dim]{task.fields[status]}"),
+                console=console,
+            ) as progress:
+                overall = progress.add_task(
+                    f"[bold]Updating {len(targets)} host(s)", total=len(targets), status=""
+                )
+                for target in targets:
+                    guest_name = Text.from_markup(target.name).plain
+                    htask = progress.add_task(
+                        f"  [cyan]{guest_name}[/] [dim]({target.host})[/]", total=None, status="connecting…"
+                    )
+                    lines2: list[str] = []
+                    async for line in stream_command(target.host, _cmd_for(target), cfg.ssh, user=target.user):
+                        lines2.append(line)
+                        if not line.startswith(_EXIT_MARKER):
+                            short = line.strip()[:70]
+                            if short:
+                                progress.update(htask, status=short)
+                    success = _parse_exit(lines2)
+                    needs_reboot, failed_units = await _post_checks(target)
+                    icon = "❌" if not success or failed_units else ("⚠️ " if needs_reboot else "✅")
+                    progress.update(htask, completed=1, total=1, status=f"{icon} done")
+                    progress.advance(overall)
+                    results.append((target, success, needs_reboot, failed_units, lines2))
 
     asyncio.run(_run_all())
+    _print_update_summary(results, cfg)
 
+
+def _print_update_summary(
+    results: list[tuple[UpdateTarget, bool, bool, list[str], list[str]]],
+    cfg: Config,
+) -> None:
+    table = Table(title="Update Summary", box=box.ROUNDED)
+    table.add_column("Guest", style="cyan")
+    table.add_column("IP")
+    table.add_column("Result", justify="center")
+    table.add_column("Reboot", justify="center")
+    table.add_column("Failed Units")
+
+    for target, success, needs_reboot, failed_units, _lines in results:
+        guest_name = Text.from_markup(target.name).plain
+        table.add_row(
+            guest_name,
+            target.host,
+            "✅" if success and not failed_units else "❌",
+            "⚠️  yes" if needs_reboot else "—",
+            ", ".join(failed_units) if failed_units else "—",
+        )
+
+    console.print()
+    console.print(table)
+
+    for target, success, needs_reboot, failed_units, output_lines in results:
+        guest_name = Text.from_markup(target.name).plain
+        user = target.user
+        if not success and not failed_units:
+            # Show last few non-empty output lines as the error context
+            relevant = [l for l in output_lines if l.strip() and not l.startswith(_EXIT_MARKER)][-8:]
+            if relevant:
+                console.print(f"\n[red]❌  {guest_name} ({target.host}) — last output:[/]")
+                for l in relevant:
+                    console.print(f"    [dim]{l}[/]")
+        if needs_reboot:
+            console.print(f"\n[yellow]⚠️  {guest_name} requires a reboot:[/]")
+            console.print(f"    ssh {user}@{target.host} reboot")
+        if failed_units:
+            console.print(f"\n[red]❌  {guest_name} — failed units:[/]")
+            for unit in failed_units:
+                console.print(f"    ssh {user}@{target.host} systemctl status {unit}")
+                console.print(f"    ssh {user}@{target.host} journalctl -u {unit} -n 50")
+
+
+_HA_RESTART_CATEGORIES = {"core", "supervisor", "os"}
+
+def _update_ha_via_api(guest: GuestInfo, cfg: Config, yes: bool) -> None:
+    """Update Home Assistant OS VM via the HA REST API."""
+    if cfg.ha is None:
+        return
+    console.rule(f"[bold]Home Assistant[/] [dim](vm #{guest.vmid} @ {guest.node})[/]")
+    with console.status("[bold]Fetching pending HA updates…[/]"):
+        try:
+            pending = ha_list_updates(cfg.ha, pending_only=True)
+        except Exception as e:
+            console.print(f"[red]✗[/] Could not reach Home Assistant: {e}")
+            return
+
+    if not pending:
+        console.print("[green]✓[/] Home Assistant — all up to date.")
+        return
+
+    # Separate firmware (not API-installable) from everything else,
+    # and sort restarters (core/os/supervisor) to run last.
+    firmware = [u for u in pending if u.short_category == "firmware"]
+    restarters = [u for u in pending if u.short_category in _HA_RESTART_CATEGORIES]
+    normal = [u for u in pending if u not in firmware and u not in restarters]
+    installable = normal + restarters
+
+    console.print(f"[bold]{len(pending)}[/] update(s) available:")
+    for u in sorted(pending, key=lambda x: (x.short_category, x.title)):
+        note = " [dim](install via HA UI)[/]" if u in firmware else ""
+        console.print(f"  [dim]•[/] [bold]{u.title}[/]  {u.installed_version} → [yellow]{u.latest_version}[/]  [dim]({u.short_category})[/]{note}")
+
+    if restarters:
+        console.print(f"\n[yellow]⚠[/]  {', '.join(u.title for u in restarters)} will restart HA — install last.")
+    if firmware:
+        console.print(f"[dim]ℹ  {len(firmware)} firmware update(s) skipped — trigger from the HA UI.[/]")
+
+    if not installable:
+        return
+    if not yes and not Confirm.ask(f"\nInstall {len(installable)} HA update(s)?"):
+        return
+
+    errors = []
+    for u in installable:
+        will_restart = u.short_category in _HA_RESTART_CATEGORIES
+        try:
+            ha_call_service(cfg.ha, "update", "install", {"entity_id": u.entity_id})
+            console.print(f"  [green]✓[/] {u.title}")
+        except Exception as e:
+            err_str = str(e)
+            if will_restart and ("timed out" in err_str.lower() or "connect" in err_str.lower()):
+                console.print(f"  [yellow]↺[/] {u.title} — HA is restarting…")
+            elif "500" in err_str:
+                console.print(f"  [yellow]⚠[/] {u.title} — not installable via API, use the HA UI")
+            else:
+                console.print(f"  [red]✗[/] {u.title}: {e}")
+                errors.append(u.entity_id)
+
+    if errors:
+        console.print(f"[red]{len(errors)} HA update(s) failed.[/]")
+    else:
+        console.print("[green]✓[/] HA updates initiated.")
+
+
+_EXIT_MARKER = "__ATC_EXIT__"
 
 _UPDATE_CMD_QUIET = (
-    "DEBIAN_FRONTEND=noninteractive apt-get update -q && "
+    "{ DEBIAN_FRONTEND=noninteractive apt-get update -q && "
     "DEBIAN_FRONTEND=noninteractive apt-get upgrade -y -q && "
-    "apt-get autoremove -y -q"
+    f"apt-get autoremove -y -q; }} 2>&1; echo {_EXIT_MARKER}:$?"
 )
 
 _UPDATE_CMD_VERBOSE = (
-    "DEBIAN_FRONTEND=noninteractive apt-get update && "
+    "{ DEBIAN_FRONTEND=noninteractive apt-get update && "
     "DEBIAN_FRONTEND=noninteractive apt-get upgrade -y && "
-    "apt-get autoremove -y"
+    f"apt-get autoremove -y; }} 2>&1; echo {_EXIT_MARKER}:$?"
 )
+
+
+# ── push-key ──────────────────────────────────────────────────────────────────
+
+@app.command("push-key")
+def push_key(
+    selector: str = typer.Argument("*", help="Name (substring), tag, VMID, or '*' for all"),
+    key_file: Optional[str] = typer.Option(None, "--key-file", "-k", help="Public key file (default: auto-detect)"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation"),
+) -> None:
+    """Push your SSH public key to guests without needing existing SSH access.
+
+    [bold]LXC containers[/] — SSHes to the Proxmox node and runs [cyan]pct exec[/].
+    [bold]QEMU VMs[/]       — uses the QEMU guest agent exec API.
+
+    Always injects into [bold]root[/]'s authorized_keys (idempotent).
+    Run once to unlock [bold]atc update hosts[/] for community-spun LXCs.
+    """
+    cfg = _load()
+
+    # Resolve public key file
+    if key_file:
+        pub_path = Path(key_file).expanduser()
+    else:
+        for candidate in ["~/.ssh/id_ed25519.pub", "~/.ssh/id_rsa.pub"]:
+            pub_path = Path(candidate).expanduser()
+            if pub_path.exists():
+                break
+        else:
+            console.print("[red]No public key found. Create ~/.ssh/id_ed25519.pub or pass --key-file.[/]")
+            raise typer.Exit(1)
+
+    if not pub_path.exists():
+        console.print(f"[red]Key file not found: {pub_path}[/]")
+        raise typer.Exit(1)
+
+    pubkey = pub_path.read_text().strip()
+    console.print(f"[dim]Key:[/] {pub_path}")
+    console.print(f"[dim]{pubkey[:72]}{'…' if len(pubkey) > 72 else ''}[/]\n")
+
+    with console.status("[bold]Fetching cluster state…[/]"):
+        cluster = asyncio.run(fetch_cluster_status(cfg.proxmox))
+
+    matched = _resolve_guests(cluster, selector, None, require_status="running")
+    if not matched:
+        console.print(f"[yellow]No running guests found matching '{selector}'[/]")
+        raise typer.Exit(1)
+
+    console.print("Guests to receive key:")
+    for g in matched:
+        kind = "lxc" if g.type == "lxc" else "vm"
+        console.print(f"  [cyan]•[/] {g.name} [dim]({kind} #{g.vmid} @ {g.node})[/]")
+
+    if not yes and not Confirm.ask(f"\nPush key to {len(matched)} guest(s)?"):
+        raise typer.Exit(0)
+
+    # Build the idempotent key-inject script (used for both paths)
+    key_script = (
+        "mkdir -p /root/.ssh && "
+        "chmod 700 /root/.ssh && "
+        f"grep -qxF '{pubkey}' /root/.ssh/authorized_keys 2>/dev/null "
+        f"|| echo '{pubkey}' >> /root/.ssh/authorized_keys && "
+        "chmod 600 /root/.ssh/authorized_keys"
+    )
+
+    console.print()
+    failed = 0
+    for g in matched:
+        kind = "lxc" if g.type == "lxc" else "vm"
+        with console.status(f"  [bold]{g.name}[/]…"):
+            if g.type == "lxc":
+                # SSH to the Proxmox node and run pct exec
+                node_host = cfg.ssh.node_host(g.node)
+                pct_cmd = f"pct exec {g.vmid} -- bash -c {_shell_quote(key_script)}"
+                result = asyncio.run(run_command(node_host, pct_cmd, cfg.ssh))
+                ok = result.success
+                msg = (result.stderr or result.stdout).strip() if not ok else ""
+            else:
+                # QEMU VM — use guest agent exec API
+                ok, msg = push_ssh_key_qemu(cfg.proxmox, g.node, g.vmid, pubkey)
+        if ok:
+            console.print(f"  ✅ {g.name} [dim]({kind} #{g.vmid})[/]")
+        else:
+            console.print(f"  ❌ {g.name} [dim]({kind} #{g.vmid})[/] — [red]{msg}[/]")
+            failed += 1
+
+    console.print()
+    if failed:
+        console.print(
+            f"[red]{failed} guest(s) failed.[/]  "
+            "LXCs need SSH access to the Proxmox node (root). "
+            "VMs need qemu-guest-agent running inside."
+        )
+        raise typer.Exit(1)
+    else:
+        console.print(f"[green]✓[/] Key pushed to {len(matched)} guest(s). You can now run [bold]atc update hosts[/].")
 
 
 # ── backup ────────────────────────────────────────────────────────────────────
@@ -909,38 +1447,7 @@ def backup_run(
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation"),
 ) -> None:
     """Create an immediate backup of guest(s)."""
-    cfg = _load()
-    with console.status("[bold]Fetching cluster state…[/]"):
-        cluster = asyncio.run(fetch_cluster_status(cfg.proxmox))
-
-    matched = _resolve_guests(cluster, selector, label, require_status="running")
-    if not matched:
-        console.print(f"[yellow]No running guests found matching '{selector}'[/]")
-        raise typer.Exit(1)
-
-    console.print("\nGuests to back up:")
-    for g in matched:
-        kind = "lxc" if g.type == "lxc" else "vm"
-        console.print(f"  [cyan]•[/] {g.name} [dim]({kind} #{g.vmid} @ {g.node})[/]")
-
-    if not yes and not Confirm.ask(f"\nBack up {len(matched)} guest(s)?"):
-        raise typer.Exit(0)
-
-    for g in matched:
-        stor = storage
-        if not stor:
-            with console.status(f"[bold]Finding backup storage on {g.node}…[/]"):
-                stor = find_backup_storage(cfg.proxmox, g.node)
-            if not stor:
-                console.print(f"[red]✗[/] {g.name} — no backup storage found on {g.node}")
-                continue
-
-        with console.status(f"[bold]Backing up {g.name} → {stor}…[/]"):
-            upid = backup_guest(cfg.proxmox, g.node, g.vmid, stor)
-        if upid:
-            console.print(f"[green]✓[/] {g.name} — task started [dim]({upid})[/]")
-        else:
-            console.print(f"[red]✗[/] {g.name} — failed to start backup")
+    run_backup_run(selector, label, storage, yes)
 
 
 # ── run ───────────────────────────────────────────────────────────────────────
@@ -1715,7 +2222,7 @@ def show_tree() -> None:
 # ── media ─────────────────────────────────────────────────────────────────────
 
 media_app = typer.Typer(
-    help="Media pipeline: Seerr · Radarr · Sonarr · Plex",
+    help="Media pipeline: Seerr · Radarr · Sonarr · Plex · Streams",
     no_args_is_help=True,
     rich_markup_mode="rich",
 )
@@ -1934,8 +2441,11 @@ def _seerr_pick(cfg, query: str):
     return results[n - 1]
 
 
-def _display_pipeline(cfg, pick) -> None:
-    """Render all 4 pipeline stages for a SeerrSearchResult."""
+def _display_pipeline(cfg, pick) -> tuple:
+    """Render all 4 pipeline stages for a SeerrSearchResult.
+
+    Returns (arr_record, plex_match, is_movie).
+    """
     is_movie = pick.media_type == "movie"
     arr_cfg  = cfg.radarr if is_movie else cfg.sonarr
     arr_label = "Radarr" if is_movie else "Sonarr"
@@ -1992,15 +2502,28 @@ def _display_pipeline(cfg, pick) -> None:
     _pipeline_row(3, "Download", icon, style, summary, detail)
 
     # ── Stage 4: Plex ─────────────────────────────────────────────────────────
+    plex_match = None
+    plex_err = ""
     if cfg.plex is None:
         _pipeline_row(4, "Plex", "·", "dim", "Not configured", "add plex: to config.yaml")
     else:
         with console.status("[bold]Checking Plex…[/]"):
             try:
                 plex_year = int(pick.year or 0)
-                plex_match = plex_find_media(cfg.plex, pick.title, pick.media_type, year=plex_year)
+                is_tv = pick.media_type == "tv"
+                plex_match = plex_find_media(
+                    cfg.plex, pick.title, pick.media_type,
+                    year=plex_year,
+                    tvdb_id=pick.tvdb_id if is_tv else 0,
+                    tmdb_id=pick.id if not is_tv else 0,
+                )
                 if not plex_match.found and plex_year:
-                    plex_match = plex_find_media(cfg.plex, pick.title, pick.media_type, year=0)
+                    plex_match = plex_find_media(
+                        cfg.plex, pick.title, pick.media_type,
+                        year=0,
+                        tvdb_id=pick.tvdb_id if is_tv else 0,
+                        tmdb_id=pick.id if not is_tv else 0,
+                    )
             except Exception as e:
                 plex_match = None
                 plex_err = str(e)
@@ -2008,13 +2531,93 @@ def _display_pipeline(cfg, pick) -> None:
         _render_plex_row(plex_match, plex_err if plex_match is None else "")
 
     console.print()
+    return arr_record, plex_match, is_movie
 
 
-def _display_pipeline_from_calendar(cfg, item) -> None:
+def _pipeline_interactive_menu(cfg, arr_record, plex_match, is_movie) -> None:
+    """Show a post-pipeline action menu and execute the chosen action."""
+    arr_cfg = cfg.radarr if is_movie else cfg.sonarr
+    actions: list[tuple[str, str]] = []
+
+    if arr_record is not None and arr_cfg is not None:
+        if isinstance(arr_record, ArrMovieRecord) and not arr_record.has_file and arr_record.monitored:
+            actions.append(("search", "Search for missing movie in Radarr"))
+        elif (
+            isinstance(arr_record, ArrSeriesRecord)
+            and arr_record.monitored
+            and arr_record.episode_count > 0
+            and arr_record.episode_file_count < arr_record.episode_count
+        ):
+            missing = arr_record.episode_count - arr_record.episode_file_count
+            actions.append(("search", f"Search for {missing} missing episode(s) in Sonarr"))
+
+    if (
+        cfg.plex is not None
+        and plex_match is not None
+        and not plex_match.found
+        and not plex_match.error
+    ):
+        actions.append(("plex_scan", "Scan Plex libraries"))
+
+    if not actions:
+        return
+
+    action_keys = {key: key for key, _ in actions}
+    parts = []
+    if "search" in action_keys:
+        parts.append("Search(s)")
+    if "plex_scan" in action_keys:
+        parts.append("Plex Scan(p)")
+    parts.append("Nothing(n)")
+
+    console.print()
+    raw = typer.prompt(", ".join(parts), default="n").strip().lower()
+
+    if raw in ("n", ""):
+        return
+    action = "search" if raw == "s" else "plex_scan" if raw == "p" else ""
+    if not action or action not in action_keys:
+        return
+
+    if action == "search":
+        if is_movie and isinstance(arr_record, ArrMovieRecord):
+            with console.status("[bold]Triggering Radarr search…[/]"):
+                try:
+                    _arr_result(radarr_search_movies(arr_cfg, [arr_record.arr_id]))
+                except Exception as e:
+                    console.print(f"[red]Error:[/] {e}")
+        elif not is_movie and isinstance(arr_record, ArrSeriesRecord):
+            with console.status("[bold]Triggering Sonarr search…[/]"):
+                try:
+                    _arr_result(sonarr_search_series(arr_cfg, arr_record.arr_id))
+                except Exception as e:
+                    console.print(f"[red]Error:[/] {e}")
+
+    elif action == "plex_scan":
+        libs = plex_list_libraries(cfg.plex)
+        if isinstance(libs, str):
+            console.print(f"[red]Error listing libraries:[/] {libs}")
+            return
+        lib_type = "movie" if is_movie else "show"
+        to_scan = [lib for lib in libs if lib.lib_type == lib_type]
+        if not to_scan:
+            console.print(f"[red]No {lib_type} libraries found in Plex[/]")
+            return
+        for lib in to_scan:
+            with console.status(f"[bold]Scanning '{lib.title}'…[/]"):
+                err = plex_scan_library(cfg.plex, lib.key)
+            if err:
+                console.print(f"[red]✗[/] {lib.title}: {err}")
+            else:
+                console.print(f"[green]✓[/] Scan queued for '{lib.title}'")
+
+
+def _display_pipeline_from_calendar(cfg, item) -> tuple:
     """Render the pipeline for a CalendarMovie or CalendarEpisode.
 
     Bypasses Seerr search disambiguation — arr item is already known.
     Seerr is queried silently (exact title match) only for request status.
+    Returns (arr_record, plex_match, is_movie).
     """
     from lib.arr import CalendarMovie as _CM, CalendarEpisode as _CE
     is_movie   = isinstance(item, _CM)
@@ -2098,6 +2701,8 @@ def _display_pipeline_from_calendar(cfg, item) -> None:
     _pipeline_row(3, "Download", icon, style, summary, detail)
 
     # ── Stage 4: Plex ─────────────────────────────────────────────────────────
+    plex_match = None
+    plex_err = ""
     if cfg.plex is None:
         _pipeline_row(4, "Plex", "·", "dim", "Not configured", "add plex: to config.yaml")
     else:
@@ -2111,6 +2716,7 @@ def _display_pipeline_from_calendar(cfg, item) -> None:
         _render_plex_row(plex_match, plex_err if plex_match is None else "")
 
     console.print()
+    return arr_record, plex_match, is_movie
 
 
 @media_app.command("pipeline")
@@ -2122,7 +2728,8 @@ def pipeline_cmd(
     pick = _seerr_pick(cfg, query)
     if pick is None:
         raise typer.Exit(1)
-    _display_pipeline(cfg, pick)
+    arr_record, plex_match, is_movie = _display_pipeline(cfg, pick)
+    _pipeline_interactive_menu(cfg, arr_record, plex_match, is_movie)
 
 
 # ── radarr / sonarr ───────────────────────────────────────────────────────────
@@ -2131,7 +2738,7 @@ from lib.search_state import load_state as _load_search_state
 from lib.arr import (
     get_status as arr_get_status,
     radarr_scan, radarr_search_missing, radarr_search_movies,
-    sonarr_scan, sonarr_search_missing, sonarr_search_episodes,
+    sonarr_scan, sonarr_search_missing, sonarr_search_episodes, sonarr_search_series,
     get_episode_id,
     get_today_imports as arr_get_today_imports,
 )
@@ -2497,7 +3104,7 @@ from lib.arr import (
 
 @media_app.command("calendar")
 def media_calendar_cmd(
-    days: int = typer.Argument(10, help="Days to show: positive = ahead, negative = past (default 10)"),
+    days: int = typer.Argument(7, help="Days to show: positive = ahead, negative = past (default 7)"),
     radarr: bool = typer.Option(False, "--radarr", help="Show only movies"),
     sonarr: bool = typer.Option(False, "--sonarr", help="Show only TV episodes"),
 ) -> None:
@@ -2543,9 +3150,9 @@ def media_calendar_cmd(
 
     console.print()
     if days >= 0:
-        console.print(f"  [bold]Upcoming releases[/] [dim]— next {days} day(s) · {start} → {end}[/]")
+        console.print(f"  [bold]Upcoming releases[/] [dim]— next {days} days · {start} → {end}[/]")
     else:
-        console.print(f"  [bold]Past releases[/] [dim]— last {abs(days)} day(s) · {start} → {end}[/]")
+        console.print(f"  [bold]Past releases[/] [dim]— last {abs(days)} days · {start} → {end}[/]")
     console.print()
 
     numbered: list = []   # flat ordered list matching displayed numbers
@@ -2570,7 +3177,6 @@ def media_calendar_cmd(
                 icon  = "[green]✓[/]" if item.has_file else "[dim]·[/]"
                 ep    = f"[dim]S{item.season:02d}E{item.episode:02d}[/]"
                 console.print(f"    [dim]{n:>2}.[/] {icon}  [bold]{item.series_title}[/]  {ep}  [dim]{item.title}[/]")
-        console.print()
 
     raw = typer.prompt(
         "Enter # for pipeline details (or Enter to skip)",
@@ -2588,7 +3194,8 @@ def media_calendar_cmd(
         console.print("[red]Out of range — skipping.[/]")
         return
 
-    _display_pipeline_from_calendar(cfg, numbered[choice - 1])
+    arr_record, plex_match, is_movie = _display_pipeline_from_calendar(cfg, numbered[choice - 1])
+    _pipeline_interactive_menu(cfg, arr_record, plex_match, is_movie)
 
 
 # ── media status ──────────────────────────────────────────────────────────────
@@ -2598,15 +3205,16 @@ import httpx as _httpx
 
 @media_app.command("status")
 def media_status_cmd(
-    radarr: bool = typer.Option(False, "--radarr", help="Show only Radarr"),
-    sonarr: bool = typer.Option(False, "--sonarr", help="Show only Sonarr"),
-    seerr: bool  = typer.Option(False, "--seerr",  help="Show only Seerr"),
-    plex:  bool  = typer.Option(False, "--plex",   help="Show only Plex"),
+    radarr:    bool = typer.Option(False, "--radarr",    help="Show only Radarr"),
+    sonarr:    bool = typer.Option(False, "--sonarr",    help="Show only Sonarr"),
+    seerr:     bool = typer.Option(False, "--seerr",     help="Show only Seerr"),
+    plex:      bool = typer.Option(False, "--plex",      help="Show only Plex"),
+    tautulli:  bool = typer.Option(False, "--tautulli",  help="Show only Tautulli"),
 ) -> None:
     """Show connectivity status for all media services."""
     cfg = _load()
     # No flags = show all
-    show_all = not any([radarr, sonarr, seerr, plex])
+    show_all = not any([radarr, sonarr, seerr, plex, tautulli])
 
     def _row(name: str, ok: bool, detail: str) -> None:
         icon  = "[green]✓[/]" if ok else "[red]✗[/]"
@@ -2665,6 +3273,20 @@ def media_status_cmd(
                     _row("Plex", False, f"HTTP {r.status_code}")
             except Exception as e:
                 _row("Plex", False, str(e))
+
+    if show_all or tautulli:
+        if cfg.tautulli is None:
+            _row("Tautulli", False, "not configured")
+        else:
+            from lib.tautulli import get_status as _tautulli_get_status
+            with console.status("Querying Tautulli…"):
+                st = _tautulli_get_status(cfg.tautulli)
+            if st.online:
+                n = st.stream_count
+                streams_str = f"{n} active stream{'s' if n != 1 else ''}"
+                _row("Tautulli", True, streams_str)
+            else:
+                _row("Tautulli", False, st.error)
 
 
 # ── media today ───────────────────────────────────────────────────────────────
@@ -3162,6 +3784,432 @@ def plex_clean_bundles_cmd() -> None:
         console.print(f"[red]✗[/] {err}")
         raise typer.Exit(1)
     console.print("[green]✓[/] Bundle clean queued")
+
+
+# ── tautulli ──────────────────────────────────────────────────────────────────
+
+from lib.tautulli import (
+    get_activity as tautulli_get_activity,
+    get_history  as tautulli_get_history,
+    terminate_session as tautulli_terminate_session,
+)
+
+tautulli_app = typer.Typer(
+    help="Plex stream monitoring via Tautulli — active, history, terminate",
+    no_args_is_help=True,
+    rich_markup_mode="rich",
+)
+media_app.add_typer(tautulli_app, name="streams")
+
+
+def _tautulli(cfg: Config):
+    if cfg.tautulli is None:
+        console.print("[red]No tautulli section in config.yaml[/]")
+        raise typer.Exit(1)
+    return cfg.tautulli
+
+
+@tautulli_app.command("active")
+def tautulli_active_cmd() -> None:
+    """Show all currently active Plex streams."""
+    cfg = _load()
+    with console.status("[bold]Fetching active streams…[/]"):
+        streams = tautulli_get_activity(_tautulli(cfg))
+
+    if not streams:
+        console.print("[dim]No active streams.[/]")
+        return
+
+    total_bw = sum(s.bandwidth for s in streams)
+    bw_str = f" · {total_bw / 1000:.1f} Mbps" if total_bw else ""
+    console.print()
+    console.print(f"  [bold]{len(streams)} active stream{'s' if len(streams) != 1 else ''}[/][dim]{bw_str}[/]")
+    console.print()
+
+    t = Table(box=box.SIMPLE_HEAD, show_edge=False, pad_edge=False)
+    t.add_column("User",      style="bold", no_wrap=True)
+    t.add_column("State",     no_wrap=True)
+    t.add_column("Title",     no_wrap=True)
+    t.add_column("Progress",  justify="right", no_wrap=True)
+    t.add_column("Quality",   no_wrap=True)
+    t.add_column("Transcode", no_wrap=True)
+    t.add_column("Player",    no_wrap=True)
+
+    state_styles = {"playing": "green", "paused": "yellow", "buffering": "cyan"}
+
+    for s in streams:
+        if s.media_type == "episode" and s.grandparent_title:
+            ep_tag = f"S{s.season:02d}E{s.episode:02d}" if s.season else ""
+            display_title = s.grandparent_title + (f" · {ep_tag}" if ep_tag else "")
+        else:
+            display_title = s.title + (f" ({s.year})" if s.year else "")
+
+        state_style = state_styles.get(s.state, "dim")
+        t.add_row(
+            s.user,
+            f"[{state_style}]{s.state}[/]",
+            display_title,
+            f"{s.progress_pct:.1f}%",
+            s.quality_profile or "—",
+            s.transcode_decision or "—",
+            s.player or "—",
+        )
+
+    console.print(t)
+    console.print(f"  [dim]Session keys: {', '.join(s.session_key for s in streams)}[/]")
+    console.print()
+
+
+@tautulli_app.command("history")
+def tautulli_history_cmd(
+    count:  int = typer.Option(20, "--count", "-n", help="Number of records to show"),
+    user:   str = typer.Option("", "--user", "-u", help="Filter by username"),
+    output: _Out = typer.Option(_Out.table, "-o", help="Output format"),
+) -> None:
+    """Show recent Plex play history."""
+    cfg = _load()
+    with console.status("[bold]Fetching play history…[/]"):
+        records = tautulli_get_history(_tautulli(cfg), length=count, user=user)
+
+    if not records:
+        console.print("[dim]No history found.[/]")
+        return
+
+    if output == _Out.json:
+        console.print_json(_json.dumps([
+            {
+                "user": r.user, "title": r.title, "media_type": r.media_type,
+                "show": r.grandparent_title, "year": r.year,
+                "played_at": r.played_at, "duration_secs": r.duration_secs,
+                "percent_complete": r.percent_complete,
+                "player": r.player, "transcode": r.transcode_decision,
+            }
+            for r in records
+        ]))
+        return
+
+    def _dur(secs: int) -> str:
+        if secs <= 0:
+            return "—"
+        h, m = divmod(secs // 60, 60)
+        return f"{h}h {m}m" if h else f"{m}m"
+
+    t = Table(box=box.SIMPLE_HEAD, show_edge=False, pad_edge=False)
+    t.add_column("User",      style="bold", no_wrap=True)
+    t.add_column("Played",    no_wrap=True)
+    t.add_column("Title",     no_wrap=True)
+    t.add_column("Type",      style="dim", no_wrap=True)
+    t.add_column("Duration",  justify="right", no_wrap=True)
+    t.add_column("%",         justify="right", no_wrap=True)
+    t.add_column("Transcode", no_wrap=True, style="dim")
+
+    for r in records:
+        if r.media_type == "episode" and r.grandparent_title:
+            display_title = f"{r.grandparent_title} · {r.title}"
+        else:
+            display_title = r.title + (f" ({r.year})" if r.year else "")
+        pct_style = "green" if r.percent_complete >= 90 else "yellow" if r.percent_complete >= 50 else "dim"
+        t.add_row(
+            r.user,
+            r.played_at,
+            display_title,
+            r.media_type or "—",
+            _dur(r.duration_secs),
+            f"[{pct_style}]{r.percent_complete}%[/]",
+            r.transcode_decision or "—",
+        )
+
+    console.print(t)
+
+
+@tautulli_app.command("terminate")
+def tautulli_terminate_cmd(
+    session_key: str = typer.Argument(..., help="Session key shown in 'atc media streams active'"),
+    message: str = typer.Option("", "--message", "-m", help="Message shown to the user"),
+    yes: bool    = typer.Option(False, "--yes", "-y", help="Skip confirmation"),
+) -> None:
+    """Terminate an active Plex stream."""
+    cfg = _load()
+    if not yes:
+        if not Confirm.ask(f"Terminate session [bold]{session_key}[/]?"):
+            raise typer.Exit(0)
+    with console.status(f"[bold]Terminating session {session_key}…[/]"):
+        try:
+            tautulli_terminate_session(_tautulli(cfg), session_key, message=message)
+        except Exception as e:
+            console.print(f"[red]✗[/] Failed: {e}")
+            raise typer.Exit(1)
+    console.print(f"[green]✓[/] Session [bold]{session_key}[/] terminated")
+
+
+# ── speedtest ─────────────────────────────────────────────────────────────────
+
+@app.command("speedtest")
+def speedtest_cmd(
+    duration: int     = typer.Option(10,    "--duration",  "-d",  help="Seconds per phase (download + upload)"),
+    parallel: int     = typer.Option(4,     "--parallel",  "-p",  help="Parallel download streams (upload uses half)"),
+    ping_only: bool   = typer.Option(False, "--ping-only",        help="Measure latency only — skip download/upload"),
+    ping_samples: int = typer.Option(10,    "--samples",   "-s",  help="Number of ping samples"),
+    output: _Out      = typer.Option(_Out.table, "-o",            help="Output format: table or json"),
+) -> None:
+    """Run a speed test against your OpenSpeedTest server.\n\n[dim]Requires openspeedtest: section in config.yaml.[/]"""
+    cfg = _load()
+    if cfg.openspeedtest is None:
+        console.print("[red]No [bold]openspeedtest[/] section in config.yaml[/]")
+        console.print("[dim]Add:[/]\n  openspeedtest:\n    host: <ip>\n    port: 3000")
+        raise typer.Exit(1)
+    asyncio.run(_speedtest_ui(cfg.openspeedtest, duration, parallel, ping_samples, ping_only, output))
+
+
+async def _speedtest_ui(
+    cfg,
+    duration_s: int,
+    parallel: int,
+    ping_samples: int,
+    ping_only: bool,
+    output: _Out,
+) -> None:
+    from statistics import median as _median
+    from rich.live import Live
+    from rich.text import Text
+    from lib.speedtest import ping_test, download_test, upload_test
+
+    BAR_W   = 28
+    SCALE   = 1000.0   # Mbps reference for bar fill (1 Gbps)
+
+    # ── Visual helpers ────────────────────────────────────────────────────────
+
+    def _bar(mbps: float, width: int = BAR_W) -> str:
+        filled = round(min(mbps / SCALE, 1.0) * width)
+        return "█" * filled + "░" * (width - filled)
+
+    def _speed_color(mbps: float) -> str:
+        if mbps >= 500: return "bold bright_green"
+        if mbps >= 100: return "cyan"
+        if mbps >= 25:  return "yellow"
+        return "red"
+
+    def _speed_label(mbps: float) -> tuple[str, str]:
+        """Return (label, color)."""
+        if mbps >= 900: return "Gigabit",   "bold bright_green"
+        if mbps >= 500: return "Excellent",  "bright_green"
+        if mbps >= 200: return "Fast",       "green"
+        if mbps >= 100: return "Good",       "cyan"
+        if mbps >= 25:  return "Basic",      "yellow"
+        return             "Slow",       "red"
+
+    def _ping_color(ms: float) -> str:
+        if ms < 5:  return "bold bright_green"
+        if ms < 20: return "green"
+        if ms < 50: return "yellow"
+        return "red"
+
+    def _ping_label(ms: float) -> str:
+        if ms < 5:  return "Excellent"
+        if ms < 20: return "Good"
+        if ms < 50: return "Fair"
+        return "High"
+
+    def _fmt_data(b: int) -> str:
+        if b >= 1024 ** 3: return f"{b / 1024**3:.2f} GB"
+        if b >= 1024 ** 2: return f"{b / 1024**2:.0f} MB"
+        return f"{b / 1024:.0f} KB"
+
+    # ── Header ────────────────────────────────────────────────────────────────
+
+    if output != _Out.json:
+        console.print()
+        console.rule(f"[bold cyan]⚡  OpenSpeedTest  ·  {cfg.host}:{cfg.port}[/]")
+        console.print()
+
+    # ── Ping ──────────────────────────────────────────────────────────────────
+
+    ping_samples_collected: list[float] = []
+
+    if output != _Out.json:
+        with Live(console=console, refresh_per_second=12, transient=True) as live:
+            def _on_sample(_idx: int, rtt: float) -> None:
+                ping_samples_collected.append(rtt)
+                done    = "[green]●[/] " * len(ping_samples_collected)
+                pending = "[dim]·[/] " * (ping_samples - len(ping_samples_collected))
+                med_str = f"  [bold]{_median(ping_samples_collected):.1f}[/] ms" if ping_samples_collected else ""
+                live.update(Text.from_markup(f"     Ping  {done}{pending}{med_str}"))
+
+            ping_result = await ping_test(cfg, samples=ping_samples, on_sample=_on_sample)
+
+        pc = _ping_color(ping_result.median_ms)
+        pl = _ping_label(ping_result.median_ms)
+        console.print(
+            f"     Ping  [{pc}]{ping_result.median_ms:.1f} ms[/]"
+            f"  [dim]±{ping_result.jitter_ms:.1f} ms jitter  ·  "
+            f"min {ping_result.min_ms:.1f} ms  ·  {pl}[/]"
+        )
+        console.print()
+    else:
+        ping_result = await ping_test(cfg, samples=ping_samples)
+
+    if ping_only:
+        if output == _Out.json:
+            console.print_json(_json.dumps({
+                "server":     f"{cfg.host}:{cfg.port}",
+                "ping_ms":    round(ping_result.median_ms, 2),
+                "jitter_ms":  round(ping_result.jitter_ms, 2),
+                "min_ms":     round(ping_result.min_ms, 2),
+            }))
+        else:
+            console.rule()
+            console.print()
+        return
+
+    # ── Download ──────────────────────────────────────────────────────────────
+
+    dl_counter   = [0]
+    dl_mbps_fin  = 0.0
+    dl_bytes_fin = 0
+
+    if output != _Out.json:
+        dl_t0 = time.perf_counter()
+
+        async def _monitor_dl(live: Live) -> None:
+            while True:
+                await asyncio.sleep(0.15)
+                elapsed = max(time.perf_counter() - dl_t0, 0.001)
+                mbps    = (dl_counter[0] * 8) / (elapsed * 1_000_000)
+                color   = _speed_color(mbps)
+                live.update(Text.from_markup(
+                    f"   ↓  Download  [{color}]{_bar(mbps)}[/]"
+                    f"  [{color}]{mbps:>7.1f} Mbps[/]"
+                    f"  [dim]{_fmt_data(dl_counter[0])}[/]"
+                ))
+
+        with Live(console=console, refresh_per_second=8, transient=True) as live:
+            live.update(Text.from_markup(
+                f"   ↓  Download  [dim]{_bar(0)}[/]  [dim]  0.0 Mbps[/]"
+            ))
+            monitor = asyncio.create_task(_monitor_dl(live))
+            dl_mbps_fin, dl_bytes_fin = await download_test(cfg, duration_s, parallel, dl_counter)
+            monitor.cancel()
+            await asyncio.gather(monitor, return_exceptions=True)
+
+        dc = _speed_color(dl_mbps_fin)
+        dl_lbl, dl_lc = _speed_label(dl_mbps_fin)
+        console.print(
+            f"   ↓  Download  [{dc}]{_bar(dl_mbps_fin)}[/]"
+            f"  [{dc}]{dl_mbps_fin:>7.1f} Mbps[/]"
+            f"  [{dl_lc}]● {dl_lbl}[/]"
+            f"  [dim]{_fmt_data(dl_bytes_fin)}[/]"
+        )
+    else:
+        dl_mbps_fin, dl_bytes_fin = await download_test(cfg, duration_s, parallel, dl_counter)
+
+    # ── Upload ────────────────────────────────────────────────────────────────
+
+    ul_counter   = [0]
+    ul_parallel  = max(1, parallel // 2)
+    ul_mbps_fin  = 0.0
+    ul_bytes_fin = 0
+
+    if output != _Out.json:
+        ul_t0 = time.perf_counter()
+
+        async def _monitor_ul(live: Live) -> None:
+            while True:
+                await asyncio.sleep(0.15)
+                elapsed = max(time.perf_counter() - ul_t0, 0.001)
+                mbps    = (ul_counter[0] * 8) / (elapsed * 1_000_000)
+                color   = _speed_color(mbps)
+                live.update(Text.from_markup(
+                    f"   ↑  Upload    [{color}]{_bar(mbps)}[/]"
+                    f"  [{color}]{mbps:>7.1f} Mbps[/]"
+                    f"  [dim]{_fmt_data(ul_counter[0])}[/]"
+                ))
+
+        with Live(console=console, refresh_per_second=8, transient=True) as live:
+            live.update(Text.from_markup(
+                f"   ↑  Upload    [dim]{_bar(0)}[/]  [dim]  0.0 Mbps[/]"
+            ))
+            monitor = asyncio.create_task(_monitor_ul(live))
+            ul_mbps_fin, ul_bytes_fin = await upload_test(cfg, duration_s, ul_parallel, ul_counter)
+            monitor.cancel()
+            await asyncio.gather(monitor, return_exceptions=True)
+
+        uc = _speed_color(ul_mbps_fin)
+        ul_lbl, ul_lc = _speed_label(ul_mbps_fin)
+        console.print(
+            f"   ↑  Upload    [{uc}]{_bar(ul_mbps_fin)}[/]"
+            f"  [{uc}]{ul_mbps_fin:>7.1f} Mbps[/]"
+            f"  [{ul_lc}]● {ul_lbl}[/]"
+            f"  [dim]{_fmt_data(ul_bytes_fin)}[/]"
+        )
+    else:
+        ul_mbps_fin, ul_bytes_fin = await upload_test(cfg, duration_s, ul_parallel, ul_counter)
+
+    # ── Summary ───────────────────────────────────────────────────────────────
+
+    if output == _Out.json:
+        console.print_json(_json.dumps({
+            "server":          f"{cfg.host}:{cfg.port}",
+            "ping_ms":         round(ping_result.median_ms, 2),
+            "jitter_ms":       round(ping_result.jitter_ms, 2),
+            "min_ms":          round(ping_result.min_ms, 2),
+            "download_mbps":   round(dl_mbps_fin, 2),
+            "download_bytes":  dl_bytes_fin,
+            "upload_mbps":     round(ul_mbps_fin, 2),
+            "upload_bytes":    ul_bytes_fin,
+            "duration_s":      duration_s,
+            "parallel_dl":     parallel,
+            "parallel_ul":     ul_parallel,
+        }))
+        return
+
+    console.print()
+    console.rule()
+    console.print()
+
+    t = Table(box=box.SIMPLE, show_header=False, pad_edge=False, show_edge=False)
+    t.add_column(width=11, justify="right", style="dim")
+    t.add_column(min_width=14)
+    t.add_column()
+
+    # Ping row
+    pc  = _ping_color(ping_result.median_ms)
+    pl  = _ping_label(ping_result.median_ms)
+    t.add_row(
+        "Ping",
+        f"[{pc}]{ping_result.median_ms:.1f} ms[/]",
+        f"[dim]±{ping_result.jitter_ms:.1f} ms jitter  ·  min {ping_result.min_ms:.1f} ms  ·  {pl}[/]",
+    )
+    t.add_row("", "", "")
+
+    # Download row
+    dc = _speed_color(dl_mbps_fin)
+    dl_lbl, dl_lc = _speed_label(dl_mbps_fin)
+    t.add_row(
+        "Download",
+        f"[{dc}]{dl_mbps_fin:.1f} Mbps[/]",
+        f"[{dl_lc}]● {dl_lbl}[/]  [dim]{_fmt_data(dl_bytes_fin)}  ·  {parallel} streams[/]",
+    )
+
+    # Upload row
+    uc = _speed_color(ul_mbps_fin)
+    ul_lbl, ul_lc = _speed_label(ul_mbps_fin)
+    t.add_row(
+        "Upload",
+        f"[{uc}]{ul_mbps_fin:.1f} Mbps[/]",
+        f"[{ul_lc}]● {ul_lbl}[/]  [dim]{_fmt_data(ul_bytes_fin)}  ·  {ul_parallel} streams[/]",
+    )
+
+    t.add_row("", "", "")
+    t.add_row(
+        "Test",
+        "",
+        f"[dim]{duration_s}s per phase  ·  {cfg.host}:{cfg.port}[/]",
+    )
+
+    console.print(t)
+    console.print()
+    console.rule()
+    console.print()
 
 
 # ── radar ─────────────────────────────────────────────────────────────────────
