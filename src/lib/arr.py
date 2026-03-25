@@ -6,7 +6,7 @@ Authentication uses X-Api-Key header.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 
 import httpx
 
@@ -93,6 +93,11 @@ def sonarr_scan(cfg: ArrConfig) -> ArrCommand:
 def sonarr_search_missing(cfg: ArrConfig) -> ArrCommand:
     """Search for all missing monitored episodes."""
     return _run_command(cfg, "MissingEpisodeSearch")
+
+
+def sonarr_search_series(cfg: ArrConfig, series_id: int) -> ArrCommand:
+    """Trigger a search for all missing episodes in a specific series."""
+    return _run_command(cfg, "SeriesSearch", seriesIds=[series_id])
 
 
 def radarr_search_movies(cfg: ArrConfig, movie_ids: list[int]) -> ArrCommand:
@@ -366,7 +371,12 @@ def get_today_imports(cfg: ArrConfig, target_date: date) -> list[ArrImportRecord
     for rec in records:
         if rec.get("eventType") not in _IMPORT_EVENT_TYPES:
             continue
-        rec_date = (rec.get("date") or "")[:10]
+        raw_date = rec.get("date") or ""
+        try:
+            rec_date = datetime.fromisoformat(raw_date.replace("Z", "+00:00")) \
+                .astimezone(tz=None).date().isoformat()
+        except (ValueError, AttributeError):
+            rec_date = raw_date[:10]
         if rec_date != date_prefix:
             continue
         movie = rec.get("movie") or {}
