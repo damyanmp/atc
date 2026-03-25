@@ -35,7 +35,6 @@ async def run_command(
         async with asyncssh.connect(
             host,
             username=effective_user,
-            client_keys=[ssh_cfg.expanded_key_file],
             known_hosts=None,         # homelab: skip host key verification
             connect_timeout=ssh_cfg.connect_timeout,
         ) as conn:
@@ -69,7 +68,6 @@ async def stream_command(
         async with asyncssh.connect(
             host,
             username=effective_user,
-            client_keys=[ssh_cfg.expanded_key_file],
             known_hosts=None,
             connect_timeout=ssh_cfg.connect_timeout,
         ) as conn:
