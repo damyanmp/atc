@@ -14,85 +14,180 @@
 #   atc secrets set <key>
 #   atc secrets delete <key>
 
+# ── General ───────────────────────────────────────────────────────────────────
+
+# Path to scan for *.sh scripts (relative to this config file's directory).
+scripts_dir: "../../"
+
+# Dashboard auto-refresh interval in seconds.
+refresh_interval: 30
+
+# ── Infrastructure ────────────────────────────────────────────────────────────
+
 proxmox:
+  # Connect to any single cluster node — the cluster API returns all nodes and
+  # guests automatically.
   # Create an API token: Proxmox UI → Datacenter → Permissions → API Tokens
-  # Recommended: dedicated user (e.g. atc@pve) with Sys.Audit + VM.Monitor roles
-  nodes:
-    - name: pve-01
-      host: 192.168.x.x
-      port: 8006
-      user: root@pam
-      token_name: atc
-      token_value: keychain:pve-01-token   # ← stored in keychain
-      verify_ssl: false
-
-    - name: pve-02
-      host: 192.168.x.x
-      port: 8006
-      user: root@pam
-      token_name: atc
-      token_value: keychain:pve-02-token
-      verify_ssl: false
-
-    - name: pve-03
-      host: 192.168.x.x
-      port: 8006
-      user: root@pam
-      token_name: atc
-      token_value: keychain:pve-03-token
-      verify_ssl: false
+  # Recommended: dedicated user (e.g. atc@pve) with Sys.Audit + VM.Monitor roles.
+  host: 192.168.x.x
+  port: 8006
+  user: root@pam
+  token_name: atc
+  token_value: keychain:pve-token   # ← stored in keychain
+  verify_ssl: false
 
 ssh:
-  # Used when SSHing into nodes, VMs, and LXCs to run apt upgrades.
+  # Used when SSHing into nodes, VMs, and LXCs (e.g. apt upgrades, key injection).
   # Requires SSH server running and your key authorized on each target.
   default_user: root
   key_file: ~/.ssh/id_rsa
   connect_timeout: 10
+
   # How to resolve Proxmox node names to SSH hostnames.
   # {name} is replaced with the node name returned by the cluster API.
-  # Default "{name}" works if short names resolve (e.g. via Pi-hole DNS).
+  # Default "{name}" works if short names resolve via DNS (e.g. Pi-hole).
   # Example: "pve-{name}.local.example.com"
   node_host_pattern: "{name}"
 
+  # Set to true to enforce ~/.ssh/known_hosts checking.
+  # Default false is appropriate for trusted home networks.
+  verify_host_keys: false
+
+  # Per-guest SSH user overrides (optional).
+  # Keys are guest names; values are the SSH user to connect as.
+  # Can also be managed via `atc get push-key` and stored in guest_users.yaml.
+  # guest_users:
+  #   my-ubuntu-vm: ubuntu
+  #   my-debian-lxc: debian
+
+# ── Storage ───────────────────────────────────────────────────────────────────
+
 dsm:
-  # Synology DSM HTTP API — read-only health checks.
-  # DSM ports: 5000 (HTTP) or 5001 (HTTPS)
-  - name: Globemaster
+  # Synology DSM HTTP API — health checks (CPU, memory, volumes).
+  # DSM ports: 5000 (HTTP) or 5001 (HTTPS).
+  - name: NAS
     host: 192.168.x.x
     port: 5000
     https: false
     user: your_dsm_user
-    password: keychain:dsm-globemaster-password  # ← stored in keychain
+    password: keychain:dsm-nas-password   # ← stored in keychain
     verify_ssl: false
 
-  # Add a second DSM instance if needed:
+  # Add more NAS instances as needed:
   # - name: SecondNAS
   #   host: 192.168.x.x
   #   port: 5000
-  #   https: false
   #   user: your_dsm_user
   #   password: keychain:dsm-secondnas-password
   #   verify_ssl: false
 
+# ── Network ───────────────────────────────────────────────────────────────────
+
+pihole:
+  # Pi-hole v6 HTTP API — DNS blocking status, gravity sync, custom DNS.
+  # Generate a password in Pi-hole: Settings → API / Web interface.
+  - name: Primary
+    host: 192.168.x.x
+    port: 80
+    https: false
+    password: keychain:pihole-primary-password   # ← stored in keychain
+    verify_ssl: false
+    primary: true   # primary instance is used for gravity sync and custom DNS writes
+
+  # - name: Secondary
+  #   host: 192.168.x.x
+  #   port: 80
+  #   password: keychain:pihole-secondary-password
+  #   primary: false
+
+# ── Home Automation ───────────────────────────────────────────────────────────
+
+homeassistant:
+  # Home Assistant REST API — entity states, updates, automations.
+  # Generate a long-lived access token: HA UI → Profile → Long-Lived Access Tokens.
+  host: 192.168.x.x
+  port: 8123
+  https: false
+  token: keychain:ha-token   # ← stored in keychain
+  verify_ssl: false
+
+  # Optional stat widgets shown in the TUI dashboard header.
+  # stats:
+  #   - name: Indoor
+  #     entity: sensor.living_room_temperature
+  #     unit: "°C"
+  #   - name: Outdoor
+  #     entity: sensor.outdoor_temperature
+  #     unit: "°C"
+
+# ── Media ─────────────────────────────────────────────────────────────────────
+
+plex:
+  # Plex Media Server API.
+  # Get your token: https://support.plex.tv/articles/204059436
+  host: 192.168.x.x
+  port: 32400
+  https: false
+  token: keychain:plex-token   # ← stored in keychain
+  verify_ssl: false
+
+radarr:
+  # Radarr — movie collection manager.
+  # API key: Radarr UI → Settings → General → API Key.
+  host: 192.168.x.x
+  port: 7878
+  https: false
+  api_key: keychain:radarr-api-key   # ← stored in keychain
+  verify_ssl: false
+  # base_path: /radarr   # uncomment if Radarr is behind a reverse proxy subpath
+
+sonarr:
+  # Sonarr — TV show collection manager.
+  # API key: Sonarr UI → Settings → General → API Key.
+  host: 192.168.x.x
+  port: 8989
+  https: false
+  api_key: keychain:sonarr-api-key   # ← stored in keychain
+  verify_ssl: false
+  # base_path: /sonarr   # uncomment if Sonarr is behind a reverse proxy subpath
+
 tautulli:
   # Tautulli — Plex monitoring (active streams, play history).
-  # Generate an API key in Tautulli: Settings → Web Interface → API key
+  # Generate an API key: Tautulli UI → Settings → Web Interface → API key.
   host: 192.168.x.x
   port: 8181
   https: false
   api_key: keychain:tautulli-api-key   # ← stored in keychain
   verify_ssl: false
 
+seerr:
+  # Overseerr or Jellyseerr — media request management.
+  # API key: Overseerr UI → Settings → General → API Key.
+  host: 192.168.x.x
+  port: 443
+  https: true
+  api_key: keychain:seerr-api-key   # ← stored in keychain
+  verify_ssl: false
+
+# ── Monitoring ────────────────────────────────────────────────────────────────
+
 openspeedtest:
-  # Self-hosted OpenSpeedTest server (docker: openspeedtest/latest)
+  # Self-hosted OpenSpeedTest server (docker: openspeedtest/latest).
   # No auth required — just point at the host and port.
   host: 192.168.x.x
   port: 3000
   https: false
   verify_ssl: false
 
-# Path to scan for *.sh scripts (relative to this config file's directory).
-scripts_dir: "../../"
-
-# Dashboard auto-refresh interval in seconds
-refresh_interval: 30
+tls:
+  # TLS certificate expiry checks — shown in the dashboard.
+  # sni: override SNI for wildcard certs on internal IPs.
+  - name: Router
+    host: 192.168.x.x
+    port: 443
+    verify_ssl: false
+  # - name: NAS
+  #   host: nas.local.example.com
+  #   port: 443
+  #   sni: nas.local.example.com
+  #   verify_ssl: false
