@@ -404,25 +404,34 @@ def find_backup_storage(cfg: ProxmoxClusterConfig, node: str) -> str | None:
 
 # ── SSH key injection ──────────────────────────────────────────────────────────
 
+def ssh_key_inject_script(pubkey: str, user: str = "root") -> str:
+    """Build an idempotent shell script that appends pubkey to a user's authorized_keys."""
+    key = pubkey.strip()
+    home = "/root" if user == "root" else f"/home/{user}"
+    ssh_dir = f"{home}/.ssh"
+    auth_keys = f"{ssh_dir}/authorized_keys"
+    return (
+        f"mkdir -p {ssh_dir} && "
+        f"chmod 700 {ssh_dir} && "
+        f"grep -qxF '{key}' {auth_keys} 2>/dev/null "
+        f"|| echo '{key}' >> {auth_keys} && "
+        f"chmod 600 {auth_keys}"
+    )
+
+
 def push_ssh_key_qemu(
     cfg: ProxmoxClusterConfig,
     node: str,
     vmid: int,
     pubkey: str,
+    user: str = "root",
 ) -> tuple[bool, str]:
     """Inject an SSH public key into a QEMU VM via the guest agent exec API.
 
     Requires qemu-guest-agent running inside the VM.
     Returns (success, message).
     """
-    key = pubkey.strip()
-    script = (
-        "mkdir -p /root/.ssh && "
-        "chmod 700 /root/.ssh && "
-        f"grep -qxF '{key}' /root/.ssh/authorized_keys 2>/dev/null "
-        f"|| echo '{key}' >> /root/.ssh/authorized_keys && "
-        "chmod 600 /root/.ssh/authorized_keys"
-    )
+    script = ssh_key_inject_script(pubkey, user)
     try:
         px = _connect(cfg)
         result = px.nodes(node).qemu(vmid).agent("exec").post(**{"command": ["bash", "-c", script]})
