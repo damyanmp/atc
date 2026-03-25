@@ -53,20 +53,80 @@ def _client(cfg: PlexConfig) -> httpx.Client:
 _YEAR_SUFFIX = re.compile(r"\s*\(\d{4}\)$")
 
 
-def find_media(cfg: PlexConfig, title: str, media_type: str, year: int = 0) -> PlexMatch:
-    """Search Plex for a movie or TV show by title.
+def find_media(
+    cfg: PlexConfig,
+    title: str,
+    media_type: str,
+    year: int = 0,
+    tvdb_id: int = 0,
+    tmdb_id: int = 0,
+) -> PlexMatch:
+    """Search Plex for a movie or TV show.
 
     media_type: "movie" or "tv"
-    year: optional — used to disambiguate when multiple titles match (e.g. remakes).
-    Uses the /hubs/search endpoint (searches all libraries).
+    tvdb_id / tmdb_id: when provided, matched against the Guid array Plex attaches
+        to each item (e.g. "tvdb://12345", "tmdb://67890"). ID match takes priority
+        over title matching and is immune to regional title differences.
+    year: used only for title-based fallback disambiguation.
 
     Plex sometimes stores titles with a year suffix (e.g. "Lost in Space (2018)").
-    The match strips any trailing "(YYYY)" from the Plex title before comparing so
-    that "Lost in Space (2018)" matches a search for "Lost in Space".
+    The title match strips any trailing "(YYYY)" before comparing.
     """
     plex_hub_type = "movie" if media_type == "movie" else "show"
+    tvdb_prefix = f"tvdb://{tvdb_id}" if tvdb_id else ""
+    tmdb_prefix = f"tmdb://{tmdb_id}" if tmdb_id else ""
+
+    def _build_match(item) -> PlexMatch:
+        added_at = ""
+        ts = item.get("addedAt")
+        if ts:
+            try:
+                added_at = datetime.fromtimestamp(int(ts)).strftime("%Y-%m-%d")
+            except Exception:
+                pass
+        return PlexMatch(
+            found=True,
+            title=item.get("title", ""),
+            year=item.get("year", 0),
+            library=item.get("librarySectionTitle", ""),
+            added_at=added_at,
+            episode_count=item.get("leafCount", 0),
+            season_count=item.get("childCount", 0),
+        )
+
     try:
         with _client(cfg) as client:
+            # Pass 1: GUID lookup via library sections (reliable, immune to title differences).
+            # /library/sections/{key}/all?guid=tvdb://12345&type=2 returns items matching that
+            # external ID. type: 1=movie, 2=show.
+            if tvdb_prefix or tmdb_prefix:
+                guid_query = tvdb_prefix or tmdb_prefix
+                lib_type_num = 1 if media_type == "movie" else 2
+                sections_r = client.get(
+                    f"{cfg.base_url}/library/sections",
+                    headers=_headers(cfg),
+                )
+                if sections_r.is_success:
+                    sections = (sections_r.json().get("MediaContainer") or {}).get("Directory") or []
+                    for section in sections:
+                        if section.get("type") != plex_hub_type:
+                            continue
+                        key = section.get("key")
+                        gr = client.get(
+                            f"{cfg.base_url}/library/sections/{key}/all",
+                            headers=_headers(cfg),
+                            params={"guid": guid_query, "type": lib_type_num},
+                        )
+                        if not gr.is_success:
+                            continue
+                        items = (gr.json().get("MediaContainer") or {}).get("Metadata") or []
+                        if items:
+                            item = items[0]
+                            # librarySectionTitle not present in this response — use section title
+                            item.setdefault("librarySectionTitle", section.get("title", ""))
+                            return _build_match(item)
+
+            # Pass 2: title search via /hubs/search (fallback when no IDs, or not found by GUID)
             r = client.get(
                 f"{cfg.base_url}/hubs/search",
                 headers=_headers(cfg),
@@ -85,27 +145,11 @@ def find_media(cfg: PlexConfig, title: str, media_type: str, year: int = 0) -> P
             for item in hub.get("Metadata") or []:
                 item_title = item.get("title", "")
                 item_year = item.get("year", 0)
-                # Normalise: strip trailing "(YYYY)" Plex sometimes appends
                 normalised = _YEAR_SUFFIX.sub("", item_title).strip().lower()
                 title_matches = normalised == title_lower or item_title.lower() == title_lower
                 year_matches = (not year) or (item_year == year)
                 if title_matches and year_matches:
-                    added_at = ""
-                    ts = item.get("addedAt")
-                    if ts:
-                        try:
-                            added_at = datetime.fromtimestamp(int(ts)).strftime("%Y-%m-%d")
-                        except Exception:
-                            pass
-                    return PlexMatch(
-                        found=True,
-                        title=item_title,
-                        year=item.get("year", 0),
-                        library=item.get("librarySectionTitle", ""),
-                        added_at=added_at,
-                        episode_count=item.get("leafCount", 0),
-                        season_count=item.get("childCount", 0),
-                    )
+                    return _build_match(item)
 
         return PlexMatch(found=False)
     except Exception as e:
