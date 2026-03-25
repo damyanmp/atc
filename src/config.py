@@ -51,6 +51,8 @@ def _resolve_secret(raw_value: str, key_hint: str) -> str:
     return value
 
 
+# ── Infrastructure ────────────────────────────────────────────────────────────
+
 @dataclass
 class ProxmoxClusterConfig:
     host: str
@@ -67,6 +69,7 @@ class SSHConfig:
     key_file: str = "~/.ssh/id_rsa"
     connect_timeout: int = 10
     node_host_pattern: str = "{name}"  # e.g. "pve-{name}.local.example.com"
+    verify_host_keys: bool = False     # set True to enforce ~/.ssh/known_hosts checking
     guest_users: dict = field(default_factory=dict)  # guest name → ssh user
 
     @property
@@ -79,6 +82,8 @@ class SSHConfig:
     def guest_user(self, guest_name: str) -> str | None:
         return self.guest_users.get(guest_name)
 
+
+# ── Storage ───────────────────────────────────────────────────────────────────
 
 @dataclass
 class DSMConfig:
@@ -96,6 +101,8 @@ class DSMConfig:
         return f"{scheme}://{self.host}:{self.port}"
 
 
+# ── Network ───────────────────────────────────────────────────────────────────
+
 @dataclass
 class PiholeInstanceConfig:
     name: str
@@ -111,6 +118,8 @@ class PiholeInstanceConfig:
         scheme = "https" if self.https else "http"
         return f"{scheme}://{self.host}:{self.port}"
 
+
+# ── Home Automation ───────────────────────────────────────────────────────────
 
 @dataclass
 class HAStatConfig:
@@ -133,6 +142,8 @@ class HAConfig:
         scheme = "https" if self.https else "http"
         return f"{scheme}://{self.host}:{self.port}"
 
+
+# ── Media ─────────────────────────────────────────────────────────────────────
 
 @dataclass
 class PlexConfig:
@@ -193,6 +204,8 @@ class TautulliConfig:
         return f"{scheme}://{self.host}:{self.port}"
 
 
+# ── Monitoring ────────────────────────────────────────────────────────────────
+
 @dataclass
 class OpenSpeedTestConfig:
     host: str
@@ -215,6 +228,8 @@ class TLSCheckConfig:
     verify_ssl: bool = True
 
 
+# ── Top-level config ──────────────────────────────────────────────────────────
+
 @dataclass
 class Config:
     proxmox: ProxmoxClusterConfig = field(default_factory=lambda: ProxmoxClusterConfig("", "", "", ""))
@@ -222,11 +237,11 @@ class Config:
     dsm_instances: list[DSMConfig] = field(default_factory=list)
     pihole_instances: list[PiholeInstanceConfig] = field(default_factory=list)
     ha: HAConfig | None = None
-    seerr: SeerrConfig | None = None
     plex: PlexConfig | None = None
     radarr: ArrConfig | None = None
     sonarr: ArrConfig | None = None
     tautulli: TautulliConfig | None = None
+    seerr: SeerrConfig | None = None
     openspeedtest: OpenSpeedTestConfig | None = None
     tls_checks: list[TLSCheckConfig] = field(default_factory=list)
     scripts_dir: str = "../../"
@@ -238,6 +253,8 @@ class Config:
         base = self.config_path.parent if self.config_path else Path.cwd()
         return (base / self.scripts_dir).resolve()
 
+
+# ── Loader ────────────────────────────────────────────────────────────────────
 
 def load_config(config_path: Path | None = None) -> Config:
     """Load config.yaml, resolving any keychain:* secret sentinels."""
@@ -253,7 +270,7 @@ def load_config(config_path: Path | None = None) -> Config:
     with open(config_path) as f:
         raw = yaml.safe_load(f)
 
-    # Proxmox cluster (single connection, cluster API returns all nodes)
+    # Proxmox
     px_raw = raw.get("proxmox", {})
     proxmox = ProxmoxClusterConfig(
         host=px_raw["host"],
@@ -266,7 +283,7 @@ def load_config(config_path: Path | None = None) -> Config:
 
     # SSH
     ssh_raw = raw.get("ssh", {})
-    # guest_users: merge config.yaml's ssh.guest_users with the sidecar file
+    # guest_users: merge config.yaml's ssh.guest_users with the optional sidecar file
     guest_users: dict[str, str] = dict(ssh_raw.get("guest_users", {}))
     sidecar = config_path.parent / "guest_users.yaml"
     if sidecar.exists():
@@ -277,10 +294,11 @@ def load_config(config_path: Path | None = None) -> Config:
         key_file=ssh_raw.get("key_file", "~/.ssh/id_rsa"),
         connect_timeout=int(ssh_raw.get("connect_timeout", 10)),
         node_host_pattern=ssh_raw.get("node_host_pattern", "{name}"),
+        verify_host_keys=bool(ssh_raw.get("verify_host_keys", False)),
         guest_users=guest_users,
     )
 
-    # DSM
+    # DSM (Synology)
     dsm_instances = []
     for d in raw.get("dsm", []):
         dsm_name = d["name"]
@@ -294,7 +312,7 @@ def load_config(config_path: Path | None = None) -> Config:
             verify_ssl=bool(d.get("verify_ssl", False)),
         ))
 
-    # Pi-hole instances
+    # Pi-hole
     pihole_instances: list[PiholeInstanceConfig] = []
     for p in raw.get("pihole", []):
         ph_name = p["name"]
@@ -312,33 +330,16 @@ def load_config(config_path: Path | None = None) -> Config:
     ha: HAConfig | None = None
     if "homeassistant" in raw:
         ha_raw = raw["homeassistant"]
-        ha_stats = [
-            HAStatConfig(
-                name=s["name"],
-                entity=s["entity"],
-                unit=s.get("unit", ""),
-            )
-            for s in ha_raw.get("stats", [])
-        ]
         ha = HAConfig(
             host=ha_raw["host"],
             port=int(ha_raw.get("port", 8123)),
             https=bool(ha_raw.get("https", False)),
             token=_resolve_secret(ha_raw["token"], "homeassistant/token"),
             verify_ssl=bool(ha_raw.get("verify_ssl", False)),
-            stats=ha_stats,
-        )
-
-    # Seerr
-    seerr: SeerrConfig | None = None
-    if "seerr" in raw:
-        sr = raw["seerr"]
-        seerr = SeerrConfig(
-            host=sr["host"],
-            port=int(sr.get("port", 443)),
-            https=bool(sr.get("https", True)),
-            api_key=_resolve_secret(sr["api_key"], "seerr/api_key"),
-            verify_ssl=bool(sr.get("verify_ssl", False)),
+            stats=[
+                HAStatConfig(name=s["name"], entity=s["entity"], unit=s.get("unit", ""))
+                for s in ha_raw.get("stats", [])
+            ],
         )
 
     # Plex
@@ -353,7 +354,7 @@ def load_config(config_path: Path | None = None) -> Config:
             verify_ssl=bool(px2.get("verify_ssl", False)),
         )
 
-    # Radarr / Sonarr
+    # Radarr
     radarr: ArrConfig | None = None
     if "radarr" in raw:
         rr = raw["radarr"]
@@ -367,17 +368,18 @@ def load_config(config_path: Path | None = None) -> Config:
             verify_ssl=bool(rr.get("verify_ssl", False)),
         )
 
+    # Sonarr
     sonarr: ArrConfig | None = None
     if "sonarr" in raw:
-        sr2 = raw["sonarr"]
+        sr = raw["sonarr"]
         sonarr = ArrConfig(
             name="sonarr",
-            host=sr2["host"],
-            port=int(sr2.get("port", 8989)),
-            base_path=sr2.get("base_path", ""),
-            https=bool(sr2.get("https", False)),
-            api_key=_resolve_secret(sr2["api_key"], "sonarr/api_key"),
-            verify_ssl=bool(sr2.get("verify_ssl", False)),
+            host=sr["host"],
+            port=int(sr.get("port", 8989)),
+            base_path=sr.get("base_path", ""),
+            https=bool(sr.get("https", False)),
+            api_key=_resolve_secret(sr["api_key"], "sonarr/api_key"),
+            verify_ssl=bool(sr.get("verify_ssl", False)),
         )
 
     # Tautulli
@@ -390,6 +392,18 @@ def load_config(config_path: Path | None = None) -> Config:
             https=bool(tt.get("https", False)),
             api_key=_resolve_secret(tt["api_key"], "tautulli/api_key"),
             verify_ssl=bool(tt.get("verify_ssl", False)),
+        )
+
+    # Seerr (Overseerr / Jellyseerr)
+    seerr: SeerrConfig | None = None
+    if "seerr" in raw:
+        sr2 = raw["seerr"]
+        seerr = SeerrConfig(
+            host=sr2["host"],
+            port=int(sr2.get("port", 443)),
+            https=bool(sr2.get("https", True)),
+            api_key=_resolve_secret(sr2["api_key"], "seerr/api_key"),
+            verify_ssl=bool(sr2.get("verify_ssl", False)),
         )
 
     # OpenSpeedTest
@@ -420,11 +434,11 @@ def load_config(config_path: Path | None = None) -> Config:
         dsm_instances=dsm_instances,
         pihole_instances=pihole_instances,
         ha=ha,
-        seerr=seerr,
         plex=plex,
         radarr=radarr,
         sonarr=sonarr,
         tautulli=tautulli,
+        seerr=seerr,
         openspeedtest=openspeedtest,
         tls_checks=tls_checks,
         scripts_dir=raw.get("scripts_dir", "../../"),
