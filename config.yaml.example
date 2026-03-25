@@ -74,6 +74,23 @@ dsm:
   #   password: keychain:dsm-secondnas-password
   #   verify_ssl: false
 
+tautulli:
+  # Tautulli — Plex monitoring (active streams, play history).
+  # Generate an API key in Tautulli: Settings → Web Interface → API key
+  host: 192.168.x.x
+  port: 8181
+  https: false
+  api_key: keychain:tautulli-api-key   # ← stored in keychain
+  verify_ssl: false
+
+openspeedtest:
+  # Self-hosted OpenSpeedTest server (docker: openspeedtest/latest)
+  # No auth required — just point at the host and port.
+  host: 192.168.x.x
+  port: 3000
+  https: false
+  verify_ssl: false
+
 # Path to scan for *.sh scripts (relative to this config file's directory).
 scripts_dir: "../../"
 

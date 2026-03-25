@@ -67,6 +67,7 @@ class SSHConfig:
     key_file: str = "~/.ssh/id_rsa"
     connect_timeout: int = 10
     node_host_pattern: str = "{name}"  # e.g. "pve-{name}.local.example.com"
+    guest_users: dict = field(default_factory=dict)  # guest name → ssh user
 
     @property
     def expanded_key_file(self) -> str:
@@ -74,6 +75,9 @@ class SSHConfig:
 
     def node_host(self, node_name: str) -> str:
         return self.node_host_pattern.format(name=node_name)
+
+    def guest_user(self, guest_name: str) -> str | None:
+        return self.guest_users.get(guest_name)
 
 
 @dataclass
@@ -176,6 +180,33 @@ class SeerrConfig:
 
 
 @dataclass
+class TautulliConfig:
+    host: str
+    api_key: str
+    port: int = 8181
+    https: bool = False
+    verify_ssl: bool = False
+
+    @property
+    def base_url(self) -> str:
+        scheme = "https" if self.https else "http"
+        return f"{scheme}://{self.host}:{self.port}"
+
+
+@dataclass
+class OpenSpeedTestConfig:
+    host: str
+    port: int = 3000
+    https: bool = False
+    verify_ssl: bool = False
+
+    @property
+    def base_url(self) -> str:
+        scheme = "https" if self.https else "http"
+        return f"{scheme}://{self.host}:{self.port}"
+
+
+@dataclass
 class TLSCheckConfig:
     name: str
     host: str
@@ -195,6 +226,8 @@ class Config:
     plex: PlexConfig | None = None
     radarr: ArrConfig | None = None
     sonarr: ArrConfig | None = None
+    tautulli: TautulliConfig | None = None
+    openspeedtest: OpenSpeedTestConfig | None = None
     tls_checks: list[TLSCheckConfig] = field(default_factory=list)
     scripts_dir: str = "../../"
     refresh_interval: int = 30
@@ -233,11 +266,18 @@ def load_config(config_path: Path | None = None) -> Config:
 
     # SSH
     ssh_raw = raw.get("ssh", {})
+    # guest_users: merge config.yaml's ssh.guest_users with the sidecar file
+    guest_users: dict[str, str] = dict(ssh_raw.get("guest_users", {}))
+    sidecar = config_path.parent / "guest_users.yaml"
+    if sidecar.exists():
+        with open(sidecar) as _f:
+            guest_users.update(yaml.safe_load(_f) or {})
     ssh = SSHConfig(
         default_user=ssh_raw.get("default_user", "root"),
         key_file=ssh_raw.get("key_file", "~/.ssh/id_rsa"),
         connect_timeout=int(ssh_raw.get("connect_timeout", 10)),
         node_host_pattern=ssh_raw.get("node_host_pattern", "{name}"),
+        guest_users=guest_users,
     )
 
     # DSM
@@ -340,6 +380,29 @@ def load_config(config_path: Path | None = None) -> Config:
             verify_ssl=bool(sr2.get("verify_ssl", False)),
         )
 
+    # Tautulli
+    tautulli: TautulliConfig | None = None
+    if "tautulli" in raw:
+        tt = raw["tautulli"]
+        tautulli = TautulliConfig(
+            host=tt["host"],
+            port=int(tt.get("port", 8181)),
+            https=bool(tt.get("https", False)),
+            api_key=_resolve_secret(tt["api_key"], "tautulli/api_key"),
+            verify_ssl=bool(tt.get("verify_ssl", False)),
+        )
+
+    # OpenSpeedTest
+    openspeedtest: OpenSpeedTestConfig | None = None
+    if "openspeedtest" in raw:
+        ost = raw["openspeedtest"]
+        openspeedtest = OpenSpeedTestConfig(
+            host=ost["host"],
+            port=int(ost.get("port", 3000)),
+            https=bool(ost.get("https", False)),
+            verify_ssl=bool(ost.get("verify_ssl", False)),
+        )
+
     # TLS cert checks
     tls_checks = []
     for t in raw.get("tls", []):
@@ -361,11 +424,27 @@ def load_config(config_path: Path | None = None) -> Config:
         plex=plex,
         radarr=radarr,
         sonarr=sonarr,
+        tautulli=tautulli,
+        openspeedtest=openspeedtest,
         tls_checks=tls_checks,
         scripts_dir=raw.get("scripts_dir", "../../"),
         refresh_interval=int(raw.get("refresh_interval", 30)),
         config_path=config_path.resolve(),
     )
+
+
+# ── Guest user persistence ────────────────────────────────────────────────────
+
+def save_guest_user(config_path: Path, guest_name: str, user: str) -> None:
+    """Persist a guest→user mapping to the guest_users.yaml sidecar file."""
+    sidecar = config_path.parent / "guest_users.yaml"
+    data: dict[str, str] = {}
+    if sidecar.exists():
+        with open(sidecar) as f:
+            data = yaml.safe_load(f) or {}
+    data[guest_name] = user
+    with open(sidecar, "w") as f:
+        yaml.dump(data, f, default_flow_style=False)
 
 
 # ── Keychain management helpers (used by `atc secrets`) ──────────────────────

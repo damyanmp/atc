@@ -14,6 +14,7 @@ from config import (
     ProxmoxClusterConfig,
     SeerrConfig,
     SSHConfig,
+    TautulliConfig,
     TLSCheckConfig,
     KEYCHAIN_PREFIX,
     load_config,
@@ -94,6 +95,20 @@ class TestPiholeConfigBaseUrl:
         assert cfg.base_url == "https://pihole.local:8443"
 
 
+class TestTautulliConfigBaseUrl:
+    def test_http_default_port(self):
+        cfg = TautulliConfig(host="192.168.1.10", api_key="k")
+        assert cfg.base_url == "http://192.168.1.10:8181"
+
+    def test_http_custom_port(self):
+        cfg = TautulliConfig(host="tautulli.local", port=8282, api_key="k")
+        assert cfg.base_url == "http://tautulli.local:8282"
+
+    def test_https(self):
+        cfg = TautulliConfig(host="tautulli.local", port=443, https=True, api_key="k")
+        assert cfg.base_url == "https://tautulli.local:443"
+
+
 # ── SSHConfig ─────────────────────────────────────────────────────────────────
 
 class TestSSHConfig:
@@ -172,6 +187,7 @@ class TestLoadConfig:
         assert cfg.plex is None
         assert cfg.ha is None
         assert cfg.seerr is None
+        assert cfg.tautulli is None
 
     def test_radarr_section_parsed(self, tmp_path):
         cfg = load_config(_minimal_yaml(tmp_path, extra=textwrap.dedent("""\
@@ -257,3 +273,16 @@ class TestLoadConfig:
         assert len(cfg.pihole_instances) == 2
         primary = next(p for p in cfg.pihole_instances if p.primary)
         assert primary.name == "Primary"
+
+    def test_tautulli_section_parsed(self, tmp_path):
+        cfg = load_config(_minimal_yaml(tmp_path, extra=textwrap.dedent("""\
+            tautulli:
+              host: 192.168.1.10
+              port: 8181
+              api_key: testtautullikey
+        """)))
+        assert cfg.tautulli is not None
+        assert cfg.tautulli.host == "192.168.1.10"
+        assert cfg.tautulli.port == 8181
+        assert cfg.tautulli.api_key == "testtautullikey"
+        assert cfg.tautulli.base_url == "http://192.168.1.10:8181"
