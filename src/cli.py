@@ -53,7 +53,7 @@ from lib.proxmox import (
     list_backups, BackupFile,
     list_backup_jobs, BackupJob,
     run_backup_job, backup_guest, find_backup_storage,
-    push_ssh_key_qemu,
+    push_ssh_key_qemu, ssh_key_inject_script,
 )
 from lib.dsm import fetch_all_dsm
 from lib.tls import check_all_certs, CertStatus
@@ -1217,7 +1217,8 @@ def push_key(
     [bold]LXC containers[/] — SSHes to the Proxmox node and runs [cyan]pct exec[/].
     [bold]QEMU VMs[/]       — uses the QEMU guest agent exec API.
 
-    Always injects into [bold]root[/]'s authorized_keys (idempotent).
+    Target user defaults to [cyan]ssh.default_user[/] in config, overridable
+    per-guest via [cyan]ssh.guest_users[/] or [bold]atc get push-key[/] --user.
     Run once to unlock [bold]atc update hosts[/] for community-spun LXCs.
     """
     cfg = _load()
@@ -1258,22 +1259,15 @@ def push_key(
     if not yes and not Confirm.ask(f"\nPush key to {len(matched)} guest(s)?"):
         raise typer.Exit(0)
 
-    # Build the idempotent key-inject script (used for both paths)
-    key_script = (
-        "mkdir -p /root/.ssh && "
-        "chmod 700 /root/.ssh && "
-        f"grep -qxF '{pubkey}' /root/.ssh/authorized_keys 2>/dev/null "
-        f"|| echo '{pubkey}' >> /root/.ssh/authorized_keys && "
-        "chmod 600 /root/.ssh/authorized_keys"
-    )
-
     console.print()
     failed = 0
     for g in matched:
         kind = "lxc" if g.type == "lxc" else "vm"
-        with console.status(f"  [bold]{g.name}[/]…"):
+        target_user = cfg.ssh.guest_user(g.name) or cfg.ssh.default_user
+        with console.status(f"  [bold]{g.name}[/] [dim]({target_user})[/]…"):
             if g.type == "lxc":
                 # SSH to the Proxmox node and run pct exec
+                key_script = ssh_key_inject_script(pubkey, target_user)
                 node_host = cfg.ssh.node_host(g.node)
                 pct_cmd = f"pct exec {g.vmid} -- bash -c {_shell_quote(key_script)}"
                 result = asyncio.run(run_command(node_host, pct_cmd, cfg.ssh))
@@ -1281,7 +1275,7 @@ def push_key(
                 msg = (result.stderr or result.stdout).strip() if not ok else ""
             else:
                 # QEMU VM — use guest agent exec API
-                ok, msg = push_ssh_key_qemu(cfg.proxmox, g.node, g.vmid, pubkey)
+                ok, msg = push_ssh_key_qemu(cfg.proxmox, g.node, g.vmid, pubkey, user=target_user)
         if ok:
             console.print(f"  ✅ {g.name} [dim]({kind} #{g.vmid})[/]")
         else:
