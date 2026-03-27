@@ -25,6 +25,8 @@ class NodeStatus:
     disk_used: int = 0        # bytes
     disk_total: int = 0       # bytes
     uptime: int = 0           # seconds
+    load_avg: float = -1.0    # 1-min load average; -1 = not fetched
+    io_wait: float = -1.0     # fraction of CPU time spent waiting on I/O; -1 = not fetched
     error: str = ""
 
 
@@ -38,6 +40,12 @@ class GuestInfo:
     cpu: float = 0.0
     mem: int = 0              # bytes
     maxmem: int = 0           # bytes
+    disk_used: int = 0        # bytes (LXC rootfs; unreliable for qemu)
+    disk_total: int = 0       # bytes (configured disk size)
+    disk_read: int = 0        # bytes read since boot (cumulative)
+    disk_write: int = 0       # bytes written since boot (cumulative)
+    net_in: int = 0           # bytes received since boot (cumulative)
+    net_out: int = 0          # bytes sent since boot (cumulative)
     uptime: int = 0
     tags: str = ""
 
@@ -116,6 +124,12 @@ def _fetch_cluster(cfg: ProxmoxClusterConfig) -> ClusterStatus:
                 cpu=float(r.get("cpu", 0)),
                 mem=int(r.get("mem", 0)),
                 maxmem=int(r.get("maxmem", 0)),
+                disk_used=int(r.get("disk", 0)),
+                disk_total=int(r.get("maxdisk", 0)),
+                disk_read=int(r.get("diskread", 0)),
+                disk_write=int(r.get("diskwrite", 0)),
+                net_in=int(r.get("netin", 0)),
+                net_out=int(r.get("netout", 0)),
                 uptime=int(r.get("uptime", 0)),
                 tags=r.get("tags", ""),
             ))
@@ -128,6 +142,37 @@ async def fetch_cluster_status(cfg: ProxmoxClusterConfig) -> ClusterStatus:
     """Async wrapper — runs the blocking proxmoxer call in a thread pool."""
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(None, _fetch_cluster, cfg)
+
+
+async def fetch_node_loads(
+    cfg: ProxmoxClusterConfig,
+    node_names: list[str],
+) -> dict[str, tuple[float, float, int]]:
+    """Fetch per-node stats in parallel from /nodes/{n}/status.
+
+    Returns {node_name: (load_avg_1m, io_wait_fraction, nproc)}.
+    load_avg_1m: 1-minute load average (-1 if unavailable).
+    io_wait_fraction: fraction of CPU time spent waiting on I/O (-1 if unavailable).
+    nproc: logical CPU count (0 if unavailable).
+    """
+    loop = asyncio.get_event_loop()
+
+    def _get(name: str) -> tuple[str, float, float, int]:
+        try:
+            px = _connect(cfg)
+            s = px.nodes(name).status.get()
+            la = s.get("loadavg", [])
+            load = float(la[0]) if la else -1.0
+            wait = float(s.get("wait", -1.0))
+            nproc = int(s.get("cpuinfo", {}).get("cpus", 0))
+            return name, load, wait, nproc
+        except Exception:
+            return name, -1.0, -1.0, 0
+
+    results = await asyncio.gather(*[
+        loop.run_in_executor(None, _get, n) for n in node_names
+    ])
+    return {name: (load, wait, nproc) for name, load, wait, nproc in results}
 
 
 async def fetch_guest_ips(cfg: ProxmoxClusterConfig, guests: list[GuestInfo]) -> dict[int, str]:
