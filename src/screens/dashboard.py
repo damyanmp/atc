@@ -1,4 +1,4 @@
-"""Dashboard screen — main view showing Proxmox nodes, VMs, LXCs, and DSM."""
+"""Dashboard screen — main view showing Proxmox nodes, VMs, LXCs, and Beszel hosts."""
 from __future__ import annotations
 
 import sys
@@ -17,7 +17,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "lib"))
 
 from config import Config
 from lib.proxmox import ClusterStatus, fetch_cluster_status
-from lib.dsm import DSMStatus, fetch_all_dsm
+from lib.beszel import BeszelSystem, fetch_systems as fetch_beszel
+from lib.hosts import normalize_name
 from lib.tls import CertStatus, check_all_certs
 
 
@@ -102,7 +103,7 @@ class DashboardScreen(Screen):
         super().__init__()
         self.config = config
         self._cluster: ClusterStatus | None = None
-        self._dsm: list[DSMStatus] = []
+        self._beszel: list[BeszelSystem] = []
         self._certs: list[CertStatus] = []
 
     def compose(self) -> ComposeResult:
@@ -120,9 +121,9 @@ class DashboardScreen(Screen):
                 yield Static("📦 LXC Containers", classes="panel-title")
                 with ScrollableContainer(classes="panel", id="lxcs-panel"):
                     yield DataTable(id="lxcs-table", show_cursor=True)
-                yield Static("💾 Synology DSM", classes="panel-title")
-                with ScrollableContainer(classes="panel", id="dsm-panel"):
-                    yield DataTable(id="dsm-table", show_cursor=False)
+                yield Static("🖥  Standalone Hosts", classes="panel-title")
+                with ScrollableContainer(classes="panel", id="beszel-panel"):
+                    yield DataTable(id="beszel-table", show_cursor=False)
                 yield Static("🔒 TLS Certificates", classes="panel-title")
                 with ScrollableContainer(classes="panel", id="certs-panel"):
                     yield DataTable(id="certs-table", show_cursor=False)
@@ -138,13 +139,13 @@ class DashboardScreen(Screen):
         nodes_t.add_columns("Node", "Status", "CPU", "Memory", "VMs", "LXCs", "Uptime")
 
         vms_t = self.query_one("#vms-table", DataTable)
-        vms_t.add_columns("", "Name", "Node", "CPU", "Memory", "Uptime")
+        vms_t.add_columns("", "Name", "Node", "CPU", "Memory", "Disk", "Uptime")
 
         lxcs_t = self.query_one("#lxcs-table", DataTable)
-        lxcs_t.add_columns("", "Name", "Node", "CPU", "Memory", "Uptime")
+        lxcs_t.add_columns("", "Name", "Node", "CPU", "Memory", "Disk", "Uptime")
 
-        dsm_t = self.query_one("#dsm-table", DataTable)
-        dsm_t.add_columns("NAS", "Status", "CPU", "Memory", "Volumes")
+        beszel_t = self.query_one("#beszel-table", DataTable)
+        beszel_t.add_columns("Host", "Status", "CPU", "Memory", "Disk")
 
         certs_t = self.query_one("#certs-table", DataTable)
         certs_t.add_columns("Name", "Expires", "Days")
@@ -154,7 +155,8 @@ class DashboardScreen(Screen):
         self.query_one("#status-bar", Static).update("⏳ Refreshing…")
         try:
             self._cluster = await fetch_cluster_status(self.config.proxmox)
-            self._dsm = await fetch_all_dsm(self.config.dsm_instances, no_prompt=True)
+            if self.config.beszel:
+                self._beszel = await fetch_beszel(self.config.beszel)
             if self.config.tls_checks:
                 self._certs = await check_all_certs(self.config.tls_checks)
             self._populate_tables()
@@ -169,6 +171,12 @@ class DashboardScreen(Screen):
     def _populate_tables(self) -> None:
         if not self._cluster:
             return
+
+        # Build Beszel lookup by normalized name for metric enrichment
+        beszel_map: dict[str, BeszelSystem] = {
+            normalize_name(s.name): s for s in self._beszel
+        }
+        matched_beszel: set[str] = set()
 
         # ---- Nodes ----
         nodes_t = self.query_one("#nodes-table", DataTable)
@@ -201,14 +209,25 @@ class DashboardScreen(Screen):
             key=lambda g: (g.status != "running", g.name)
         )
         for vm in vms:
+            bz = beszel_map.get(normalize_name(vm.name))
+            if bz:
+                matched_beszel.add(normalize_name(vm.name))
             icon = _status_icon(vm.status)
-            cpu = f"{vm.cpu * 100:.0f}%" if vm.status == "running" else "—"
-            mem = (
-                f"{_fmt_bytes(vm.mem)}/{_fmt_bytes(vm.maxmem)}"
-                if vm.status == "running" and vm.maxmem > 0 else "—"
-            )
+            if bz and bz.online:
+                cpu = f"{bz.cpu_percent:.0f}%"
+                mem = f"{bz.mem_percent:.0f}%"
+                disk = f"{bz.disk_percent:.0f}%"
+            elif vm.status == "running":
+                cpu = f"{vm.cpu * 100:.0f}%"
+                mem = (
+                    f"{_fmt_bytes(vm.mem)}/{_fmt_bytes(vm.maxmem)}"
+                    if vm.maxmem > 0 else "—"
+                )
+                disk = "—"
+            else:
+                cpu = mem = disk = "—"
             uptime = _fmt_uptime(vm.uptime) if vm.status == "running" else vm.status
-            vms_t.add_row(icon, vm.name, vm.node, cpu, mem, uptime)
+            vms_t.add_row(icon, vm.name, vm.node, cpu, mem, disk, uptime)
 
         # ---- LXCs ----
         lxcs_t = self.query_one("#lxcs-table", DataTable)
@@ -218,27 +237,36 @@ class DashboardScreen(Screen):
             key=lambda g: (g.status != "running", g.name)
         )
         for ct in lxcs:
+            bz = beszel_map.get(normalize_name(ct.name))
+            if bz:
+                matched_beszel.add(normalize_name(ct.name))
             icon = _status_icon(ct.status)
-            cpu = f"{ct.cpu * 100:.0f}%" if ct.status == "running" else "—"
-            mem = (
-                f"{_fmt_bytes(ct.mem)}/{_fmt_bytes(ct.maxmem)}"
-                if ct.status == "running" and ct.maxmem > 0 else "—"
-            )
+            if bz and bz.online:
+                cpu = f"{bz.cpu_percent:.0f}%"
+                mem = f"{bz.mem_percent:.0f}%"
+                disk = f"{bz.disk_percent:.0f}%"
+            elif ct.status == "running":
+                cpu = f"{ct.cpu * 100:.0f}%"
+                mem = (
+                    f"{_fmt_bytes(ct.mem)}/{_fmt_bytes(ct.maxmem)}"
+                    if ct.maxmem > 0 else "—"
+                )
+                disk = "—"
+            else:
+                cpu = mem = disk = "—"
             uptime = _fmt_uptime(ct.uptime) if ct.status == "running" else ct.status
-            lxcs_t.add_row(icon, ct.name, ct.node, cpu, mem, uptime)
+            lxcs_t.add_row(icon, ct.name, ct.node, cpu, mem, disk, uptime)
 
-        # ---- DSM ----
-        dsm_t = self.query_one("#dsm-table", DataTable)
-        dsm_t.clear()
-        for dsm in self._dsm:
-            status = "🟢 Online" if dsm.online else f"🔴 {dsm.error[:20]}"
-            cpu = f"{dsm.cpu_percent:.0f}%" if dsm.online else "—"
-            mem = f"{dsm.mem_percent:.0f}%" if dsm.online else "—"
-            vols = "  ".join(
-                f"{v['name']}: {v['percent']:.0f}% ({v['used_gb']}/{v['total_gb']}G)"
-                for v in dsm.volumes
-            ) if dsm.online else "—"
-            dsm_t.add_row(dsm.name, status, cpu, mem, vols or "—")
+        # ---- Standalone hosts (Beszel-only — not matched to any Proxmox guest) ----
+        beszel_t = self.query_one("#beszel-table", DataTable)
+        beszel_t.clear()
+        standalone = [s for s in self._beszel if normalize_name(s.name) not in matched_beszel]
+        for sys in standalone:
+            status = "🟢 Online" if sys.online else f"🔴 {sys.error[:20] or sys.status}"
+            cpu = f"{sys.cpu_percent:.0f}%" if sys.online else "—"
+            mem = f"{sys.mem_percent:.0f}%" if sys.online else "—"
+            disk = f"{sys.disk_percent:.0f}%" if sys.online else "—"
+            beszel_t.add_row(sys.name, status, cpu, mem, disk)
 
         # ---- TLS Certs ----
         certs_t = self.query_one("#certs-table", DataTable)
