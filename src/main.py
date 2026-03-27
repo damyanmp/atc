@@ -129,6 +129,10 @@ def main() -> None:
 
         backup_group.get_command = _patched_backup_cmd  # type: ignore[method-assign]
 
+    # Register "up" as a hidden alias for "uptimekuma"
+    if "uptimekuma" in (click_app.commands or {}):
+        click_app.commands["up"] = click_app.commands["uptimekuma"]
+
     click_app(standalone_mode=True)
 
 
