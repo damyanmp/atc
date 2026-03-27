@@ -156,6 +156,67 @@ def list_updates(cfg: HAConfig, pending_only: bool = True) -> list[HAUpdateEntit
         return entities
 
 
+def get_diagnostics(cfg: HAConfig, since_iso: str = "", tail_lines: int = 150) -> str:
+    """Return HA diagnostic text for the blackbox dump.
+
+    Combines two sources (both gracefully skipped on error):
+      1. Recent logbook entries since `since_iso` (ISO 8601 string).
+      2. Active persistent notifications (user-visible warnings/errors).
+
+    The old /api/error_log endpoint was removed in HA 2023.6+.
+    """
+    parts: list[str] = []
+
+    with _client(cfg) as client:
+        h = _headers(cfg)
+
+        # ── Logbook ───────────────────────────────────────────────────────────
+        try:
+            url = f"{cfg.base_url}/api/logbook"
+            if since_iso:
+                url += f"/{since_iso}"
+            r = client.get(url, headers=h)
+            if r.is_success:
+                entries = r.json()
+                if entries:
+                    parts.append(f"Logbook ({len(entries)} entries):")
+                    for e in entries[-tail_lines:]:
+                        when = e.get("when", "")[:19]
+                        name = e.get("name", "")
+                        msg  = e.get("message", "")
+                        domain = e.get("domain", "")
+                        parts.append(f"  [{when}] {domain}/{name}: {msg}")
+                else:
+                    parts.append("Logbook: no entries in window.")
+            else:
+                parts.append(f"Logbook: HTTP {r.status_code}")
+        except Exception as e:
+            parts.append(f"Logbook: error — {e}")
+
+        # ── Persistent notifications ──────────────────────────────────────────
+        try:
+            r = client.get(f"{cfg.base_url}/api/states", headers=h)
+            if r.is_success:
+                notifs = [
+                    s for s in r.json()
+                    if s.get("entity_id", "").startswith("persistent_notification.")
+                    and s.get("state") != "dismissed"
+                ]
+                if notifs:
+                    parts.append(f"\nPersistent notifications ({len(notifs)}):")
+                    for n in notifs:
+                        attrs = n.get("attributes", {})
+                        title = attrs.get("title", n["entity_id"])
+                        msg   = attrs.get("message", "")
+                        parts.append(f"  ⚠  {title}: {msg}")
+                else:
+                    parts.append("\nPersistent notifications: none.")
+        except Exception as e:
+            parts.append(f"\nPersistent notifications: error — {e}")
+
+    return "\n".join(parts)
+
+
 def get_stats(cfg: HAConfig) -> list[HAStatResult]:
     results: list[HAStatResult] = []
     with _client(cfg) as client:
