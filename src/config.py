@@ -46,7 +46,7 @@ def _resolve_secret(raw_value: str, key_hint: str) -> str:
         print("    Empty value — aborting.")
         sys.exit(1)
 
-    keyring.set_password(KEYCHAIN_SERVICE, key_name, value)
+    secret_set(key_name, value)
     print(f"    ✅  Stored in keychain as {key_name!r}\n")
     return value
 
@@ -83,16 +83,14 @@ class SSHConfig:
         return self.guest_users.get(guest_name)
 
 
-# ── Storage ───────────────────────────────────────────────────────────────────
+# ── Monitoring ────────────────────────────────────────────────────────────────
 
 @dataclass
-class DSMConfig:
-    name: str
+class BeszelConfig:
     host: str
-    user: str
-    password: str
-    port: int = 5000
-    https: bool = False
+    api_key: str
+    port: int = 443
+    https: bool = True
     verify_ssl: bool = False
 
     @property
@@ -228,13 +226,74 @@ class TLSCheckConfig:
     verify_ssl: bool = True
 
 
+# ── Portainer ─────────────────────────────────────────────────────────────────
+
+@dataclass
+class PortainerConfig:
+    host: str
+    api_key: str          # Portainer API token
+    port: int = 9000
+    https: bool = False
+    verify_ssl: bool = False
+
+    @property
+    def base_url(self) -> str:
+        scheme = "https" if self.https else "http"
+        return f"{scheme}://{self.host}:{self.port}"
+
+
+# ── Monitoring ────────────────────────────────────────────────────────────────
+
+@dataclass
+class UptimeKumaConfig:
+    host: str
+    api_key: str = ""
+    slug: str = "default"
+    port: int = 3001
+    https: bool = False
+    verify_ssl: bool = False
+
+    @property
+    def base_url(self) -> str:
+        scheme = "https" if self.https else "http"
+        return f"{scheme}://{self.host}:{self.port}"
+
+
+@dataclass
+class PrometheusConfig:
+    host: str
+    port: int = 9090
+    https: bool = False
+    verify_ssl: bool = False
+
+    @property
+    def base_url(self) -> str:
+        scheme = "https" if self.https else "http"
+        return f"{scheme}://{self.host}:{self.port}"
+
+
+# ── Blackbox ──────────────────────────────────────────────────────────────────
+
+@dataclass
+class BlackboxSshHost:
+    name: str
+    host: str
+    user: str = ""  # empty = use ssh.default_user
+
+
+@dataclass
+class BlackboxConfig:
+    ssh_hosts: list[BlackboxSshHost] = field(default_factory=list)
+    # Proxmox nodes are always added automatically
+
+
 # ── Top-level config ──────────────────────────────────────────────────────────
 
 @dataclass
 class Config:
     proxmox: ProxmoxClusterConfig = field(default_factory=lambda: ProxmoxClusterConfig("", "", "", ""))
     ssh: SSHConfig = field(default_factory=SSHConfig)
-    dsm_instances: list[DSMConfig] = field(default_factory=list)
+    beszel: BeszelConfig | None = None
     pihole_instances: list[PiholeInstanceConfig] = field(default_factory=list)
     ha: HAConfig | None = None
     plex: PlexConfig | None = None
@@ -244,6 +303,10 @@ class Config:
     seerr: SeerrConfig | None = None
     openspeedtest: OpenSpeedTestConfig | None = None
     tls_checks: list[TLSCheckConfig] = field(default_factory=list)
+    uptimekuma: UptimeKumaConfig | None = None
+    portainer: PortainerConfig | None = None
+    prometheus: PrometheusConfig | None = None
+    blackbox: BlackboxConfig = field(default_factory=BlackboxConfig)
     scripts_dir: str = "../../"
     refresh_interval: int = 30
     config_path: Path = field(default_factory=Path)
@@ -298,19 +361,17 @@ def load_config(config_path: Path | None = None) -> Config:
         guest_users=guest_users,
     )
 
-    # DSM (Synology)
-    dsm_instances = []
-    for d in raw.get("dsm", []):
-        dsm_name = d["name"]
-        dsm_instances.append(DSMConfig(
-            name=dsm_name,
-            host=d["host"],
-            port=int(d.get("port", 5000)),
-            https=bool(d.get("https", False)),
-            user=d["user"],
-            password=_resolve_secret(d["password"], f"dsm/{dsm_name}/password"),
-            verify_ssl=bool(d.get("verify_ssl", False)),
-        ))
+    # Beszel
+    beszel: BeszelConfig | None = None
+    if "beszel" in raw:
+        bz = raw["beszel"]
+        beszel = BeszelConfig(
+            host=bz["host"],
+            port=int(bz.get("port", 443)),
+            https=bool(bz.get("https", True)),
+            api_key=_resolve_secret(bz["api_key"], "beszel/api_key"),
+            verify_ssl=bool(bz.get("verify_ssl", False)),
+        )
 
     # Pi-hole
     pihole_instances: list[PiholeInstanceConfig] = []
@@ -428,10 +489,59 @@ def load_config(config_path: Path | None = None) -> Config:
             verify_ssl=bool(t.get("verify_ssl", True)),
         ))
 
+    # Portainer
+    portainer: PortainerConfig | None = None
+    if "portainer" in raw:
+        pt = raw["portainer"]
+        portainer = PortainerConfig(
+            host=pt["host"],
+            port=int(pt.get("port", 9000)),
+            https=bool(pt.get("https", False)),
+            api_key=_resolve_secret(pt["api_key"], "portainer/api_key"),
+            verify_ssl=bool(pt.get("verify_ssl", False)),
+        )
+
+    # Uptime Kuma
+    uptimekuma: UptimeKumaConfig | None = None
+    if "uptimekuma" in raw:
+        uk = raw["uptimekuma"]
+        uptimekuma = UptimeKumaConfig(
+            host=uk["host"],
+            port=int(uk.get("port", 3001)),
+            slug=uk.get("slug", "default"),
+            https=bool(uk.get("https", False)),
+            verify_ssl=bool(uk.get("verify_ssl", False)),
+            api_key=_resolve_secret(uk.get("api_key", ""), "uptimekuma/api_key") if uk.get("api_key") else "",
+        )
+
+    # Prometheus
+    prometheus: PrometheusConfig | None = None
+    if "prometheus" in raw:
+        pm = raw["prometheus"]
+        prometheus = PrometheusConfig(
+            host=pm["host"],
+            port=int(pm.get("port", 9090)),
+            https=bool(pm.get("https", False)),
+            verify_ssl=bool(pm.get("verify_ssl", False)),
+        )
+
+    # Blackbox
+    bb_raw = raw.get("blackbox", {})
+    blackbox = BlackboxConfig(
+        ssh_hosts=[
+            BlackboxSshHost(
+                name=h["name"],
+                host=h["host"],
+                user=h.get("user", ""),
+            )
+            for h in bb_raw.get("ssh_hosts", [])
+        ],
+    )
+
     return Config(
         proxmox=proxmox,
         ssh=ssh,
-        dsm_instances=dsm_instances,
+        beszel=beszel,
         pihole_instances=pihole_instances,
         ha=ha,
         plex=plex,
@@ -441,6 +551,10 @@ def load_config(config_path: Path | None = None) -> Config:
         seerr=seerr,
         openspeedtest=openspeedtest,
         tls_checks=tls_checks,
+        uptimekuma=uptimekuma,
+        portainer=portainer,
+        prometheus=prometheus,
+        blackbox=blackbox,
         scripts_dir=raw.get("scripts_dir", "../../"),
         refresh_interval=int(raw.get("refresh_interval", 30)),
         config_path=config_path.resolve(),
@@ -463,19 +577,13 @@ def save_guest_user(config_path: Path, guest_name: str, user: str) -> None:
 
 # ── Keychain management helpers (used by `atc secrets`) ──────────────────────
 
-def secrets_list() -> list[tuple[str, str]]:
-    """Return all (key, masked_value) pairs stored under the atc service."""
+def secrets_list() -> list[str]:
+    """Return all keys stored under the atc service."""
     # keyring doesn't have a list-all API on all backends,
     # so we read from a small index we maintain ourselves.
     index_key = "__index__"
     raw = keyring.get_password(KEYCHAIN_SERVICE, index_key) or ""
-    keys = [k for k in raw.split(",") if k]
-    result = []
-    for k in sorted(keys):
-        val = keyring.get_password(KEYCHAIN_SERVICE, k) or ""
-        masked = val[:2] + "***" + val[-2:] if len(val) > 4 else "***"
-        result.append((k, masked))
-    return result
+    return sorted(k for k in raw.split(",") if k)
 
 
 def _index_add(key: str) -> None:
@@ -508,5 +616,78 @@ def secret_delete(key: str) -> bool:
         return False
 
 
-def secret_get(key: str) -> str | None:
-    return keyring.get_password(KEYCHAIN_SERVICE, key)
+def secret_verify(key: str, candidate: str) -> bool:
+    """Return True iff candidate matches the stored secret, compared via SHA-256 hashes.
+
+    Never exposes or returns the stored plaintext value.
+    Uses hmac.compare_digest to prevent timing-based side-channel attacks.
+    """
+    import hashlib
+    import hmac as _hmac
+    stored = keyring.get_password(KEYCHAIN_SERVICE, key)
+    if stored is None:
+        return False
+    stored_hash = hashlib.sha256(stored.encode()).digest()
+    candidate_hash = hashlib.sha256(candidate.encode()).digest()
+    return _hmac.compare_digest(stored_hash, candidate_hash)
+
+
+def _find_keychain_refs(obj: object) -> set[str]:
+    """Recursively find all keychain:<key> sentinel values in a parsed YAML object."""
+    if isinstance(obj, str) and obj.startswith(KEYCHAIN_PREFIX):
+        return {obj[len(KEYCHAIN_PREFIX):]}
+    if isinstance(obj, dict):
+        result: set[str] = set()
+        for v in obj.values():
+            result |= _find_keychain_refs(v)
+        return result
+    if isinstance(obj, list):
+        result = set()
+        for item in obj:
+            result |= _find_keychain_refs(item)
+        return result
+    return set()
+
+
+def secrets_scan_config(config_path: Path | None = None) -> tuple[list[str], list[str]]:
+    """Scan config.yaml for keychain: sentinels and repair the index for any found in the keychain.
+
+    Returns (repaired, missing):
+      repaired — keys that were in the keychain but missing from the index (now added)
+      missing  — keys referenced in config.yaml but not yet stored in the keychain
+    """
+    if config_path is None:
+        config_path = Path(__file__).parent.parent / "config.yaml"
+
+    with open(config_path) as f:
+        data = yaml.safe_load(f)
+
+    found_keys = sorted(_find_keychain_refs(data))
+
+    index_key = "__index__"
+    raw = keyring.get_password(KEYCHAIN_SERVICE, index_key) or ""
+    indexed = {k for k in raw.split(",") if k}
+
+    repaired: list[str] = []
+    missing: list[str] = []
+    for key in found_keys:
+        if keyring.get_password(KEYCHAIN_SERVICE, key) is not None:
+            if key not in indexed:
+                _index_add(key)
+                repaired.append(key)
+        else:
+            missing.append(key)
+
+    return repaired, missing
+
+
+def secret_repair(key: str, candidate: str) -> bool:
+    """Verify candidate matches the stored secret and, if so, add key to the index.
+
+    Returns True if the hash matched (and the index was repaired), False otherwise.
+    Never exposes or returns the stored plaintext value.
+    """
+    if not secret_verify(key, candidate):
+        return False
+    _index_add(key)
+    return True
