@@ -16,7 +16,6 @@ import typer
 from rich.console import Console
 from rich.table import Table
 from rich import box
-from rich.panel import Panel
 from rich.prompt import Confirm, Prompt
 from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, MofNCompleteColumn
 from rich.text import Text
@@ -26,7 +25,7 @@ sys.path.insert(0, str(Path(__file__).parent / "lib"))
 
 from config import (
     Config, load_config,
-    secret_set, secret_delete, secret_get, secrets_list,
+    secret_set, secret_delete, secret_verify, secret_repair, secrets_scan_config, secrets_list,
     save_guest_user,
     KEYCHAIN_SERVICE,
 )
@@ -46,7 +45,8 @@ from lib.ha import (
     list_updates as ha_list_updates,
 )
 from lib.proxmox import (
-    fetch_cluster_status, fetch_guest_ips, ClusterStatus, GuestInfo,
+    fetch_cluster_status, fetch_guest_ips, fetch_node_loads,
+    ClusterStatus, GuestInfo,
     fetch_guest_detail, GuestDetail,
     get_node_ip,
     start_guest, stop_guest, restart_guest,
@@ -55,7 +55,8 @@ from lib.proxmox import (
     run_backup_job, backup_guest, find_backup_storage,
     push_ssh_key_qemu, ssh_key_inject_script,
 )
-from lib.dsm import fetch_all_dsm
+from lib.beszel import fetch_systems as fetch_beszel, BeszelSystem
+from lib.hosts import NormalizedHost, merge_hosts
 from lib.tls import check_all_certs, CertStatus
 from lib.ssh import UpdateTarget, run_update, run_command, stream_command
 from screens.scripts import _find_scripts, _get_script_description
@@ -156,6 +157,15 @@ def _fmt_uptime(s: int) -> str:
     return f"{m}m"
 
 
+def _pct_color(val: float, warn: float = 0.75, crit: float = 0.90) -> str:
+    return "red" if val >= crit else ("yellow" if val >= warn else "green")
+
+
+def _bar_pct(val: float, width: int = 24) -> str:
+    filled = round(min(val, 1.0) * width)
+    return "█" * filled + "░" * (width - filled)
+
+
 def _guest_tags(guest) -> list[str]:
     raw = guest.tags or ""
     return [t.strip().lower() for t in raw.replace(",", ";").split(";") if t.strip()]
@@ -249,22 +259,25 @@ def _guests_to_json(
     ]
 
 
-def _dsm_to_json(dsm_list) -> list[dict]:
-    result = []
-    for d in dsm_list:
-        entry: dict = {"name": d.name, "online": d.online}
-        if d.online:
-            entry.update({
-                "model": d.model,
-                "dsmVersion": d.dsmVersion,
-                "cpu_percent": d.cpu_percent,
-                "mem_percent": d.mem_percent,
-                "volumes": d.volumes,
-            })
-        else:
-            entry["error"] = d.error
-        result.append(entry)
-    return result
+
+def _hosts_to_json(hosts: list[NormalizedHost]) -> list[dict]:
+    return [
+        {
+            "name": h.name,
+            "type": h.type,
+            "node": h.node or None,
+            "vmid": h.vmid or None,
+            "status": h.status,
+            "ip": h.ip or None,
+            "cpu_pct": round(h.cpu_pct, 2),
+            "mem_pct": round(h.mem_pct, 2),
+            "disk_pct": round(h.disk_pct, 2) if h.disk_available else None,
+            "uptime": h.uptime or None,
+            "tags": h.tags or None,
+            "source": h.source,
+        }
+        for h in hosts
+    ]
 
 
 # ── Table renderers (wide) ────────────────────────────────────────────────────
@@ -350,28 +363,162 @@ def _render_guests_wide(
     console.print(t)
 
 
-def _render_dsm_wide(dsm_list) -> None:
-    t = Table(title="💾 Synology DSM", box=box.ROUNDED)
-    t.add_column("NAS", style="bold")
-    t.add_column("Status")
-    t.add_column("Model")
-    t.add_column("DSM Version")
-    t.add_column("CPU", justify="right")
-    t.add_column("Memory", justify="right")
-    t.add_column("Volumes")
 
-    for dsm in dsm_list:
-        if dsm.online:
-            status = "[green]● online[/]"
-            cpu = _fmt_pct(dsm.cpu_percent / 100)
-            mem = _fmt_pct(dsm.mem_percent / 100)
-            vols = "  ".join(
-                f"{v['name']} {_fmt_pct(v['percent']/100)} ({v['used_gb']}/{v['total_gb']}G)"
-                for v in dsm.volumes
-            ) or "—"
-            t.add_row(dsm.name, status, dsm.model, dsm.dsmVersion, cpu, mem, vols)
+def _render_hosts_wide(hosts: list[NormalizedHost]) -> None:
+    t = Table(title="🖥  All Hosts", box=box.ROUNDED, show_lines=False)
+    t.add_column("", width=2)
+    t.add_column("Name", style="bold")
+    t.add_column("Type", width=4)
+    t.add_column("Node")
+    t.add_column("IP")
+    t.add_column("Status")
+    t.add_column("CPU", justify="right")
+    t.add_column("Mem", justify="right")
+    t.add_column("Disk", justify="right")
+    t.add_column("Uptime")
+    t.add_column("Tags", style="dim")
+
+    for h in hosts:
+        dot = "[green]●[/]" if h.online else "[dim]●[/]"
+        kind = {"vm": "[blue]vm [/]", "lxc": "[cyan]lxc[/]"}.get(h.type, "[dim]host[/]")
+        node = h.node or "[dim]—[/]"
+        ip = h.ip or "[dim]—[/]"
+        status = f"[green]{h.status}[/]" if h.online else f"[dim]{h.status}[/]"
+        cpu = _fmt_pct(h.cpu_pct / 100) if h.online else "[dim]—[/]"
+        mem = _fmt_pct(h.mem_pct / 100) if h.online else "[dim]—[/]"
+        disk = _fmt_pct(h.disk_pct / 100) if h.disk_available else "[dim]—[/]"
+        uptime = _fmt_uptime(h.uptime) if h.uptime > 0 else "[dim]—[/]"
+        tags = h.tags.replace(";", " ") if h.tags else "[dim]—[/]"
+        t.add_row(dot, h.name, kind, node, ip, status, cpu, mem, disk, uptime, tags)
+
+    console.print(t)
+
+
+def _render_hosts_table(hosts: list[NormalizedHost]) -> None:
+    t = Table(box=box.SIMPLE, show_header=True, pad_edge=False)
+    t.add_column("", width=2)
+    t.add_column("Name", style="bold", min_width=20)
+    t.add_column("Type", width=4)
+    t.add_column("Node", min_width=10)
+    t.add_column("IP", min_width=15)
+    t.add_column("CPU", justify="right", min_width=6)
+    t.add_column("Mem", justify="right", min_width=6)
+    t.add_column("Disk", justify="right", min_width=6)
+    t.add_column("Tags", style="dim", min_width=8)
+
+    for h in hosts:
+        dot = "[green]●[/]" if h.online else "[dim]●[/]"
+        kind = {"vm": "[blue]vm [/]", "lxc": "[cyan]lxc[/]"}.get(h.type, "[dim]hst[/]")
+        node = h.node or "[dim]—[/]"
+        ip = h.ip or "[dim]—[/]"
+        name = h.name if h.online else f"[dim]{h.name}[/]"
+        cpu = _fmt_pct(h.cpu_pct / 100) if h.online else "[dim]—[/]"
+        mem = _fmt_pct(h.mem_pct / 100) if h.online else "[dim]—[/]"
+        disk = _fmt_pct(h.disk_pct / 100) if h.disk_available else "[dim]—[/]"
+        tags = h.tags.replace(";", " ") if h.tags else "[dim]—[/]"
+        t.add_row(dot, name, kind, node, ip, cpu, mem, disk, tags)
+
+    console.print(t)
+
+
+def _fmt_io(read: int, write: int) -> str:
+    """Format cumulative disk or net I/O as 'Xr Xw'."""
+    if read == 0 and write == 0:
+        return "[dim]—[/]"
+    return f"{_fmt_bytes(read)}r {_fmt_bytes(write)}w"
+
+
+def _fmt_bps(recv: float, sent: float, *, rx_label: str = "↓", tx_label: str = "↑") -> str:
+    """Format bytes-per-second rates as 'X↓ X↑'. Returns '—' if both are zero."""
+    if recv == 0.0 and sent == 0.0:
+        return "[dim]—[/]"
+    return f"{_fmt_bytes(int(recv))}{rx_label} {_fmt_bytes(int(sent))}{tx_label}"
+
+
+def _render_cluster_grouped(
+    cluster: ClusterStatus,
+    hosts: list[NormalizedHost],
+    node_loads: dict[str, tuple[float, float, int]],
+) -> None:
+    """Single grouped table: Proxmox nodes with guests nested underneath,
+    followed by standalone Beszel-only hosts (NAS, bare-metal Docker, etc.).
+
+    Node columns:  ● Name | node | CPU | Load/nproc | IOWait | Mem | Disk | Uptime
+    Guest columns: ● Name | type | CPU |     —      |   —    | Mem | Disk | DiskIO | NetIO | Uptime
+    """
+    by_node: dict[str, list[NormalizedHost]] = {}
+    for h in hosts:
+        if h.type in ("vm", "lxc"):
+            by_node.setdefault(h.node, []).append(h)
+    standalone = [h for h in hosts if h.type == "host"]
+
+    t = Table(box=box.SIMPLE, show_header=True, pad_edge=False, show_edge=False)
+    t.add_column("", width=2)
+    t.add_column("Name", min_width=22)
+    t.add_column("Type", width=5)
+    t.add_column("CPU", justify="right", min_width=5)
+    t.add_column("Load", justify="right", min_width=8)    # "0.42/4" or "—"
+    t.add_column("IOWait", justify="right", min_width=7)
+    t.add_column("Mem", justify="right", min_width=5)
+    t.add_column("Disk", justify="right", min_width=5)
+    t.add_column("Disk I/O", justify="right", min_width=14)   # "12Gr 3Gw"
+    t.add_column("Net I/O", justify="right", min_width=14)    # "2Gr 800Mw"
+    t.add_column("Uptime", min_width=8)
+
+    def _guest_rows(guests: list[NormalizedHost]) -> None:
+        running = [h for h in guests if h.online]
+        stopped = [h for h in guests if not h.online]
+        ordered = sorted(running, key=lambda h: h.name) + sorted(stopped, key=lambda h: h.name)
+        for i, h in enumerate(ordered):
+            is_last = i == len(ordered) - 1
+            prefix = "  └ " if is_last else "  ├ "
+            dot = "[green]●[/]" if h.online else "[dim]●[/]"
+            kind = "[cyan]lxc[/]" if h.type == "lxc" else "[blue]vm [/]"
+            name = f"{prefix}{h.name}" if h.online else f"{prefix}[dim]{h.name}[/]"
+            cpu = _fmt_pct(h.cpu_pct / 100) if h.online else "[dim]—[/]"
+            mem = _fmt_pct(h.mem_pct / 100) if h.online else "[dim]—[/]"
+            disk = _fmt_pct(h.disk_pct / 100) if h.disk_available else "[dim]—[/]"
+            # Prefer Beszel rate data; fall back to Proxmox cumulative
+            if h.online and h.source == "merged":
+                diskio = _fmt_bps(h.bz_disk_read_bps, h.bz_disk_write_bps, rx_label="r", tx_label="w")
+                netio = _fmt_bps(h.bz_net_recv_bps, h.bz_net_sent_bps)
+            elif h.online:
+                diskio = _fmt_io(h.disk_read, h.disk_write)
+                netio = _fmt_io(h.net_in, h.net_out)
+            else:
+                diskio = netio = "[dim]—[/]"
+            uptime = _fmt_uptime(h.uptime) if h.uptime > 0 else "[dim]—[/]"
+            t.add_row(dot, name, kind, cpu, "[dim]—[/]", "[dim]—[/]", mem, disk, diskio, netio, uptime)
+
+    for node in cluster.nodes:
+        dot = "[green]●[/]" if node.online else "[red]●[/]"
+        if node.online:
+            cpu = _fmt_pct(node.cpu)
+            load_val, wait_val, nproc = node_loads.get(node.name, (-1.0, -1.0, 0))
+            if load_val >= 0:
+                load = f"{load_val:.2f}/{nproc}" if nproc > 0 else f"{load_val:.2f}"
+            else:
+                load = "[dim]—[/]"
+            wait = _fmt_pct(wait_val) if wait_val >= 0 else "[dim]—[/]"
+            mem = _fmt_pct(node.mem_used / node.mem_total if node.mem_total else 0)
+            disk = _fmt_pct(node.disk_used / node.disk_total if node.disk_total else 0)
+            uptime = _fmt_uptime(node.uptime)
         else:
-            t.add_row(dsm.name, f"[red]● {dsm.error[:30]}[/]", "—", "—", "—", "—", "—")
+            cpu = load = wait = mem = disk = uptime = "[dim]—[/]"
+        t.add_row(dot, f"[bold]{node.name}[/]", "[dim]node[/]",
+                  cpu, load, wait, mem, disk, "[dim]—[/]", "[dim]—[/]", uptime)
+        _guest_rows(by_node.get(node.name, []))
+
+    for h in standalone:
+        dot = "[green]●[/]" if h.online else "[red]●[/]"
+        cpu = _fmt_pct(h.cpu_pct / 100) if h.online else "[dim]—[/]"
+        mem = _fmt_pct(h.mem_pct / 100) if h.online else "[dim]—[/]"
+        disk = _fmt_pct(h.disk_pct / 100) if h.disk_available else "[dim]—[/]"
+        diskio = _fmt_bps(h.bz_disk_read_bps, h.bz_disk_write_bps, rx_label="r", tx_label="w") if h.online else "[dim]—[/]"
+        netio = _fmt_bps(h.bz_net_recv_bps, h.bz_net_sent_bps) if h.online else "[dim]—[/]"
+        uptime = _fmt_uptime(h.uptime) if h.uptime > 0 else "[dim]—[/]"
+        t.add_row(dot, f"[bold]{h.name}[/]", "[dim]host[/]",
+                  cpu, "[dim]—[/]", "[dim]—[/]", mem, disk, diskio, netio, uptime)
 
     console.print(t)
 
@@ -438,7 +585,7 @@ def _render_guests_table(
 
 # ── get ───────────────────────────────────────────────────────────────────────
 
-get_app = typer.Typer(help="Query cluster state — nodes, VMs, LXCs, DSM", no_args_is_help=False, rich_markup_mode="rich")
+get_app = typer.Typer(help="Query cluster state — nodes, VMs, LXCs, and all hosts", no_args_is_help=False, rich_markup_mode="rich")
 app.add_typer(get_app, name="get")
 
 
@@ -447,13 +594,16 @@ def get_all(
     ctx: typer.Context,
     tag: Optional[str] = typer.Option(None, "-t", "--tag", help="Show detail for all hosts with this tag"),
     output: _Out = typer.Option(_Out.table, "-o", help="Output format: table | wide | json"),
+    json_flag: bool = typer.Option(False, "-j", is_flag=True, hidden=True, help="JSON output (shorthand for -o json)"),
 ) -> None:
-    """Show everything: nodes, VMs, LXCs, and DSM.
+    """Show everything: Proxmox nodes and all hosts (VMs, LXCs, standalone).
 
     Use [cyan]-t <tag>[/] to show detail panels for all hosts matching a tag.
     """
     if ctx.invoked_subcommand is not None:
         return
+    if json_flag:
+        output = _Out.json
 
     # -t without a selector: detail panels for all matching guests
     if tag:
@@ -463,32 +613,38 @@ def get_all(
     cfg = _load()
     with console.status("[bold]Fetching cluster state…[/]"):
         cluster = asyncio.run(fetch_cluster_status(cfg.proxmox))
-    with console.status("[bold]Fetching guest IPs…[/]"):
-        ip_map = asyncio.run(fetch_guest_ips(cfg.proxmox, cluster.guests))
-    with console.status("[bold]Fetching DSM status…[/]"):
-        dsm_list = asyncio.run(fetch_all_dsm(cfg.dsm_instances))
+
+    async def _fetch_all():
+        ip_task = fetch_guest_ips(cfg.proxmox, cluster.guests)
+        load_task = fetch_node_loads(cfg.proxmox, [n.name for n in cluster.nodes if n.online])
+        beszel_task = fetch_beszel(cfg.beszel) if cfg.beszel else asyncio.sleep(0)
+        ip_map, node_loads, beszel_raw = await asyncio.gather(ip_task, load_task, beszel_task)
+        return ip_map, node_loads, beszel_raw or []
+
+    with console.status("[bold]Fetching metrics…[/]"):
+        ip_map, node_loads, beszel_systems = asyncio.run(_fetch_all())
+
+    hosts = merge_hosts(cluster, beszel_systems, ip_map)
 
     if output == _Out.json:
         console.print_json(_json.dumps({
             "nodes": _nodes_to_json(cluster),
-            "guests": _guests_to_json(cluster, ip_map=ip_map),
-            "dsm": _dsm_to_json(dsm_list),
+            "hosts": _hosts_to_json(hosts),
         }))
     elif output == _Out.wide:
-        _render_nodes_wide(cluster)
-        _render_guests_wide(cluster, guest_type="qemu", ip_map=ip_map)
-        _render_guests_wide(cluster, guest_type="lxc", ip_map=ip_map)
-        _render_dsm_wide(dsm_list)
+        _render_cluster_grouped(cluster, hosts, node_loads)
     else:
-        _render_nodes_table(cluster)
-        _render_guests_table(cluster, guest_type=None, ip_map=ip_map)
+        _render_cluster_grouped(cluster, hosts, node_loads)
 
 
 @get_app.command("nodes")
 def get_nodes(
     output: _Out = typer.Option(_Out.table, "-o", help="Output format: table | wide | json"),
+    json_flag: bool = typer.Option(False, "-j", is_flag=True, hidden=True, help="JSON output (shorthand for -o json)"),
 ) -> None:
     """List Proxmox hypervisor nodes."""
+    if json_flag:
+        output = _Out.json
     cfg = _load()
     with console.status("[bold]Fetching node status…[/]"):
         cluster = asyncio.run(fetch_cluster_status(cfg.proxmox))
@@ -505,8 +661,11 @@ def get_nodes(
 def get_vms(
     label: Optional[str] = typer.Option(None, "-l", "--label", help="Filter by tag"),
     output: _Out = typer.Option(_Out.table, "-o", help="Output format: table | wide | json"),
+    json_flag: bool = typer.Option(False, "-j", is_flag=True, hidden=True, help="JSON output (shorthand for -o json)"),
 ) -> None:
     """List virtual machines."""
+    if json_flag:
+        output = _Out.json
     cfg = _load()
     with console.status("[bold]Fetching VM status…[/]"):
         cluster = asyncio.run(fetch_cluster_status(cfg.proxmox))
@@ -528,8 +687,11 @@ def get_vms(
 def get_lxcs(
     label: Optional[str] = typer.Option(None, "-l", "--label", help="Filter by tag"),
     output: _Out = typer.Option(_Out.table, "-o", help="Output format: table | wide | json"),
+    json_flag: bool = typer.Option(False, "-j", is_flag=True, hidden=True, help="JSON output (shorthand for -o json)"),
 ) -> None:
     """List LXC containers."""
+    if json_flag:
+        output = _Out.json
     cfg = _load()
     with console.status("[bold]Fetching LXC status…[/]"):
         cluster = asyncio.run(fetch_cluster_status(cfg.proxmox))
@@ -547,136 +709,172 @@ def get_lxcs(
         _render_guests_table(cluster, "lxc", label_filter=label, ip_map=ip_map)
 
 
+def _do_get_hosts(label: Optional[str], output: _Out) -> None:
+    """Shared logic for 'get hosts', 'get ls', and 'ps' — avoids Typer OptionInfo default issue."""
+    cfg = _load()
+    with console.status("[bold]Fetching cluster state…[/]"):
+        cluster = asyncio.run(fetch_cluster_status(cfg.proxmox))
+
+    async def _fetch_all():
+        ip_task = fetch_guest_ips(cfg.proxmox, cluster.guests)
+        load_task = fetch_node_loads(cfg.proxmox, [n.name for n in cluster.nodes if n.online])
+        beszel_task = fetch_beszel(cfg.beszel) if cfg.beszel else asyncio.sleep(0)
+        ip_map, node_loads, beszel_raw = await asyncio.gather(ip_task, load_task, beszel_task)
+        return ip_map, node_loads, beszel_raw or []
+
+    with console.status("[bold]Fetching metrics…[/]"):
+        ip_map, node_loads, beszel_systems = asyncio.run(_fetch_all())
+
+    hosts = merge_hosts(cluster, beszel_systems, ip_map)
+
+    if label:
+        lf = label.lower()
+        hosts = [h for h in hosts if lf in [t for t in h.tags.replace(";", " ").split() if t]]
+
+    if output == _Out.json:
+        console.print_json(_json.dumps(_hosts_to_json(hosts)))
+    elif output == _Out.wide:
+        _render_hosts_wide(hosts)
+    else:
+        _render_cluster_grouped(cluster, hosts, node_loads)
+
+
 @get_app.command("hosts")
 def get_hosts(
     label: Optional[str] = typer.Option(None, "-l", "--label", help="Filter by tag"),
     output: _Out = typer.Option(_Out.table, "-o", help="Output format: table | wide | json"),
+    json_flag: bool = typer.Option(False, "-j", is_flag=True, hidden=True, help="JSON output (shorthand for -o json)"),
 ) -> None:
-    """List all guests — VMs and LXC containers combined."""
-    cfg = _load()
-    with console.status("[bold]Fetching guest status…[/]"):
-        cluster = asyncio.run(fetch_cluster_status(cfg.proxmox))
-    with console.status("[bold]Fetching guest IPs…[/]"):
-        ip_map = asyncio.run(fetch_guest_ips(cfg.proxmox, cluster.guests))
-
-    if output == _Out.json:
-        guests = _guests_to_json(cluster, ip_map=ip_map)
-        if label:
-            guests = [g for g in guests if label.lower() in [t.lower() for t in (g.get("tags") or "").replace(",", ";").split(";") if t.strip()]]
-        console.print_json(_json.dumps(guests))
-    elif output == _Out.wide:
-        _render_guests_wide(cluster, None, ip_map=ip_map)
-    else:
-        _render_guests_table(cluster, None, label_filter=label, ip_map=ip_map)
+    """List all hosts — Proxmox VMs, LXCs, and standalone Beszel-only hosts."""
+    if json_flag:
+        output = _Out.json
+    _do_get_hosts(label, output)
 
 
 @get_app.command("ls", hidden=True)
 def get_ls(
     label: Optional[str] = typer.Option(None, "-l", "--label", help="Filter by tag"),
     output: _Out = typer.Option(_Out.table, "-o", help="Output format: table | wide | json"),
+    json_flag: bool = typer.Option(False, "-j", is_flag=True, hidden=True, help="JSON output (shorthand for -o json)"),
 ) -> None:
     """Alias for 'get hosts'."""
-    get_hosts(label=label, output=output)
-
-
-@get_app.command("dsm")
-def get_dsm(
-    output: _Out = typer.Option(_Out.table, "-o", help="Output format: table | wide | json"),
-) -> None:
-    """List Synology DSM instances."""
-    cfg = _load()
-    with console.status("[bold]Fetching DSM status…[/]"):
-        dsm_list = asyncio.run(fetch_all_dsm(cfg.dsm_instances))
-
-    if output == _Out.json:
-        console.print_json(_json.dumps(_dsm_to_json(dsm_list)))
-    else:
-        _render_dsm_wide(dsm_list)
+    if json_flag:
+        output = _Out.json
+    _do_get_hosts(label, output)
 
 
 # ── get <selector> — detail view (guests and nodes) ──────────────────────────
 
 def _render_node_detail(node: "NodeStatus") -> None:
-    rows: list[str] = []
-    dot = "[green]●[/]" if node.online else "[red]○[/]"
-    rows.append(f"  [bold]Status[/]    {dot} {'online' if node.online else 'offline'}")
-    rows.append(f"  [bold]Type[/]      node")
-    rows.append(f"  [bold]Uptime[/]    {_fmt_uptime(node.uptime)}")
-    rows.append("")
+    BAR_W = 24
+    console.print()
+    console.rule(f"[bold]⬡  {node.name}  ·  node[/]")
+    console.print()
+
+    dot_c = "green" if node.online else "red"
+    status_str = "online" if node.online else "offline"
+    status_c = "green" if node.online else "red"
+    uptime_part = f"   [dim]up[/] {_fmt_uptime(node.uptime)}" if node.online else ""
+    console.print(f"   [{dot_c}]●[/] [{status_c}]{status_str}[/]{uptime_part}")
+    console.print()
 
     if node.online:
-        rows.append(f"  [bold]CPU[/]       {_fmt_pct(node.cpu)}")
+        cpu_c = _pct_color(node.cpu)
+        console.print(
+            f"   CPU    [{cpu_c}]{_bar_pct(node.cpu, BAR_W)}[/]"
+            f"  [{cpu_c}]{node.cpu * 100:>3.0f}%[/]"
+        )
         if node.mem_total:
             mem_pct = node.mem_used / node.mem_total
-            rows.append(
-                f"  [bold]Memory[/]    {_fmt_pct(mem_pct)}"
-                f"  {_fmt_bytes(node.mem_used)} / {_fmt_bytes(node.mem_total)}"
+            mem_c = _pct_color(mem_pct)
+            console.print(
+                f"   Mem    [{mem_c}]{_bar_pct(mem_pct, BAR_W)}[/]"
+                f"  [{mem_c}]{mem_pct * 100:>3.0f}%[/]"
+                f"  [dim]{_fmt_bytes(node.mem_used)} / {_fmt_bytes(node.mem_total)}[/]"
             )
         if node.disk_total:
             disk_pct = node.disk_used / node.disk_total
-            rows.append(
-                f"  [bold]Disk[/]      {_fmt_pct(disk_pct)}"
-                f"  {_fmt_bytes(node.disk_used)} / {_fmt_bytes(node.disk_total)}"
+            disk_c = _pct_color(disk_pct)
+            console.print(
+                f"   Disk   [{disk_c}]{_bar_pct(disk_pct, BAR_W)}[/]"
+                f"  [{disk_c}]{disk_pct * 100:>3.0f}%[/]"
+                f"  [dim]{_fmt_bytes(node.disk_used)} / {_fmt_bytes(node.disk_total)}[/]"
             )
 
     if node.error:
-        rows.append(f"\n  [red]Error: {node.error}[/]")
+        console.print(f"\n   [red]Error: {node.error}[/]")
 
-    console.print(Panel(
-        "\n".join(rows),
-        title=f"[bold]{node.name}[/]",
-        expand=False,
-        padding=(0, 1),
-    ))
+    console.print()
+    console.rule()
+    console.print()
 
 
 def _render_guest_detail(detail: GuestDetail) -> None:
-    dot = "[green]●[/]" if detail.status == "running" else "[dim]○[/]"
+    BAR_W = 24
     kind = "LXC" if detail.type == "lxc" else "VM"
+    icon = "📦" if detail.type == "lxc" else "🖥 "
 
-    rows: list[str] = []
-    rows.append(f"  [bold]Status[/]    {dot} {detail.status}")
-    rows.append(f"  [bold]Type[/]      {kind} [dim]#{detail.vmid}[/]")
-    rows.append(f"  [bold]Node[/]      {detail.node}")
-    rows.append(f"  [bold]Uptime[/]    {_fmt_uptime(detail.uptime)}")
-    rows.append("")
+    console.print()
+    console.rule(f"[bold]{icon} {detail.name}  ·  {kind} #{detail.vmid}[/]")
+    console.print()
 
+    # ── Status line ───────────────────────────────────────────────────────────
+    dot_c = "green" if detail.status == "running" else "dim"
+    status_c = "green" if detail.status == "running" else "dim"
+    console.print(
+        f"   [{dot_c}]●[/] [{status_c}]{detail.status}[/]"
+        f"   [dim]node[/] {detail.node}"
+        f"   [dim]up[/] {_fmt_uptime(detail.uptime)}"
+    )
+    console.print()
+
+    # ── Metrics with bars ─────────────────────────────────────────────────────
     cores_label = f"{detail.cpu_cores} core{'s' if detail.cpu_cores != 1 else ''}"
-    rows.append(f"  [bold]CPU[/]       {_fmt_pct(detail.cpu_usage)}  ({cores_label} allocated)")
+    cpu_c = _pct_color(detail.cpu_usage)
+    console.print(
+        f"   CPU    [{cpu_c}]{_bar_pct(detail.cpu_usage, BAR_W)}[/]"
+        f"  [{cpu_c}]{detail.cpu_usage * 100:>3.0f}%[/]"
+        f"  [dim]({cores_label})[/]"
+    )
 
     if detail.mem_total:
         mem_pct = detail.mem_used / detail.mem_total
-        rows.append(
-            f"  [bold]Memory[/]    {_fmt_pct(mem_pct)}"
-            f"  {_fmt_bytes(detail.mem_used)} / {_fmt_bytes(detail.mem_total)}"
+        mem_c = _pct_color(mem_pct)
+        console.print(
+            f"   Mem    [{mem_c}]{_bar_pct(mem_pct, BAR_W)}[/]"
+            f"  [{mem_c}]{mem_pct * 100:>3.0f}%[/]"
+            f"  [dim]{_fmt_bytes(detail.mem_used)} / {_fmt_bytes(detail.mem_total)}[/]"
         )
 
     if detail.disk_total:
         disk_pct = detail.disk_used / detail.disk_total
-        rows.append(
-            f"  [bold]Disk[/]      {_fmt_pct(disk_pct)}"
-            f"  {_fmt_bytes(detail.disk_used)} / {_fmt_bytes(detail.disk_total)}"
+        disk_c = _pct_color(disk_pct)
+        console.print(
+            f"   Disk   [{disk_c}]{_bar_pct(disk_pct, BAR_W)}[/]"
+            f"  [{disk_c}]{disk_pct * 100:>3.0f}%[/]"
+            f"  [dim]{_fmt_bytes(detail.disk_used)} / {_fmt_bytes(detail.disk_total)}[/]"
         )
 
-    rows.append("")
-    ip_str = "  ".join(detail.ips) if detail.ips else "[dim]—[/]"
-    rows.append(f"  [bold]IP(s)[/]     {ip_str}")
+    console.print()
+
+    # ── Network / info ────────────────────────────────────────────────────────
+    if detail.ips:
+        console.print(f"   [dim]IP(s)[/]  {'  '.join(detail.ips)}")
+    else:
+        console.print("   [dim]IP(s)[/]  [dim]—[/]")
 
     if detail.ostype:
-        rows.append(f"  [bold]OS[/]        {detail.ostype}")
+        console.print(f"   [dim]OS[/]     {detail.ostype}")
 
     if detail.tags:
-        rows.append(f"  [bold]Tags[/]      {detail.tags}")
+        console.print(f"   [dim]Tags[/]   {detail.tags.replace(';', ' ')}")
 
     if detail.error:
-        rows.append(f"\n  [red]Error: {detail.error}[/]")
+        console.print(f"\n   [red]Error: {detail.error}[/]")
 
-    console.print(Panel(
-        "\n".join(rows),
-        title=f"[bold]{detail.name}[/]",
-        expand=False,
-        padding=(0, 1),
-    ))
+    console.print()
+    console.rule()
+    console.print()
 
 
 def _guest_detail_to_json(detail: GuestDetail) -> dict:
@@ -852,9 +1050,12 @@ def run_backup_run(
 def ps_cmd(
     label: Optional[str] = typer.Option(None, "-l", "--label", help="Filter by tag"),
     output: _Out = typer.Option(_Out.table, "-o", help="Output format: table | wide | json"),
+    json_flag: bool = typer.Option(False, "-j", is_flag=True, hidden=True, help="JSON output (shorthand for -o json)"),
 ) -> None:
-    """List running guests — VMs and LXCs. [dim](alias: get hosts)[/dim]"""
-    get_hosts(label=label, output=output)
+    """List all hosts — VMs, LXCs, and standalone hosts. [dim](alias: get hosts)[/dim]"""
+    if json_flag:
+        output = _Out.json
+    _do_get_hosts(label, output)
 
 
 # ── start / stop / restart ────────────────────────────────────────────────────
@@ -1308,12 +1509,15 @@ app.add_typer(backup_app, name="backup")
 def backup_list(
     label: Optional[str] = typer.Option(None, "-l", "--label", help="Filter by guest tag"),
     output: _Out = typer.Option(_Out.table, "-o", help="Output format: table | wide | json"),
+    json_flag: bool = typer.Option(False, "-j", is_flag=True, hidden=True, help="JSON output (shorthand for -o json)"),
 ) -> None:
     """List backup files across all cluster nodes.
 
     [bold]table[/] (default): latest backup per guest.
     [bold]wide[/]: every individual backup file.
     """
+    if json_flag:
+        output = _Out.json
     cfg = _load()
     with console.status("[bold]Fetching cluster state…[/]"):
         cluster = asyncio.run(fetch_cluster_status(cfg.proxmox))
@@ -1385,8 +1589,11 @@ def backup_list(
 def backup_ls(
     label: Optional[str] = typer.Option(None, "-l", "--label", help="Filter by guest tag"),
     output: _Out = typer.Option(_Out.table, "-o", help="Output format: table | wide | json"),
+    json_flag: bool = typer.Option(False, "-j", is_flag=True, hidden=True, help="JSON output (shorthand for -o json)"),
 ) -> None:
     """Alias for 'list'."""
+    if json_flag:
+        output = _Out.json
     backup_list(label=label, output=output)
 
 
@@ -1518,17 +1725,16 @@ def secrets_default(ctx: typer.Context) -> None:
 @secrets_app.command("list")
 def _secrets_list() -> None:
     """List all secret keys stored in the keychain."""
-    entries = secrets_list()
-    if not entries:
+    keys = secrets_list()
+    if not keys:
         console.print(f"[dim]No secrets stored yet for service '{KEYCHAIN_SERVICE}'.[/]")
         console.print("Secrets are created automatically on first use of a [bold]keychain:<key>[/] value in config.yaml.")
         return
 
     t = Table(title=f"Keychain secrets (service: '{KEYCHAIN_SERVICE}')", box=box.ROUNDED)
     t.add_column("Key", style="cyan bold")
-    t.add_column("Value (masked)")
-    for key, masked in entries:
-        t.add_row(key, masked)
+    for key in keys:
+        t.add_row(key)
     console.print(t)
 
 
@@ -1563,16 +1769,64 @@ def secrets_delete(
         raise typer.Exit(1)
 
 
-@secrets_app.command("get")
-def secrets_get_cmd(
-    key: str = typer.Argument(..., help="Secret key to retrieve"),
+@secrets_app.command("verify")
+def secrets_verify_cmd(
+    key: str = typer.Argument(..., help="Secret key to verify against"),
 ) -> None:
-    """Print a secret value (use carefully — prints to stdout)."""
-    val = secret_get(key)
-    if val is None:
-        console.print(f"[red]Key '{key}' not found.[/]")
+    """Verify a value matches the stored secret by comparing SHA-256 hashes.
+
+    Prompts for re-entry. Never prints or reveals the stored value.
+    """
+    candidate = getpass.getpass(f"Enter value to verify for '{key}': ").strip()
+    if not candidate:
+        console.print("[red]Empty value — aborted.[/]")
         raise typer.Exit(1)
-    console.print(val)
+    if secret_verify(key, candidate):
+        console.print(f"[green]✓[/] Match — the stored value for [cyan]{key!r}[/] is correct.")
+    else:
+        console.print(f"[red]✗[/] No match for [cyan]{key!r}[/].")
+        raise typer.Exit(1)
+
+
+@secrets_app.command("scan")
+def secrets_scan_cmd() -> None:
+    """Scan config.yaml for keychain: references and repair the index.
+
+    Checks which referenced keys are stored in the keychain and adds any
+    missing ones to the index. No values are read or displayed.
+    """
+    repaired, missing = secrets_scan_config()
+    if repaired:
+        for key in repaired:
+            console.print(f"[green]✓[/] Added to index: [cyan]{key}[/]")
+    if missing:
+        for key in missing:
+            console.print(f"[yellow]![/] Not in keychain: [cyan]{key}[/] — run [bold]atc secrets set {key}[/]")
+    if not repaired and not missing:
+        console.print("[dim]Index is complete — all config.yaml secrets are indexed.[/]")
+    elif not repaired:
+        console.print("[dim]No new keys added to index.[/]")
+
+
+@secrets_app.command("repair")
+def secrets_repair_cmd(
+    key: str = typer.Argument(..., help="Secret key to repair in the index"),
+) -> None:
+    """Re-index a secret by verifying it matches the stored value via SHA-256 hash.
+
+    Prompts for the value. If the hash matches what is stored in the keychain,
+    the key is added to the index so it appears in 'atc secrets list'.
+    The stored value is never printed or returned.
+    """
+    candidate = getpass.getpass(f"Enter value for '{key}' to verify and re-index: ").strip()
+    if not candidate:
+        console.print("[red]Empty value — aborted.[/]")
+        raise typer.Exit(1)
+    if secret_repair(key, candidate):
+        console.print(f"[green]✓[/] Hash matched — [cyan]{key!r}[/] added to index.")
+    else:
+        console.print(f"[red]✗[/] Hash did not match for [cyan]{key!r}[/] — index not updated.")
+        raise typer.Exit(1)
 
 
 @secrets_app.command("ls", hidden=True)
@@ -1728,8 +1982,11 @@ def pihole_unpause(
 @pihole_dns_app.command("list")
 def pihole_dns_list(
     output: _Out = typer.Option(_Out.table, "-o", help="Output format: table | json"),
+    json_flag: bool = typer.Option(False, "-j", is_flag=True, hidden=True, help="JSON output (shorthand for -o json)"),
 ) -> None:
     """List custom local DNS records (reads from primary instance)."""
+    if json_flag:
+        output = _Out.json
     cfg = _load()
     primary = _pihole_primary(cfg)
 
@@ -2128,7 +2385,7 @@ def cmd_certs() -> None:
     with console.status("[bold]Checking certificates…[/]"):
         results: list[CertStatus] = asyncio.run(check_all_certs(cfg.tls_checks))
 
-    t = Table(box=box.SIMPLE_HEAD)
+    t = Table(box=box.SIMPLE, pad_edge=False)
     t.add_column("Name", style="cyan", no_wrap=True)
     t.add_column("Host:Port", style="dim")
     t.add_column("Subject")
@@ -2150,6 +2407,275 @@ def cmd_certs() -> None:
         t.add_row(r.name, host_port, r.subject, expiry_str, days_str)
 
     console.print(t)
+
+
+# ── uptimekuma ────────────────────────────────────────────────────────────────
+
+from lib.uptimekuma import fetch_monitors as _uk_fetch, status_label as _uk_status
+
+uptimekuma_app = typer.Typer(
+    help="Show Uptime Kuma monitor statuses. [dim](up)[/dim]",
+    no_args_is_help=False,
+    rich_markup_mode="rich",
+)
+app.add_typer(uptimekuma_app, name="uptimekuma")
+
+
+def _uk_render(failed: bool, output: _Out) -> None:
+    cfg = _load()
+    if not cfg.uptimekuma:
+        console.print(
+            "[yellow]No Uptime Kuma configured. "
+            "Add an 'uptimekuma:' section to config.yaml.[/]"
+        )
+        raise typer.Exit(0)
+
+    with console.status("[bold]Fetching Uptime Kuma status…[/]"):
+        try:
+            monitors = _uk_fetch(cfg.uptimekuma)
+        except Exception as e:
+            console.print(f"[red]❌  {e}[/]")
+            raise typer.Exit(1)
+
+    if not monitors:
+        console.print("[yellow]No monitors found.[/]")
+        raise typer.Exit(0)
+
+    down        = sum(1 for m in monitors if m.status == 0)
+    up          = sum(1 for m in monitors if m.status == 1)
+    pending     = sum(1 for m in monitors if m.status == 2)
+    maintenance = sum(1 for m in monitors if m.status == 3)
+    visible     = [m for m in monitors if m.status == 0] if failed else monitors
+
+    if failed and not visible:
+        console.print("[green]✓  All monitors up.[/]")
+        return
+
+    if output == _Out.json:
+        console.print_json(_json.dumps([
+            {
+                "id":          m.id,
+                "name":        m.name,
+                "group":       m.group,
+                "status":      m.status,
+                "latency_ms":  m.latency_ms,
+                "uptime_24h":  round(m.uptime_24h  * 100, 2),
+                "uptime_720h": round(m.uptime_720h * 100, 2),
+            }
+            for m in visible
+        ]))
+        return
+
+    def _lat_str(m) -> str:
+        if m.status != 1 or not m.latency_ms:
+            return "[dim]—[/]"
+        ms = m.latency_ms
+        color = "green" if ms < 100 else ("yellow" if ms < 500 else "red")
+        return f"[{color}]{ms}ms[/]"
+
+    def _uptime_str(pct: float) -> str:
+        p = pct * 100
+        color = "green" if p >= 99.0 else ("yellow" if p >= 95.0 else "red")
+        return f"[{color}]{p:.1f}%[/]"
+
+    def _bar(pct: float, width: int = 10) -> str:
+        filled = round(pct * width)
+        p = pct * 100
+        color = "green" if p >= 99.0 else ("yellow" if p >= 95.0 else "red")
+        return f"[{color}]{'█' * filled}[/][dim]{'░' * (width - filled)}[/]"
+
+    # Build ordered groups preserving encounter order
+    groups: dict[str, list] = {}
+    for m in visible:
+        key = m.group or ""
+        groups.setdefault(key, []).append(m)
+
+    # If all monitors share one unnamed group, skip section headers
+    show_groups = not (len(groups) == 1 and "" in groups)
+
+    t = Table(box=box.SIMPLE, pad_edge=False, show_header=True, header_style="dim")
+    t.add_column("", width=2)
+    t.add_column("Monitor", style="bold", min_width=22)
+    t.add_column("Latency", justify="right", min_width=7)
+    t.add_column("24h",    justify="right", min_width=6)
+    t.add_column("30d",    justify="right", min_width=6)
+    t.add_column("",       min_width=11, no_wrap=True)   # bar
+    t.add_column("Status", min_width=13)
+
+    first = True
+    for group_name, mons in groups.items():
+        if show_groups and group_name:
+            if not first:
+                t.add_row("", "", "", "", "", "", "")
+            t.add_row("", f"[dim italic]{group_name}[/]", "", "", "", "", "")
+            first = False
+        for m in mons:
+            label, color = _uk_status(m.status)
+            t.add_row(
+                f"[{color}]●[/]",
+                m.name,
+                _lat_str(m),
+                _uptime_str(m.uptime_24h),
+                _uptime_str(m.uptime_720h),
+                _bar(m.uptime_720h),
+                f"[{color}]{label}[/]",
+            )
+            first = False
+
+    console.print(t)
+
+    parts: list[str] = []
+    if up:          parts.append(f"[green]● {up} up[/]")
+    if down:        parts.append(f"[red bold]● {down} down[/]")
+    if pending:     parts.append(f"[yellow]● {pending} pending[/]")
+    if maintenance: parts.append(f"[blue]● {maintenance} maintenance[/]")
+    parts.append(f"[dim]{len(monitors)} total[/]")
+    console.print("  " + "  [dim]·[/]  ".join(parts))
+
+
+@uptimekuma_app.callback(invoke_without_command=True)
+def cmd_uptimekuma(
+    ctx: typer.Context,
+    failed: bool = typer.Option(False, "-f", "--failed", is_flag=True, help="Show only down monitors."),
+    output: _Out = typer.Option(_Out.table, "-o", help="Output format: table | json"),
+) -> None:
+    """Show all monitor statuses."""
+    if ctx.invoked_subcommand is not None:
+        return
+    _uk_render(failed=failed, output=output)
+
+
+@uptimekuma_app.command("not")
+def cmd_uptimekuma_not(
+    output: _Out = typer.Option(_Out.table, "-o", help="Output format: table | json"),
+) -> None:
+    """Show only down monitors."""
+    _uk_render(failed=True, output=output)
+
+
+# ── blackbox ──────────────────────────────────────────────────────────────────
+
+from lib.blackbox import collect_all as _bb_collect, render_dump as _bb_render
+
+
+@app.command("blackbox")
+def cmd_blackbox(
+    hours: int = typer.Option(2, "--hours", help="Lookback window in hours."),
+    all_containers: bool = typer.Option(
+        False,
+        "--all-containers",
+        help="Capture logs for ALL containers, not just unhealthy/exited ones.",
+    ),
+    out: Optional[Path] = typer.Option(
+        None,
+        "--out",
+        help="Output file path. Default: ./blackbox-YYYYMMDD-HHMMSS.txt in cwd.",
+    ),
+) -> None:
+    """Collect a full-stack diagnostic snapshot and write it to a file.
+
+    Gathers data from Uptime Kuma (outage history), Proxmox, SSH host
+    journals, Portainer Docker environments, Home Assistant error log,
+    and Prometheus firing alerts — all in parallel.
+    """
+    cfg = _load()
+
+    if out is None:
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        out = Path.cwd() / f"blackbox-{ts}.txt"
+
+    sources: list[str] = ["Proxmox", "SSH hosts"]
+    if cfg.uptimekuma:
+        sources.append("Uptime Kuma")
+    if cfg.portainer:
+        sources.append("Portainer (Docker)")
+    if cfg.ha:
+        sources.append("Home Assistant")
+    if cfg.prometheus:
+        sources.append("Prometheus")
+
+    console.print(f"[bold]Collecting blackbox dump[/] (window: {hours}h)")
+    console.print(f"Sources: {', '.join(sources)}")
+    console.print("")
+
+    with console.status("[bold]Collecting from all sources…[/]"):
+        try:
+            dump = asyncio.run(
+                _bb_collect(
+                    cfg,
+                    window_hours=hours,
+                    all_containers=all_containers,
+                    prometheus_url=cfg.prometheus.base_url if cfg.prometheus else "",
+                )
+            )
+        except Exception as e:
+            console.print(f"[red]❌  Collection failed: {e}[/]")
+            raise typer.Exit(1)
+
+    text = _bb_render(dump)
+
+    try:
+        out.write_text(text, encoding="utf-8")
+    except Exception as e:
+        console.print(f"[red]❌  Could not write file: {e}[/]")
+        raise typer.Exit(1)
+
+    # Print a brief summary to the terminal
+    console.print(f"[green]✔[/]  Dump written → [bold]{out}[/]")
+    console.print("")
+
+    if dump.uptime_kuma:
+        down_count = len(dump.uptime_kuma.down_monitors)
+        outage_count = len(dump.uptime_kuma.outages)
+        color = "red" if down_count else "green"
+        console.print(
+            f"  Uptime Kuma  [{color}]{down_count} monitor(s) DOWN[/], "
+            f"{outage_count} recent outage(s)"
+        )
+
+    if dump.proxmox:
+        if dump.proxmox.error:
+            console.print(f"  Proxmox      [yellow]ERROR: {dump.proxmox.error}[/]")
+        else:
+            n_off = len(dump.proxmox.offline_nodes)
+            n_fail = len(dump.proxmox.failed_tasks)
+            color = "red" if n_off or n_fail else "green"
+            console.print(
+                f"  Proxmox      [{color}]{n_off} offline node(s), {n_fail} failed task(s)[/]"
+            )
+
+    for host in dump.ssh_hosts:
+        if host.error:
+            console.print(f"  SSH {host.name:<15} [yellow]ERROR: {host.error}[/]")
+        else:
+            line_count = host.journal_errors.count("\n") + 1 if host.journal_errors.strip() else 0
+            color = "yellow" if line_count else "green"
+            console.print(f"  SSH {host.name:<15} [{color}]{line_count} error line(s)[/]")
+
+    for env in dump.docker_envs:
+        if env.error:
+            console.print(f"  Docker {env.name:<12} [yellow]ERROR: {env.error}[/]")
+        else:
+            attn = sum(1 for c in env.containers if "unhealthy" in c or "exited" in c)
+            color = "red" if attn else "green"
+            console.print(
+                f"  Docker {env.name:<12} [{color}]{len(env.containers)} container(s),"
+                f" {len(env.logs)} log(s) captured[/]"
+            )
+
+    if dump.homeassistant:
+        if dump.homeassistant.error:
+            console.print(f"  HA           [yellow]ERROR: {dump.homeassistant.error}[/]")
+        else:
+            console.print("  HA           [green]error log captured[/]")
+
+    if dump.prometheus:
+        n = len(dump.prometheus.firing_alerts)
+        color = "red" if n else "green"
+        console.print(f"  Prometheus   [{color}]{n} firing alert(s)[/]")
+
+    console.print("")
+    console.print(f"Open: [dim]{out}[/]")
 
 
 # ── tree ──────────────────────────────────────────────────────────────────────
@@ -2904,8 +3430,11 @@ def _seerr(cfg: Config):
 def seerr_search_cmd(
     query: str = typer.Argument(..., help="Movie or TV show title to search for"),
     output: _Out = typer.Option(_Out.table, "-o", help="Output format"),
+    json_flag: bool = typer.Option(False, "-j", is_flag=True, hidden=True, help="JSON output (shorthand for -o json)"),
 ) -> None:
     """Search for movies and TV shows."""
+    if json_flag:
+        output = _Out.json
     cfg = _load()
     sc = _seerr(cfg)
 
@@ -3067,11 +3596,14 @@ def seerr_list_cmd(
     movies_only: bool = typer.Option(False, "--movies", "-m", help="Movies only"),
     processing_only: bool = typer.Option(False, "--processing", "-p", help="Approved and in-flight (not yet available)"),
     output: _Out = typer.Option(_Out.table, "-o", help="Output format"),
+    json_flag: bool = typer.Option(False, "-j", is_flag=True, hidden=True, help="JSON output (shorthand for -o json)"),
 ) -> None:
     """List media requests. Unfulfilled only by default.
 
     [dim]Filters: [bold]-t[/] tv  [bold]-m[/] movies  [bold]-p[/] processing  [bold]-a[/] all[/]
     """
+    if json_flag:
+        output = _Out.json
     _seerr_list_body(show_all, tv_only, movies_only, processing_only, output)
 
 
@@ -3082,8 +3614,11 @@ def seerr_ls_cmd(
     movies_only: bool = typer.Option(False, "--movies", "-m", help="Movies only"),
     processing_only: bool = typer.Option(False, "--processing", "-p", help="Approved and in-flight (not yet available)"),
     output: _Out = typer.Option(_Out.table, "-o", help="Output format"),
+    json_flag: bool = typer.Option(False, "-j", is_flag=True, hidden=True, help="JSON output (shorthand for -o json)"),
 ) -> None:
     """Alias for [bold]list[/]."""
+    if json_flag:
+        output = _Out.json
     _seerr_list_body(show_all, tv_only, movies_only, processing_only, output)
 
 
@@ -3142,11 +3677,10 @@ def media_calendar_cmd(
     for e in episodes:
         by_date[e.air_date].append(e)
 
-    console.print()
     if days >= 0:
-        console.print(f"  [bold]Upcoming releases[/] [dim]— next {days} days · {start} → {end}[/]")
+        console.rule(f"[bold]Upcoming[/]  [dim]next {days} days · {start} → {end}[/]")
     else:
-        console.print(f"  [bold]Past releases[/] [dim]— last {abs(days)} days · {start} → {end}[/]")
+        console.rule(f"[bold]Past releases[/]  [dim]last {abs(days)} days · {start} → {end}[/]")
     console.print()
 
     numbered: list = []   # flat ordered list matching displayed numbers
@@ -3210,10 +3744,14 @@ def media_status_cmd(
     # No flags = show all
     show_all = not any([radarr, sonarr, seerr, plex, tautulli])
 
+    console.print()
+    console.rule("[bold]🎬  Media Status[/]")
+    console.print()
+
     def _row(name: str, ok: bool, detail: str) -> None:
-        icon  = "[green]✓[/]" if ok else "[red]✗[/]"
+        icon  = "[green]●[/]" if ok else "[red]●[/]"
         style = "green" if ok else "red"
-        console.print(f"  {icon}  [bold]{name:<10}[/]  [{style}]{detail}[/]")
+        console.print(f"   {icon}  [bold]{name:<10}[/]  [{style}]{detail}[/]")
 
     if show_all or radarr:
         if cfg.radarr is None:
@@ -3282,6 +3820,10 @@ def media_status_cmd(
             else:
                 _row("Tautulli", False, st.error)
 
+    console.print()
+    console.rule()
+    console.print()
+
 
 # ── media today ───────────────────────────────────────────────────────────────
 
@@ -3329,12 +3871,11 @@ def media_today_cmd() -> None:
     all_imports = radarr_imports + sonarr_imports
 
     # ── 2. Header ───────────────────────────────────────────────────────────────
-    console.print()
-    console.print(f"  [bold]Today[/] [dim]— {today}[/]")
+    console.rule(f"[bold]📅  Today  ·  {today}[/]")
 
     # ── 3. Releases ─────────────────────────────────────────────────────────────
     console.print()
-    console.print("  [bold]Releases[/]")
+    console.print("  [bold cyan]Releases[/]")
     if cal_movies:
         console.print("  [cyan]Movies[/]")
         for m in cal_movies:
@@ -3366,7 +3907,7 @@ def media_today_cmd() -> None:
 
     # ── 4. Requests ─────────────────────────────────────────────────────────────
     console.print()
-    console.print("  [bold]Requests[/]")
+    console.print("  [bold cyan]Requests[/]")
     req_movies = [r for r in seerr_reqs if r.media_type == "movie"]
     req_tv     = [r for r in seerr_reqs if r.media_type != "movie"]
 
@@ -3393,7 +3934,7 @@ def media_today_cmd() -> None:
 
     # ── 5. Downloads ─────────────────────────────────────────────────────────────
     console.print()
-    console.print("  [bold]Downloads[/]")
+    console.print("  [bold cyan]Downloads[/]")
     dl_movies = [imp for imp in all_imports if imp.media_type == "movie"]
     dl_tv     = [imp for imp in all_imports if imp.media_type == "episode"]
 
@@ -3448,6 +3989,8 @@ def media_today_cmd() -> None:
     if not dl_movies and not dl_tv:
         console.print("  [dim]Nothing downloaded today.[/]")
 
+    console.print()
+    console.rule()
     console.print()
 
 
@@ -3525,15 +4068,16 @@ def media_search_today_cmd(
 
     # ── Display plan ──────────────────────────────────────────────────────────
     console.print()
-    console.print(f"  [bold]search-today[/] [dim]— {today}[/]")
+    console.rule(f"[bold]🔍  Search Today  ·  {today}[/]")
+    console.print()
 
     if not cal_movies and not cal_episodes:
-        console.print()
         console.print("  [dim]Nothing on the calendar for today.[/]")
+        console.print()
+        console.rule()
         console.print()
         return
 
-    console.print()
     if movie_rows:
         console.print("  [cyan]Movies[/]")
         for arr_id, title, year, release_type, skip in movie_rows:
@@ -3563,6 +4107,8 @@ def media_search_today_cmd(
 
     if not movies_to_search and not episodes_to_search:
         console.print("  [dim]Nothing to search — all items are downloaded, queued, or on cooldown.[/]")
+        console.print()
+        console.rule()
         console.print()
         return
 
@@ -3607,6 +4153,8 @@ def media_search_today_cmd(
             console.print(f"  [red]✗[/] Sonarr search failed: {exc}")
 
     console.print()
+    console.rule()
+    console.print()
 
 
 # ── plex ──────────────────────────────────────────────────────────────────────
@@ -3650,7 +4198,7 @@ def plex_libraries_cmd() -> None:
     if isinstance(libs, str):
         console.print(f"[red]Error:[/] {libs}")
         raise typer.Exit(1)
-    t = Table(box=box.SIMPLE_HEAD, show_edge=False)
+    t = Table(box=box.SIMPLE, show_edge=False, pad_edge=False)
     t.add_column("ID",    style="dim",   no_wrap=True)
     t.add_column("Title", style="bold")
     t.add_column("Type")
@@ -3815,12 +4363,12 @@ def tautulli_active_cmd() -> None:
         return
 
     total_bw = sum(s.bandwidth for s in streams)
-    bw_str = f" · {total_bw / 1000:.1f} Mbps" if total_bw else ""
-    console.print()
-    console.print(f"  [bold]{len(streams)} active stream{'s' if len(streams) != 1 else ''}[/][dim]{bw_str}[/]")
+    bw_str = f"  ·  {total_bw / 1000:.1f} Mbps" if total_bw else ""
+    n = len(streams)
+    console.rule(f"[bold]{n} active stream{'s' if n != 1 else ''}[/][dim]{bw_str}[/]")
     console.print()
 
-    t = Table(box=box.SIMPLE_HEAD, show_edge=False, pad_edge=False)
+    t = Table(box=box.SIMPLE, show_edge=False, pad_edge=False)
     t.add_column("User",      style="bold", no_wrap=True)
     t.add_column("State",     no_wrap=True)
     t.add_column("Title",     no_wrap=True)
@@ -3850,7 +4398,8 @@ def tautulli_active_cmd() -> None:
         )
 
     console.print(t)
-    console.print(f"  [dim]Session keys: {', '.join(s.session_key for s in streams)}[/]")
+    console.print()
+    console.rule(f"[dim]session keys: {', '.join(s.session_key for s in streams)}[/]")
     console.print()
 
 
@@ -3859,8 +4408,11 @@ def tautulli_history_cmd(
     count:  int = typer.Option(20, "--count", "-n", help="Number of records to show"),
     user:   str = typer.Option("", "--user", "-u", help="Filter by username"),
     output: _Out = typer.Option(_Out.table, "-o", help="Output format"),
+    json_flag: bool = typer.Option(False, "-j", is_flag=True, hidden=True, help="JSON output (shorthand for -o json)"),
 ) -> None:
     """Show recent Plex play history."""
+    if json_flag:
+        output = _Out.json
     cfg = _load()
     with console.status("[bold]Fetching play history…[/]"):
         records = tautulli_get_history(_tautulli(cfg), length=count, user=user)
@@ -3888,7 +4440,7 @@ def tautulli_history_cmd(
         h, m = divmod(secs // 60, 60)
         return f"{h}h {m}m" if h else f"{m}m"
 
-    t = Table(box=box.SIMPLE_HEAD, show_edge=False, pad_edge=False)
+    t = Table(box=box.SIMPLE, show_edge=False, pad_edge=False)
     t.add_column("User",      style="bold", no_wrap=True)
     t.add_column("Played",    no_wrap=True)
     t.add_column("Title",     no_wrap=True)
@@ -3945,8 +4497,11 @@ def speedtest_cmd(
     ping_only: bool   = typer.Option(False, "--ping-only",        help="Measure latency only — skip download/upload"),
     ping_samples: int = typer.Option(10,    "--samples",   "-s",  help="Number of ping samples"),
     output: _Out      = typer.Option(_Out.table, "-o",            help="Output format: table or json"),
+    json_flag: bool   = typer.Option(False, "-j", is_flag=True, hidden=True, help="JSON output (shorthand for -o json)"),
 ) -> None:
     """Run a speed test against your OpenSpeedTest server.\n\n[dim]Requires openspeedtest: section in config.yaml.[/]"""
+    if json_flag:
+        output = _Out.json
     cfg = _load()
     if cfg.openspeedtest is None:
         console.print("[red]No [bold]openspeedtest[/] section in config.yaml[/]")
