@@ -60,26 +60,17 @@ ssh:
   #   my-ubuntu-vm: ubuntu
   #   my-debian-lxc: debian
 
-# ── Storage ───────────────────────────────────────────────────────────────────
+# ── Monitoring: Beszel ────────────────────────────────────────────────────────
 
-dsm:
-  # Synology DSM HTTP API — health checks (CPU, memory, volumes).
-  # DSM ports: 5000 (HTTP) or 5001 (HTTPS).
-  - name: NAS
-    host: 192.168.x.x
-    port: 5000
-    https: false
-    user: your_dsm_user
-    password: keychain:dsm-nas-password   # ← stored in keychain
-    verify_ssl: false
-
-  # Add more NAS instances as needed:
-  # - name: SecondNAS
-  #   host: 192.168.x.x
-  #   port: 5000
-  #   user: your_dsm_user
-  #   password: keychain:dsm-secondnas-password
-  #   verify_ssl: false
+beszel:
+  # Beszel hub — lightweight host monitoring (CPU, memory, disk).
+  # Replaces per-service health checks for non-Proxmox hosts (NAS, Docker hosts, etc.)
+  # Generate an API key: Beszel UI → Settings → API Keys → Create
+  host: beszel.local.example.com
+  port: 443
+  https: true
+  api_key: keychain:beszel-api-key   # ← stored in keychain
+  verify_ssl: false
 
 # ── Network ───────────────────────────────────────────────────────────────────
 
@@ -171,12 +162,43 @@ seerr:
 
 # ── Monitoring ────────────────────────────────────────────────────────────────
 
+prometheus:
+  # Prometheus — used by blackbox to include firing/pending alert rules.
+  # No auth required for most self-hosted instances.
+  host: 192.168.x.x
+  port: 9090
+  https: false
+  verify_ssl: false
+
 openspeedtest:
   # Self-hosted OpenSpeedTest server (docker: openspeedtest/latest).
   # No auth required — just point at the host and port.
   host: 192.168.x.x
   port: 3000
   https: false
+  verify_ssl: false
+
+uptimekuma:
+  # Uptime Kuma — service uptime monitoring (louislam/uptime-kuma).
+  # With api_key: uses /metrics endpoint (Prometheus) — all monitors, no status page needed.
+  # Without api_key: uses public status page API — slug must be a public status page.
+  # Generate an API key: Uptime Kuma → Settings → API Keys → Add API Key.
+  host: 192.168.x.x
+  port: 3001
+  https: false
+  api_key: keychain:uptimekuma-api-key   # ← stored in keychain
+  # slug: main   # status page slug for outage history (e.g. /status/main → slug: main)
+  verify_ssl: false
+
+portainer:
+  # Portainer — unified Docker management across multiple hosts.
+  # Supports CE and EE. Used by blackbox to collect container logs from all
+  # connected Docker environments (via Portainer agents).
+  # Generate a token: Portainer UI → Account → Access tokens → Add access token.
+  host: 192.168.x.x
+  port: 9000
+  https: false
+  api_key: keychain:portainer-api-key   # ← stored in keychain
   verify_ssl: false
 
 tls:
@@ -191,3 +213,14 @@ tls:
   #   port: 443
   #   sni: nas.local.example.com
   #   verify_ssl: false
+
+# ── Blackbox ──────────────────────────────────────────────────────────────────
+
+# blackbox:
+#   # Extra SSH hosts to collect journalctl error logs from (in addition to
+#   # Proxmox nodes which are auto-discovered via the Proxmox API).
+#   # Use this to include standalone Docker hosts, NAS boxes, etc.
+#   ssh_hosts:
+#     - name: docker-1
+#       host: 192.168.x.x
+#       # user: root   # optional — defaults to ssh.default_user
