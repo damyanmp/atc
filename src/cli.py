@@ -369,6 +369,7 @@ def _render_hosts_wide(hosts: list[NormalizedHost]) -> None:
     t.add_column("", width=2)
     t.add_column("Name", style="bold")
     t.add_column("Type", width=4)
+    t.add_column("ID", justify="right", style="dim")
     t.add_column("Node")
     t.add_column("IP")
     t.add_column("Status")
@@ -381,6 +382,7 @@ def _render_hosts_wide(hosts: list[NormalizedHost]) -> None:
     for h in hosts:
         dot = "[green]●[/]" if h.online else "[dim]●[/]"
         kind = {"vm": "[blue]vm [/]", "lxc": "[cyan]lxc[/]"}.get(h.type, "[dim]host[/]")
+        vmid_str = str(h.vmid) if h.vmid else "[dim]—[/]"
         node = h.node or "[dim]—[/]"
         ip = h.ip or "[dim]—[/]"
         status = f"[green]{h.status}[/]" if h.online else f"[dim]{h.status}[/]"
@@ -389,7 +391,7 @@ def _render_hosts_wide(hosts: list[NormalizedHost]) -> None:
         disk = _fmt_pct(h.disk_pct / 100) if h.disk_available else "[dim]—[/]"
         uptime = _fmt_uptime(h.uptime) if h.uptime > 0 else "[dim]—[/]"
         tags = h.tags.replace(";", " ") if h.tags else "[dim]—[/]"
-        t.add_row(dot, h.name, kind, node, ip, status, cpu, mem, disk, uptime, tags)
+        t.add_row(dot, h.name, kind, vmid_str, node, ip, status, cpu, mem, disk, uptime, tags)
 
     console.print(t)
 
@@ -454,6 +456,7 @@ def _render_cluster_grouped(
 
     t = Table(box=box.SIMPLE, show_header=True, pad_edge=False, show_edge=False)
     t.add_column("", width=2)
+    t.add_column("ID", justify="right", style="dim", min_width=4)
     t.add_column("Name", min_width=22)
     t.add_column("Type", width=5)
     t.add_column("CPU", justify="right", min_width=5)
@@ -488,7 +491,8 @@ def _render_cluster_grouped(
             else:
                 diskio = netio = "[dim]—[/]"
             uptime = _fmt_uptime(h.uptime) if h.uptime > 0 else "[dim]—[/]"
-            t.add_row(dot, name, kind, cpu, "[dim]—[/]", "[dim]—[/]", mem, disk, diskio, netio, uptime)
+            vmid_str = str(h.vmid) if h.vmid else "[dim]—[/]"
+            t.add_row(dot, vmid_str, name, kind, cpu, "[dim]—[/]", "[dim]—[/]", mem, disk, diskio, netio, uptime)
 
     for node in cluster.nodes:
         dot = "[green]●[/]" if node.online else "[red]●[/]"
@@ -505,7 +509,7 @@ def _render_cluster_grouped(
             uptime = _fmt_uptime(node.uptime)
         else:
             cpu = load = wait = mem = disk = uptime = "[dim]—[/]"
-        t.add_row(dot, f"[bold]{node.name}[/]", "[dim]node[/]",
+        t.add_row(dot, "[dim]—[/]", f"[bold]{node.name}[/]", "[dim]node[/]",
                   cpu, load, wait, mem, disk, "[dim]—[/]", "[dim]—[/]", uptime)
         _guest_rows(by_node.get(node.name, []))
 
@@ -517,7 +521,7 @@ def _render_cluster_grouped(
         diskio = _fmt_bps(h.bz_disk_read_bps, h.bz_disk_write_bps, rx_label="r", tx_label="w") if h.online else "[dim]—[/]"
         netio = _fmt_bps(h.bz_net_recv_bps, h.bz_net_sent_bps) if h.online else "[dim]—[/]"
         uptime = _fmt_uptime(h.uptime) if h.uptime > 0 else "[dim]—[/]"
-        t.add_row(dot, f"[bold]{h.name}[/]", "[dim]host[/]",
+        t.add_row(dot, "[dim]—[/]", f"[bold]{h.name}[/]", "[dim]host[/]",
                   cpu, "[dim]—[/]", "[dim]—[/]", mem, disk, diskio, netio, uptime)
 
     console.print(t)
