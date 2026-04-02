@@ -132,6 +132,18 @@ def main() -> None:
     # Register "up" as a hidden alias for "uptimekuma"
     if "uptimekuma" in (click_app.commands or {}):
         click_app.commands["up"] = click_app.commands["uptimekuma"]
+        _orig_list_commands = click_app.list_commands
+        click_app.list_commands = lambda ctx: [  # type: ignore[method-assign]
+            c for c in _orig_list_commands(ctx) if c != "up"
+        ]
+
+    # Auth gate — skip for `atc auth` subcommands so the user can set/clear PIN
+    # without being asked for the PIN they're trying to configure.
+    raw_args = sys.argv[1:]
+    _auth_exempt = raw_args and raw_args[0] == "auth"
+    if not _auth_exempt:
+        from auth import require_auth
+        require_auth()
 
     click_app(standalone_mode=True)
 

@@ -1848,6 +1848,39 @@ def secrets_rm(
     secrets_delete(key=key, yes=yes)
 
 
+# ── auth ──────────────────────────────────────────────────────────────────────
+
+from auth import has_pin, cmd_set_pin, cmd_clear_pin
+
+auth_app = typer.Typer(
+    help="Manage PIN-based access control for atc.",
+    no_args_is_help=True,
+    rich_markup_mode="rich",
+)
+app.add_typer(auth_app, name="auth")
+
+
+@auth_app.command("set-pin")
+def auth_set_pin() -> None:
+    """Set or change the PIN required to run atc."""
+    cmd_set_pin()
+
+
+@auth_app.command("clear")
+def auth_clear() -> None:
+    """Remove the PIN, disabling auth entirely."""
+    cmd_clear_pin()
+
+
+@auth_app.command("status")
+def auth_status() -> None:
+    """Show whether a PIN is currently configured."""
+    if has_pin():
+        console.print("[green]●[/]  PIN is [bold]enabled[/]. Prompted once per terminal session.")
+    else:
+        console.print("[dim]●[/]  No PIN configured. Run [bold]atc auth set-pin[/] to enable.")
+
+
 # ── pihole ────────────────────────────────────────────────────────────────────
 
 pihole_app = typer.Typer(
