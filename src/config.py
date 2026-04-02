@@ -102,6 +102,24 @@ class BeszelConfig:
 # ── Network ───────────────────────────────────────────────────────────────────
 
 @dataclass
+class UniFiConfig:
+    host: str
+    api_key: str = ""        # preferred: UniFi Network 8.x+ API key
+    username: str = ""       # fallback: username/password cookie auth
+    password: str = ""
+    port: int = 443
+    https: bool = True
+    udm: bool = True         # True for UDM/UDR (adds /proxy/network/ prefix)
+    site: str = "default"
+    verify_ssl: bool = False
+
+    @property
+    def base_url(self) -> str:
+        scheme = "https" if self.https else "http"
+        return f"{scheme}://{self.host}:{self.port}"
+
+
+@dataclass
 class PiholeInstanceConfig:
     name: str
     host: str
@@ -306,6 +324,7 @@ class Config:
     uptimekuma: UptimeKumaConfig | None = None
     portainer: PortainerConfig | None = None
     prometheus: PrometheusConfig | None = None
+    unifi: UniFiConfig | None = None
     blackbox: BlackboxConfig = field(default_factory=BlackboxConfig)
     scripts_dir: str = "../../"
     refresh_interval: int = 30
@@ -525,6 +544,22 @@ def load_config(config_path: Path | None = None) -> Config:
             verify_ssl=bool(pm.get("verify_ssl", False)),
         )
 
+    # UniFi
+    unifi: UniFiConfig | None = None
+    if "unifi" in raw:
+        uf = raw["unifi"]
+        unifi = UniFiConfig(
+            host=uf["host"],
+            port=int(uf.get("port", 443)),
+            https=bool(uf.get("https", True)),
+            udm=bool(uf.get("udm", True)),
+            site=uf.get("site", "default"),
+            verify_ssl=bool(uf.get("verify_ssl", False)),
+            api_key=_resolve_secret(uf["api_key"], "unifi/api_key") if uf.get("api_key") else "",
+            username=uf.get("username", ""),
+            password=_resolve_secret(uf["password"], "unifi/password") if uf.get("password") else "",
+        )
+
     # Blackbox
     bb_raw = raw.get("blackbox", {})
     blackbox = BlackboxConfig(
@@ -554,6 +589,7 @@ def load_config(config_path: Path | None = None) -> Config:
         uptimekuma=uptimekuma,
         portainer=portainer,
         prometheus=prometheus,
+        unifi=unifi,
         blackbox=blackbox,
         scripts_dir=raw.get("scripts_dir", "../../"),
         refresh_interval=int(raw.get("refresh_interval", 30)),

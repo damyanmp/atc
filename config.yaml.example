@@ -74,6 +74,21 @@ beszel:
 
 # ── Network ───────────────────────────────────────────────────────────────────
 
+unifi:
+  # UniFi Network Application — firewall rules, VLANs, network config.
+  # Auth option 1 (recommended): API key — UniFi Network 8.x+
+  #   Generate: Network UI → Settings → Control Plane → Integrations → Create API Key
+  # Auth option 2 (legacy): username + password (cookie-based session)
+  host: 192.168.x.x        # IP or hostname of UDM / Cloud Key / controller
+  port: 443
+  https: true
+  udm: true                # true for UDM/UDR (adds /proxy/network/ prefix); false for standalone controller
+  site: default            # UniFi site name (usually "default")
+  api_key: keychain:unifi-api-key   # ← preferred; comment out if using username/password
+  # username: admin
+  # password: keychain:unifi-password
+  verify_ssl: false
+
 pihole:
   # Pi-hole v6 HTTP API — DNS blocking status, gravity sync, custom DNS.
   # Generate a password in Pi-hole: Settings → API / Web interface.
