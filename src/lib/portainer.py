@@ -33,6 +33,16 @@ class PortainerContainer:
     health: str   # "healthy", "unhealthy", "starting", "" if no healthcheck
     env_id: int
     env_name: str
+    labels: dict = None  # type: ignore[assignment]
+
+    def __post_init__(self):
+        if self.labels is None:
+            self.labels = {}
+
+    @property
+    def compose_project(self) -> str:
+        """The docker-compose project name, or '' if not a Compose container."""
+        return self.labels.get("com.docker.compose.project", "")
 
     @property
     def needs_attention(self) -> bool:
@@ -133,6 +143,7 @@ def fetch_containers(
             health=health,
             env_id=env_id,
             env_name=env_name,
+            labels=c.get("Labels") or {},
         ))
 
     return containers
@@ -181,6 +192,147 @@ def fetch_container_logs(
     return "\n".join(lines) if lines else r.text
 
 
+# ── Images ────────────────────────────────────────────────────────────────────
+
+@dataclass
+class PortainerImage:
+    id: str           # full SHA256
+    tags: list[str]   # repo:tag pairs; empty = dangling
+    size: int         # bytes (compressed on-disk size)
+    created: int      # unix timestamp
+    env_id: int
+    env_name: str
+
+    @property
+    def dangling(self) -> bool:
+        return not self.tags
+
+    @property
+    def display_name(self) -> str:
+        return self.tags[0] if self.tags else f"<none> ({self.id[:12]})"
+
+
+def fetch_images(
+    cfg: PortainerConfig,
+    env_id: int,
+    env_name: str,
+) -> list[PortainerImage]:
+    """Return all images for a given Portainer environment."""
+    with _client(cfg) as client:
+        r = client.get(
+            f"{cfg.base_url}/api/endpoints/{env_id}/docker/images/json",
+            headers=_headers(cfg),
+            params={"all": "false"},  # exclude intermediate layers
+        )
+        if not r.is_success:
+            raise RuntimeError(
+                f"Portainer images HTTP {r.status_code} (env {env_id}): {r.text[:200]}"
+            )
+
+    images = []
+    for img in r.json():
+        tags = [t for t in (img.get("RepoTags") or []) if t != "<none>:<none>"]
+        images.append(PortainerImage(
+            id=img.get("Id", ""),
+            tags=tags,
+            size=img.get("Size", 0),
+            created=img.get("Created", 0),
+            env_id=env_id,
+            env_name=env_name,
+        ))
+    return images
+
+
+def prune_images(
+    cfg: PortainerConfig,
+    env_id: int,
+    all_unused: bool = False,
+) -> tuple[int, int]:
+    """Prune images. Returns (images_deleted, bytes_reclaimed).
+
+    all_unused=False: only dangling (untagged) images.
+    all_unused=True: all images not referenced by any container.
+    """
+    filters = '{"dangling":["false"]}' if all_unused else '{"dangling":["true"]}'
+    with _client(cfg) as client:
+        r = client.post(
+            f"{cfg.base_url}/api/endpoints/{env_id}/docker/images/prune",
+            headers=_headers(cfg),
+            params={"filters": filters},
+        )
+        if not r.is_success:
+            raise RuntimeError(
+                f"Image prune HTTP {r.status_code} (env {env_id}): {r.text[:200]}"
+            )
+
+    data = r.json()
+    deleted = len(data.get("ImagesDeleted") or [])
+    reclaimed = data.get("SpaceReclaimed", 0)
+    return deleted, reclaimed
+
+
+# ── Volumes ───────────────────────────────────────────────────────────────────
+
+@dataclass
+class PortainerVolume:
+    name: str
+    driver: str
+    mountpoint: str
+    created: str      # ISO 8601 string (may be empty)
+    env_id: int
+    env_name: str
+
+
+def fetch_volumes(
+    cfg: PortainerConfig,
+    env_id: int,
+    env_name: str,
+) -> list[PortainerVolume]:
+    """Return all volumes for a given Portainer environment."""
+    with _client(cfg) as client:
+        r = client.get(
+            f"{cfg.base_url}/api/endpoints/{env_id}/docker/volumes",
+            headers=_headers(cfg),
+        )
+        if not r.is_success:
+            raise RuntimeError(
+                f"Portainer volumes HTTP {r.status_code} (env {env_id}): {r.text[:200]}"
+            )
+
+    volumes = []
+    for v in r.json().get("Volumes") or []:
+        volumes.append(PortainerVolume(
+            name=v.get("Name", ""),
+            driver=v.get("Driver", ""),
+            mountpoint=v.get("Mountpoint", ""),
+            created=v.get("CreatedAt", ""),
+            env_id=env_id,
+            env_name=env_name,
+        ))
+    return volumes
+
+
+def prune_volumes(
+    cfg: PortainerConfig,
+    env_id: int,
+) -> tuple[int, int]:
+    """Prune unused (orphaned) volumes. Returns (volumes_deleted, bytes_reclaimed)."""
+    with _client(cfg) as client:
+        r = client.post(
+            f"{cfg.base_url}/api/endpoints/{env_id}/docker/volumes/prune",
+            headers=_headers(cfg),
+        )
+        if not r.is_success:
+            raise RuntimeError(
+                f"Volume prune HTTP {r.status_code} (env {env_id}): {r.text[:200]}"
+            )
+
+    data = r.json()
+    deleted = len(data.get("VolumesDeleted") or [])
+    reclaimed = data.get("SpaceReclaimed", 0)
+    return deleted, reclaimed
+
+
 # ── Container outage detection ────────────────────────────────────────────────
 
 @dataclass
@@ -191,6 +343,124 @@ class ContainerOutage:
     ended_at: str      # ISO 8601 timestamp of recovery start, or "ongoing"
     duration_min: int  # 0 if ongoing
     exit_code: str     # exit code from die event, "" if stop
+
+
+def container_action(
+    cfg: PortainerConfig,
+    env_id: int,
+    container_id: str,
+    action: str,
+) -> None:
+    """Perform start/stop/restart on a container. Raises on failure."""
+    with _client(cfg) as client:
+        r = client.post(
+            f"{cfg.base_url}/api/endpoints/{env_id}/docker/containers/{container_id}/{action}",
+            headers=_headers(cfg),
+        )
+        # 304 = already in desired state (e.g. start on a running container)
+        if not r.is_success and r.status_code != 304:
+            raise RuntimeError(
+                f"Container {action} HTTP {r.status_code} (env {env_id}): {r.text[:200]}"
+            )
+
+
+@dataclass
+class PortainerStack:
+    id: int
+    name: str
+    status: int   # 1=active, 2=inactive
+    env_id: int
+    env_name: str
+    type: int     # 1=swarm, 2=compose
+
+
+def fetch_stacks(
+    cfg: PortainerConfig,
+    envs: "list[PortainerEnvironment] | None" = None,
+) -> list[PortainerStack]:
+    """Return all stacks registered in Portainer."""
+    with _client(cfg) as client:
+        r = client.get(f"{cfg.base_url}/api/stacks", headers=_headers(cfg))
+        if not r.is_success:
+            raise RuntimeError(f"Portainer stacks HTTP {r.status_code}: {r.text[:200]}")
+
+    env_map = {e.id: e.name for e in (envs or [])}
+    return [
+        PortainerStack(
+            id=s["Id"],
+            name=s["Name"],
+            status=s.get("Status", 1),
+            env_id=s.get("EndpointId", 0),
+            env_name=env_map.get(s.get("EndpointId", 0), str(s.get("EndpointId", 0))),
+            type=s.get("Type", 2),
+        )
+        for s in r.json()
+    ]
+
+
+def stack_action(
+    cfg: PortainerConfig,
+    stack_id: int,
+    action: str,
+) -> None:
+    """Perform start/stop on a stack. Raises on failure."""
+    with _client(cfg) as client:
+        r = client.post(
+            f"{cfg.base_url}/api/stacks/{stack_id}/{action}",
+            headers=_headers(cfg),
+        )
+        if not r.is_success:
+            raise RuntimeError(
+                f"Stack {action} HTTP {r.status_code} (stack {stack_id}): {r.text[:200]}"
+            )
+
+
+@dataclass
+class InferredStack:
+    """A Compose project inferred from container labels (not registered in Portainer)."""
+    project: str          # com.docker.compose.project value
+    env_id: int
+    env_name: str
+    containers: "list[PortainerContainer]"
+
+    @property
+    def name(self) -> str:
+        return self.project
+
+    @property
+    def running(self) -> int:
+        return sum(1 for c in self.containers if c.state == "running")
+
+    @property
+    def total(self) -> int:
+        return len(self.containers)
+
+
+def infer_compose_stacks(
+    containers: "list[PortainerContainer]",
+    portainer_stack_names: "set[str] | None" = None,
+) -> "list[InferredStack]":
+    """Group containers by their docker-compose project label.
+
+    Containers without a compose project label are ignored.
+    Pass portainer_stack_names to skip projects already registered as
+    a Portainer-managed stack (avoids duplicates in the listing).
+    """
+    known = {n.lower() for n in (portainer_stack_names or set())}
+    by_project: dict[tuple[int, str, str], list[PortainerContainer]] = {}
+    for c in containers:
+        project = c.compose_project
+        if not project:
+            continue
+        if project.lower() in known:
+            continue
+        key = (c.env_id, c.env_name, project)
+        by_project.setdefault(key, []).append(c)
+
+    return [
+        InferredStack(project=project, env_id=env_id, env_name=env_name, containers=ctrs)
+        for (env_id, env_name, project), ctrs in sorted(by_project.items())
+    ]
 
 
 def fetch_container_events(

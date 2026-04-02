@@ -2715,6 +2715,425 @@ def cmd_blackbox(
     console.print(f"Open: [dim]{out}[/]")
 
 
+# ── docker ────────────────────────────────────────────────────────────────────
+
+docker_app = typer.Typer(
+    help="Manage Docker containers and Compose stacks across all Portainer environments",
+    no_args_is_help=True,
+    rich_markup_mode="rich",
+)
+app.add_typer(docker_app, name="docker")
+
+
+def _require_portainer(cfg):
+    if not cfg.portainer:
+        console.print("[red]❌  No Portainer configured (missing [portainer] in config)[/]")
+        raise typer.Exit(1)
+    return cfg.portainer
+
+
+def _fetch_all_containers(pt_cfg):
+    """Return (envs, containers) across all active Portainer environments."""
+    from lib.portainer import fetch_environments, fetch_containers
+    envs = fetch_environments(pt_cfg)
+    containers = []
+    for env in envs:
+        if env.status != 1:
+            continue
+        containers.extend(fetch_containers(pt_cfg, env.id, env.name, all_containers=True))
+    return envs, containers
+
+
+def _match_containers(containers, selector: str, env_filter: str | None):
+    sel = selector.lower()
+    matches = [c for c in containers if sel in c.name.lower()]
+    if env_filter:
+        matches = [c for c in matches if env_filter.lower() in c.env_name.lower()]
+    return matches
+
+
+def _match_stacks(stacks, selector: str, env_filter: str | None):
+    sel = selector.lower()
+    matches = [s for s in stacks if sel in s.name.lower()]
+    if env_filter:
+        matches = [s for s in matches if env_filter.lower() in s.env_name.lower()]
+    return matches
+
+
+@docker_app.command("ls")
+def docker_ls(
+    env: str | None = typer.Option(None, "--env", "-e", help="Filter by environment name"),
+    all_: bool = typer.Option(False, "--all", "-a", help="Include stopped containers"),
+) -> None:
+    """List containers across all Portainer environments."""
+    cfg = _load()
+    pt_cfg = _require_portainer(cfg)
+
+    from lib.portainer import fetch_environments, fetch_containers
+    with console.status("[bold]Fetching containers…[/]"):
+        envs = fetch_environments(pt_cfg)
+        rows = []
+        for e in envs:
+            if env and env.lower() not in e.name.lower():
+                continue
+            if e.status != 1:
+                continue
+            for c in fetch_containers(pt_cfg, e.id, e.name, all_containers=True):
+                if not all_ and c.state not in ("running", "restarting"):
+                    continue
+                rows.append(c)
+
+    from rich.table import Table
+    table = Table(show_header=True, header_style="bold", box=None)
+    table.add_column("Environment", style="dim")
+    table.add_column("Container")
+    table.add_column("State")
+    table.add_column("Health")
+    table.add_column("Status", style="dim")
+
+    _STATE_ICON = {
+        "running": "🟢", "restarting": "🟡", "paused": "⚫",
+        "exited": "🔴", "dead": "🔴",
+    }
+    for c in sorted(rows, key=lambda x: (x.env_name, x.name)):
+        icon = _STATE_ICON.get(c.state, "⚫")
+        health = c.health or "—"
+        table.add_row(c.env_name, c.name, f"{icon} {c.state}", health, c.status)
+
+    console.print(table)
+
+
+@docker_app.command("stacks")
+def docker_stacks(
+    env: str | None = typer.Option(None, "--env", "-e", help="Filter by environment name"),
+) -> None:
+    """List Compose stacks across all Portainer environments.
+
+    Shows both stacks managed by Portainer and projects inferred from
+    docker-compose labels on containers (e.g. stacks deployed via
+    Synology Container Manager or plain docker compose).
+    """
+    cfg = _load()
+    pt_cfg = _require_portainer(cfg)
+
+    from lib.portainer import (
+        fetch_environments, fetch_containers, fetch_stacks, infer_compose_stacks,
+    )
+    with console.status("[bold]Fetching stacks…[/]"):
+        envs = fetch_environments(pt_cfg)
+        portainer_stacks = fetch_stacks(pt_cfg, envs)
+        all_containers = []
+        for e in envs:
+            if e.status != 1:
+                continue
+            all_containers.extend(fetch_containers(pt_cfg, e.id, e.name, all_containers=True))
+        known_names = {s.name for s in portainer_stacks}
+        inferred = infer_compose_stacks(all_containers, portainer_stack_names=known_names)
+
+    if env:
+        portainer_stacks = [s for s in portainer_stacks if env.lower() in s.env_name.lower()]
+        inferred = [s for s in inferred if env.lower() in s.env_name.lower()]
+
+    from rich.table import Table
+    table = Table(show_header=True, header_style="bold", box=None)
+    table.add_column("Environment", style="dim")
+    table.add_column("Stack")
+    table.add_column("Status")
+    table.add_column("Source", style="dim")
+
+    for s in sorted(portainer_stacks, key=lambda x: (x.env_name, x.name)):
+        status = "🟢 active" if s.status == 1 else "⚫ inactive"
+        table.add_row(s.env_name, s.name, status, "portainer")
+
+    for s in sorted(inferred, key=lambda x: (x.env_name, x.name)):
+        status = f"🟢 {s.running}/{s.total} running" if s.running else f"⚫ 0/{s.total} running"
+        table.add_row(s.env_name, s.name, status, "compose labels")
+
+    console.print(table)
+
+
+def _docker_action(
+    selector: str,
+    env_filter: str | None,
+    yes: bool,
+    verb: str,
+) -> None:
+    """Shared logic for start/stop/restart across containers, Portainer stacks, and inferred stacks."""
+    cfg = _load()
+    pt_cfg = _require_portainer(cfg)
+
+    from lib.portainer import (
+        fetch_environments, fetch_containers, fetch_stacks, infer_compose_stacks,
+        container_action, stack_action,
+    )
+    with console.status("[bold]Fetching Portainer state…[/]"):
+        envs = fetch_environments(pt_cfg)
+        all_containers = []
+        for e in envs:
+            if e.status != 1:
+                continue
+            all_containers.extend(fetch_containers(pt_cfg, e.id, e.name, all_containers=True))
+        portainer_stacks = fetch_stacks(pt_cfg, envs)
+        known_names = {s.name for s in portainer_stacks}
+        inferred_stacks = infer_compose_stacks(all_containers, portainer_stack_names=known_names)
+
+    matched_containers = _match_containers(all_containers, selector, env_filter)
+    matched_stacks = _match_stacks(portainer_stacks, selector, env_filter)
+    matched_inferred = [s for s in inferred_stacks
+                        if selector.lower() in s.name.lower()
+                        and (not env_filter or env_filter.lower() in s.env_name.lower())]
+
+    # If the selector matches a stack (portainer or inferred), don't also act on its
+    # individual containers — that would double-up the action.
+    stack_project_names = {s.name.lower() for s in matched_stacks}
+    stack_project_names |= {s.name.lower() for s in matched_inferred}
+    matched_containers = [
+        c for c in matched_containers
+        if c.compose_project.lower() not in stack_project_names
+    ]
+
+    if not matched_containers and not matched_stacks and not matched_inferred:
+        console.print(f"[yellow]No container or stack found matching '{selector}'[/]")
+        raise typer.Exit(1)
+
+    console.print(f"\nTargets to [bold]{verb}[/]:")
+    for c in matched_containers:
+        console.print(f"  [cyan]•[/] [dim][container][/]      {c.name} [dim](env: {c.env_name}, {c.state})[/]")
+    for s in matched_stacks:
+        state = "active" if s.status == 1 else "inactive"
+        console.print(f"  [cyan]•[/] [dim][portainer stack][/] {s.name} [dim](env: {s.env_name}, {state})[/]")
+    for s in matched_inferred:
+        console.print(
+            f"  [cyan]•[/] [dim][compose project][/]  {s.name} "
+            f"[dim](env: {s.env_name}, {s.running}/{s.total} running)[/]"
+        )
+
+    total = len(matched_containers) + len(matched_stacks) + len(matched_inferred)
+    if not yes and not Confirm.ask(f"\n{verb.capitalize()} {total} target(s)?"):
+        raise typer.Exit(0)
+
+    for c in matched_containers:
+        with console.status(f"[bold]{verb.capitalize()}ing container {c.name}…[/]"):
+            try:
+                container_action(pt_cfg, c.env_id, c.id, verb)
+                console.print(f"[green]✓[/] {c.name} — {verb} issued")
+            except Exception as e:
+                console.print(f"[red]✗[/] {c.name} — {e}")
+
+    for s in matched_stacks:
+        with console.status(f"[bold]{verb.capitalize()}ing stack {s.name}…[/]"):
+            try:
+                if verb == "restart":
+                    stack_action(pt_cfg, s.id, "stop")
+                    stack_action(pt_cfg, s.id, "start")
+                else:
+                    stack_action(pt_cfg, s.id, verb)
+                console.print(f"[green]✓[/] {s.name} — {verb} issued")
+            except Exception as e:
+                console.print(f"[red]✗[/] {s.name} — {e}")
+
+    for s in matched_inferred:
+        errors = []
+        with console.status(f"[bold]{verb.capitalize()}ing compose project {s.name}…[/]"):
+            for c in s.containers:
+                try:
+                    container_action(pt_cfg, c.env_id, c.id, verb)
+                except Exception as e:
+                    errors.append(f"{c.name}: {e}")
+        if errors:
+            console.print(f"[red]✗[/] {s.name} — partial failure:")
+            for err in errors:
+                console.print(f"    [dim]{err}[/]")
+        else:
+            console.print(f"[green]✓[/] {s.name} — {verb} issued ({s.total} container(s))")
+
+
+@docker_app.command("start")
+def docker_start(
+    selector: str = typer.Argument(..., help="Container or stack name (substring match)"),
+    env: str | None = typer.Option(None, "--env", "-e", help="Scope to a specific environment"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation"),
+) -> None:
+    """Start a container or Compose stack (matched by name)."""
+    _docker_action(selector, env, yes, "start")
+
+
+@docker_app.command("stop")
+def docker_stop(
+    selector: str = typer.Argument(..., help="Container or stack name (substring match)"),
+    env: str | None = typer.Option(None, "--env", "-e", help="Scope to a specific environment"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation"),
+) -> None:
+    """Stop a container or Compose stack (matched by name)."""
+    _docker_action(selector, env, yes, "stop")
+
+
+@docker_app.command("restart")
+def docker_restart(
+    selector: str = typer.Argument(..., help="Container or stack name (substring match)"),
+    env: str | None = typer.Option(None, "--env", "-e", help="Scope to a specific environment"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation"),
+) -> None:
+    """Restart a container or Compose stack (matched by name).
+
+    Stacks are restarted via stop → start. Containers use the Docker restart API.
+    """
+    _docker_action(selector, env, yes, "restart")
+
+
+@docker_app.command("images")
+def docker_images(
+    env: str | None = typer.Option(None, "--env", "-e", help="Filter by environment name"),
+    dangling: bool = typer.Option(False, "--dangling", "-d", help="Show only dangling (untagged) images"),
+) -> None:
+    """List images across all Portainer environments."""
+    cfg = _load()
+    pt_cfg = _require_portainer(cfg)
+
+    from lib.portainer import fetch_environments, fetch_images
+    with console.status("[bold]Fetching images…[/]"):
+        envs = fetch_environments(pt_cfg)
+        rows = []
+        for e in envs:
+            if env and env.lower() not in e.name.lower():
+                continue
+            if e.status != 1:
+                continue
+            rows.extend(fetch_images(pt_cfg, e.id, e.name))
+
+    if dangling:
+        rows = [img for img in rows if img.dangling]
+
+    from rich.table import Table
+    table = Table(show_header=True, header_style="bold", box=None)
+    table.add_column("Environment", style="dim")
+    table.add_column("Image")
+    table.add_column("Size", justify="right")
+    table.add_column("Created", style="dim")
+
+    for img in sorted(rows, key=lambda x: (x.env_name, x.display_name)):
+        size_str = _fmt_bytes(img.size) if img.size else "—"
+        created_str = datetime.fromtimestamp(img.created).strftime("%Y-%m-%d") if img.created else "—"
+        name = f"[yellow]{img.display_name}[/]" if img.dangling else img.display_name
+        table.add_row(img.env_name, name, size_str, created_str)
+
+    console.print(table)
+    total = sum(img.size for img in rows)
+    console.print(f"\n[dim]{len(rows)} image(s), {_fmt_bytes(total)} total[/]")
+
+
+@docker_app.command("volumes")
+def docker_volumes(
+    env: str | None = typer.Option(None, "--env", "-e", help="Filter by environment name"),
+) -> None:
+    """List volumes across all Portainer environments."""
+    cfg = _load()
+    pt_cfg = _require_portainer(cfg)
+
+    from lib.portainer import fetch_environments, fetch_volumes
+    with console.status("[bold]Fetching volumes…[/]"):
+        envs = fetch_environments(pt_cfg)
+        rows = []
+        for e in envs:
+            if env and env.lower() not in e.name.lower():
+                continue
+            if e.status != 1:
+                continue
+            rows.extend(fetch_volumes(pt_cfg, e.id, e.name))
+
+    from rich.table import Table
+    table = Table(show_header=True, header_style="bold", box=None)
+    table.add_column("Environment", style="dim")
+    table.add_column("Volume")
+    table.add_column("Driver", style="dim")
+    table.add_column("Created", style="dim")
+
+    for v in sorted(rows, key=lambda x: (x.env_name, x.name)):
+        created_str = v.created[:10] if v.created else "—"
+        table.add_row(v.env_name, v.name, v.driver, created_str)
+
+    console.print(table)
+    console.print(f"\n[dim]{len(rows)} volume(s)[/]")
+
+
+@docker_app.command("prune")
+def docker_prune(
+    env: str | None = typer.Option(None, "--env", "-e", help="Scope to a specific environment"),
+    volumes: bool = typer.Option(True, "--volumes/--no-volumes", help="Prune orphaned volumes"),
+    images: bool = typer.Option(True, "--images/--no-images", help="Prune dangling images"),
+    all_images: bool = typer.Option(False, "--all-images", help="Also prune unused (not just dangling) images"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation"),
+) -> None:
+    """Remove orphaned volumes and dangling images across all Portainer environments.
+
+    By default prunes both unused volumes and dangling (untagged) images.
+    Use [bold]--all-images[/] to also remove images not referenced by any container.
+    """
+    cfg = _load()
+    pt_cfg = _require_portainer(cfg)
+
+    from lib.portainer import fetch_environments, prune_volumes, prune_images
+    with console.status("[bold]Fetching environments…[/]"):
+        envs = fetch_environments(pt_cfg)
+
+    target_envs = [e for e in envs if e.status == 1]
+    if env:
+        target_envs = [e for e in target_envs if env.lower() in e.name.lower()]
+
+    if not target_envs:
+        console.print("[yellow]No active environments matched.[/]")
+        raise typer.Exit(1)
+
+    # Summarise what will happen
+    actions = []
+    if volumes:
+        actions.append("orphaned volumes")
+    if images:
+        label = "all unused images" if all_images else "dangling (untagged) images"
+        actions.append(label)
+
+    if not actions:
+        console.print("[yellow]Nothing to prune (both --no-volumes and --no-images were set).[/]")
+        raise typer.Exit(0)
+
+    console.print(f"\nWill prune [bold]{', '.join(actions)}[/] on:")
+    for e in target_envs:
+        console.print(f"  [cyan]•[/] {e.name}")
+
+    if not yes and not Confirm.ask("\nProceed?"):
+        raise typer.Exit(0)
+
+    console.print("")
+    total_vols = total_imgs = 0
+    total_bytes = 0
+
+    for e in target_envs:
+        if volumes:
+            try:
+                with console.status(f"Pruning volumes on [bold]{e.name}[/]…"):
+                    n, b = prune_volumes(pt_cfg, e.id)
+                console.print(f"[green]✓[/] {e.name} volumes  — {n} removed, {_fmt_bytes(b)} reclaimed")
+                total_vols += n
+                total_bytes += b
+            except Exception as ex:
+                console.print(f"[red]✗[/] {e.name} volumes  — {ex}")
+
+        if images:
+            try:
+                with console.status(f"Pruning images on [bold]{e.name}[/]…"):
+                    n, b = prune_images(pt_cfg, e.id, all_unused=all_images)
+                console.print(f"[green]✓[/] {e.name} images   — {n} removed, {_fmt_bytes(b)} reclaimed")
+                total_imgs += n
+                total_bytes += b
+            except Exception as ex:
+                console.print(f"[red]✗[/] {e.name} images   — {ex}")
+
+    console.print(
+        f"\n[bold]Total:[/] {total_vols} volume(s) + {total_imgs} image(s) removed, "
+        f"[green]{_fmt_bytes(total_bytes)}[/] reclaimed"
+    )
+
+
 # ── tree ──────────────────────────────────────────────────────────────────────
 
 # Aliases shown inline in tree: {group_name: {canonical_cmd: alias}}
