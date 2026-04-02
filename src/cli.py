@@ -63,6 +63,11 @@ from screens.scripts import _find_scripts, _get_script_description
 
 console = Console()
 
+# ── Feature flags ─────────────────────────────────────────────────────────────
+# Set to True to allow Radarr/Sonarr search commands (missing, search-today,
+# and the interactive pipeline search action) to actually fire indexer searches.
+# Disabled by default to prevent accidental indexer hammering.
+ENABLE_ARR_SEARCH: bool = False
 
 # ── Output format enum ────────────────────────────────────────────────────────
 
@@ -3515,7 +3520,7 @@ def _pipeline_interactive_menu(cfg, arr_record, plex_match, is_movie) -> None:
     arr_cfg = cfg.radarr if is_movie else cfg.sonarr
     actions: list[tuple[str, str]] = []
 
-    if arr_record is not None and arr_cfg is not None:
+    if ENABLE_ARR_SEARCH and arr_record is not None and arr_cfg is not None:
         if isinstance(arr_record, ArrMovieRecord) and not arr_record.has_file and arr_record.monitored:
             actions.append(("search", "Search for missing movie in Radarr"))
         elif (
@@ -3775,6 +3780,9 @@ def radarr_search_missing_cmd(
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation prompt"),
 ) -> None:
     """Search for all missing movies."""
+    if not ENABLE_ARR_SEARCH:
+        console.print("[yellow]⚑[/] Arr search is disabled (ENABLE_ARR_SEARCH=False).")
+        raise typer.Exit(0)
     if not yes:
         if not Confirm.ask("Trigger missing movies search? (may be slow)"):
             raise typer.Exit(0)
@@ -3839,6 +3847,9 @@ def sonarr_search_missing_cmd(
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation prompt"),
 ) -> None:
     """Search for all missing monitored episodes."""
+    if not ENABLE_ARR_SEARCH:
+        console.print("[yellow]⚑[/] Arr search is disabled (ENABLE_ARR_SEARCH=False).")
+        raise typer.Exit(0)
     if not yes:
         if not Confirm.ask("Trigger missing episodes search? (may be slow)"):
             raise typer.Exit(0)
@@ -4462,6 +4473,9 @@ def media_search_today_cmd(
     MoviesSearch command and one EpisodeSearch command.  Uses the search-state
     cooldown so re-running within the cooldown window won't hammer indexers.
     """
+    if not ENABLE_ARR_SEARCH:
+        console.print("[yellow]⚑[/] Arr search is disabled (ENABLE_ARR_SEARCH=False).")
+        raise typer.Exit(0)
     cfg = _load()
     today = _date.today()
     search_state = _load_search_state(cfg.config_path)
