@@ -291,12 +291,19 @@ def enrich_tv_seasons(cfg: SeerrConfig, result: SeerrSearchResult) -> None:
             if s.get("status") == 5
         )
 
-        # Requested seasons come from the latest request inside mediaInfo
+        # Requested seasons: prefer explicit request object; fall back to seasons
+        # that Seerr is actively tracking (status > 1 = anything beyond "unknown").
+        # This handles the case where a request was already fulfilled and no longer
+        # appears in the requests list.
         requests = media_info.get("requests") or []
         if requests:
             req_season_nums = {s["seasonNumber"] for s in (requests[0].get("seasons") or [])}
             result.seasons_requested = len(req_season_nums)
             result.episodes_requested = sum(ep_count.get(n, 0) for n in req_season_nums)
+        elif seerr_seasons:
+            active_nums = {s["seasonNumber"] for s in seerr_seasons if s.get("status", 1) > 1}
+            result.seasons_requested = len(active_nums)
+            result.episodes_requested = sum(ep_count.get(n, 0) for n in active_nums)
     except Exception:
         pass
 

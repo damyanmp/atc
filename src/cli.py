@@ -3262,7 +3262,7 @@ def _stage_seerr(r) -> tuple[str, str, str, str]:
     def _season_str(progress: bool = False) -> str:
         """Season count label for TV shows.
 
-        progress=True  → "avail/total seasons · avail_eps/req_eps eps"
+        progress=True  → "avail/total seasons · avail_eps/req_eps eps" (zeros suppressed)
         progress=False → "req seasons · req_eps eps" (what entered the pipeline)
         Falls back gracefully when counts aren't populated yet.
         """
@@ -3270,10 +3270,18 @@ def _stage_seerr(r) -> tuple[str, str, str, str]:
             return ""
         parts: list[str] = []
         if progress:
-            if r.seasons_total:
-                parts.append(f"{r.seasons_available}/{r.seasons_total} seasons")
+            if r.seasons_requested:
+                # We know exactly which seasons were requested
+                if r.seasons_available > 0:
+                    parts.append(f"{r.seasons_available}/{r.seasons_requested} seasons")
+                else:
+                    n = r.seasons_requested
+                    parts.append(f"{n} season{'s' if n != 1 else ''} requested")
+            elif r.seasons_total:
+                # Only total is known — show it without implying it was all requested
+                parts.append(f"{r.seasons_total} seasons tracked")
             req_eps = r.episodes_requested or r.episodes_total
-            if req_eps:
+            if req_eps and r.episodes_available > 0:
                 parts.append(f"{r.episodes_available}/{req_eps} eps")
         else:
             n_seasons = r.seasons_requested or r.seasons_total
