@@ -93,6 +93,8 @@ class UpdateTarget:
     name: str       # display name (e.g. "viggen")
     host: str       # IP or hostname to SSH into
     user: str = "root"
+    update_cmd: str | None = None       # custom post-apt command
+    update_cmd_headless: bool = False   # if True, stream output; if False, hand off PTY
 
 
 async def run_update(

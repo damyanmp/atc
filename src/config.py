@@ -64,13 +64,20 @@ class ProxmoxClusterConfig:
 
 
 @dataclass
+class GuestUpdateCmd:
+    cmd: str
+    headless: bool = False
+
+
+@dataclass
 class SSHConfig:
     default_user: str = "root"
     key_file: str = "~/.ssh/id_rsa"
     connect_timeout: int = 10
     node_host_pattern: str = "{name}"  # e.g. "pve-{name}.local.example.com"
     verify_host_keys: bool = False     # set True to enforce ~/.ssh/known_hosts checking
-    guest_users: dict = field(default_factory=dict)  # guest name → ssh user
+    guest_users: dict = field(default_factory=dict)                      # guest name → ssh user
+    guest_update_cmds: dict = field(default_factory=dict)                # guest name → GuestUpdateCmd
 
     @property
     def expanded_key_file(self) -> str:
@@ -81,6 +88,9 @@ class SSHConfig:
 
     def guest_user(self, guest_name: str) -> str | None:
         return self.guest_users.get(guest_name)
+
+    def guest_update_cmd(self, guest_name: str) -> "GuestUpdateCmd | None":
+        return self.guest_update_cmds.get(guest_name)
 
 
 # ── Monitoring ────────────────────────────────────────────────────────────────
@@ -371,6 +381,22 @@ def load_config(config_path: Path | None = None) -> Config:
     if sidecar.exists():
         with open(sidecar) as _f:
             guest_users.update(yaml.safe_load(_f) or {})
+    # guest_update_cmds: optional sidecar for per-guest custom update commands
+    # Supports both plain string ("update") and dict ({cmd: ..., headless: true})
+    def _parse_update_cmds(raw_dict: dict) -> dict:
+        out = {}
+        for name, val in raw_dict.items():
+            if isinstance(val, str):
+                out[name] = GuestUpdateCmd(cmd=val)
+            elif isinstance(val, dict):
+                out[name] = GuestUpdateCmd(cmd=val["cmd"], headless=bool(val.get("headless", False)))
+        return out
+
+    guest_update_cmds: dict[str, GuestUpdateCmd] = _parse_update_cmds(ssh_raw.get("guest_update_cmds", {}))
+    cmds_sidecar = config_path.parent / "guest_update_cmds.yaml"
+    if cmds_sidecar.exists():
+        with open(cmds_sidecar) as _f:
+            guest_update_cmds.update(_parse_update_cmds(yaml.safe_load(_f) or {}))
     ssh = SSHConfig(
         default_user=ssh_raw.get("default_user", "root"),
         key_file=ssh_raw.get("key_file", "~/.ssh/id_rsa"),
@@ -378,6 +404,7 @@ def load_config(config_path: Path | None = None) -> Config:
         node_host_pattern=ssh_raw.get("node_host_pattern", "{name}"),
         verify_host_keys=bool(ssh_raw.get("verify_host_keys", False)),
         guest_users=guest_users,
+        guest_update_cmds=guest_update_cmds,
     )
 
     # Beszel
@@ -607,6 +634,18 @@ def save_guest_user(config_path: Path, guest_name: str, user: str) -> None:
         with open(sidecar) as f:
             data = yaml.safe_load(f) or {}
     data[guest_name] = user
+    with open(sidecar, "w") as f:
+        yaml.dump(data, f, default_flow_style=False)
+
+
+def save_guest_update_cmd(config_path: Path, guest_name: str, cmd: str, headless: bool = False) -> None:
+    """Persist a guest→update-command mapping to the guest_update_cmds.yaml sidecar file."""
+    sidecar = config_path.parent / "guest_update_cmds.yaml"
+    data: dict = {}
+    if sidecar.exists():
+        with open(sidecar) as f:
+            data = yaml.safe_load(f) or {}
+    data[guest_name] = {"cmd": cmd, "headless": headless}
     with open(sidecar, "w") as f:
         yaml.dump(data, f, default_flow_style=False)
 

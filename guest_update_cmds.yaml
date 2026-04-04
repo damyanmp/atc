@@ -1,0 +1,15 @@
+pihole:
+  cmd: pihole updatePihole --unattended
+  headless: true
+plex:
+  cmd: update
+  headless: false
+postgresql:
+  cmd: update
+  headless: false
+postgress:
+  cmd: update
+  headless: false
+uptimekuma:
+  cmd: update
+  headless: false

@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import getpass
 import json as _json
+import subprocess
 import sys
 import time
 from datetime import datetime
@@ -26,7 +27,7 @@ sys.path.insert(0, str(Path(__file__).parent / "lib"))
 from config import (
     Config, load_config,
     secret_set, secret_delete, secret_verify, secret_repair, secrets_scan_config, secrets_list,
-    save_guest_user,
+    save_guest_user, save_guest_update_cmd,
     KEYCHAIN_SERVICE,
 )
 from lib.pihole import (
@@ -995,10 +996,13 @@ def run_update_hosts(
             )
             save_guest_user(cfg.config_path, g.name, user)
             cfg.ssh.guest_users[g.name] = user
+        custom = cfg.ssh.guest_update_cmd(g.name)
         targets.append(UpdateTarget(
             name=f"{g.name} [dim]({'lxc' if g.type == 'lxc' else 'vm'} #{g.vmid} @ {g.node})[/dim]",
             host=ips[g.name] or g.name,
             user=user,
+            update_cmd=custom.cmd if custom else None,
+            update_cmd_headless=custom.headless if custom else False,
         ))
 
     if targets:
@@ -1197,6 +1201,32 @@ def update_hosts(
     run_update_hosts(selector, label, yes, verbose)
 
 
+@update_app.command("set-cmd")
+def update_set_cmd(
+    guest: str = typer.Argument(..., help="Guest name (must match exactly, e.g. 'pihole')"),
+    cmd: str = typer.Argument(..., help="Custom update command to run after apt (e.g. 'update')"),
+    headless: bool = typer.Option(False, "--headless", help="Stream output instead of handing off a PTY"),
+) -> None:
+    """Register a custom post-apt update command for a guest.
+
+    Community-script LXCs (Pi-hole, AdGuard, etc.) ship their own updater
+    that refreshes both packages and the project repo. Register it here so
+    [bold]atc update hosts[/] runs it after the normal apt pass.
+
+    Use [bold]--headless[/] when the script supports unattended mode (no TUI wizard),
+    so atc streams the output inline instead of handing off the terminal.
+
+    Example:
+      [cyan]atc update set-cmd pihole "pihole updatePihole --unattended" --headless[/]
+      [cyan]atc update set-cmd adguard update[/]   [dim]# interactive TUI — no flag[/]
+    """
+    cfg = _load()
+    save_guest_update_cmd(cfg.config_path, guest, cmd, headless=headless)
+    mode = "[green]headless[/] (streamed)" if headless else "[yellow]interactive[/] (PTY handoff)"
+    console.print(f"[green]✓[/] Saved: [cyan]{guest}[/] → [bold]{cmd}[/] ({mode})")
+    console.print(f"[dim]Next [bold]atc update hosts {guest}[/bold] will run apt, then [bold]{cmd}[/bold].[/]")
+
+
 def _parse_exit(lines: list[str]) -> bool:
     """Return True if the update command exited 0 (reads __ATC_EXIT__:N marker)."""
     for line in reversed(lines):
@@ -1208,7 +1238,12 @@ def _parse_exit(lines: list[str]) -> bool:
 def _confirm_and_update(targets: list[UpdateTarget], cfg: Config, yes: bool, verbose: bool = False) -> None:
     console.print("\nTargets to update:")
     for t in targets:
-        console.print(f"  [cyan]•[/] {t.name}")
+        if t.update_cmd:
+            mode = "headless" if t.update_cmd_headless else "interactive"
+            extra = f" [dim]+ [cyan]{t.update_cmd}[/cyan] ({mode})[/dim]"
+        else:
+            extra = ""
+        console.print(f"  [cyan]•[/] {t.name}{extra}")
 
     if not yes:
         if not Confirm.ask(f"\nRun apt upgrade on {len(targets)} target(s)?"):
@@ -1290,29 +1325,92 @@ def _confirm_and_update(targets: list[UpdateTarget], cfg: Config, yes: bool, ver
                     results.append((target, success, needs_reboot, failed_units, lines2))
 
     asyncio.run(_run_all())
-    _print_update_summary(results, cfg)
+
+    # Phase 2 — run custom update commands (headless streamed or interactive PTY)
+    # Maps plain guest name → exit code
+    custom_results: dict[str, int] = {}
+    custom_targets = [t for t in targets if t.update_cmd]
+
+    async def _run_headless_custom(t: UpdateTarget) -> int:
+        """Stream a headless custom command, return exit code."""
+        cmd = f"{{ TERM=xterm-256color {t.update_cmd}; }} 2>&1; echo {_EXIT_MARKER}:$?"
+        if t.user != "root":
+            cmd = f'sudo bash -c "{cmd}"'
+        lines: list[str] = []
+        async for line in stream_command(t.host, cmd, cfg.ssh, user=t.user):
+            lines.append(line)
+            if not line.startswith(_EXIT_MARKER):
+                short = line.strip()[:70]
+                if short:
+                    console.print(f"  [dim]{short}[/]")
+        return 0 if _parse_exit(lines) else 1
+
+    if custom_targets:
+        headless = [t for t in custom_targets if t.update_cmd_headless]
+        interactive = [t for t in custom_targets if not t.update_cmd_headless]
+
+        if headless:
+            console.print(f"\n[bold]Running headless custom update(s) on {len(headless)} host(s)…[/bold]")
+            for t in headless:
+                guest_name = Text.from_markup(t.name).plain
+                console.rule(f"[bold]{guest_name}[/] — [cyan]{t.update_cmd}[/]")
+                rc = asyncio.run(_run_headless_custom(t))
+                custom_results[guest_name] = rc
+                icon = "✅" if rc == 0 else "❌"
+                console.rule(f"{icon} [bold]{guest_name}[/] — [cyan]{t.update_cmd}[/] done")
+
+        if interactive:
+            console.print(
+                f"\n[bold]Running interactive custom update(s) on "
+                f"{len(interactive)} host(s) — terminal handed off for each:[/bold]"
+            )
+            for t in interactive:
+                guest_name = Text.from_markup(t.name).plain
+                console.rule(f"[bold]{guest_name}[/] — [cyan]{t.update_cmd}[/]")
+                ssh_args = ["ssh"]
+                key = cfg.ssh.expanded_key_file
+                if key:
+                    ssh_args += ["-i", key]
+                if not cfg.ssh.verify_host_keys:
+                    ssh_args += ["-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null"]
+                ssh_args += ["-t", f"{t.user}@{t.host}", f"TERM=xterm-256color {t.update_cmd}"]
+                proc = subprocess.run(ssh_args)
+                custom_results[guest_name] = proc.returncode
+                icon = "✅" if proc.returncode == 0 else "❌"
+                console.rule(f"{icon} [bold]{guest_name}[/] — [cyan]{t.update_cmd}[/] done")
+
+    _print_update_summary(results, cfg, custom_results=custom_results)
 
 
 def _print_update_summary(
     results: list[tuple[UpdateTarget, bool, bool, list[str], list[str]]],
     cfg: Config,
+    custom_results: dict[str, int] | None = None,
 ) -> None:
+    custom_results = custom_results or {}
+    has_custom = any(t.update_cmd for t, *_ in results)
+
     table = Table(title="Update Summary", box=box.ROUNDED)
     table.add_column("Guest", style="cyan")
     table.add_column("IP")
-    table.add_column("Result", justify="center")
+    table.add_column("apt", justify="center")
+    if has_custom:
+        table.add_column("custom cmd", justify="center")
     table.add_column("Reboot", justify="center")
     table.add_column("Failed Units")
 
     for target, success, needs_reboot, failed_units, _lines in results:
         guest_name = Text.from_markup(target.name).plain
-        table.add_row(
-            guest_name,
-            target.host,
-            "✅" if success and not failed_units else "❌",
-            "⚠️  yes" if needs_reboot else "—",
-            ", ".join(failed_units) if failed_units else "—",
-        )
+        apt_icon = "✅" if success and not failed_units else "❌"
+        row = [guest_name, target.host, apt_icon]
+        if has_custom:
+            if target.update_cmd:
+                rc = custom_results.get(guest_name)
+                row.append("✅" if rc == 0 else ("❌" if rc is not None else "—"))
+            else:
+                row.append("—")
+        row += ["⚠️  yes" if needs_reboot else "—", ", ".join(failed_units) if failed_units else "—"]
+        table.add_row(*row)
 
     console.print()
     console.print(table)
