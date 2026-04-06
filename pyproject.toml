@@ -18,7 +18,6 @@ dependencies = [
 
 [project.scripts]
 atc = "src.main:main"
-nasa = "src.nasa:main"
 
 [build-system]
 requires = ["hatchling"]
