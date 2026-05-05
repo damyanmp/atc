@@ -1,16 +1,16 @@
-"""Update screen — select targets and stream apt-get upgrade output."""
+"""Update screen — dry-run first, then explicit confirm before apt upgrade."""
 from __future__ import annotations
 
 import sys
 from pathlib import Path
+from typing import Literal
 
 from textual import work
 from textual.app import ComposeResult
-from textual.containers import Horizontal, Vertical, ScrollableContainer
+from textual.containers import Horizontal, Vertical
 from textual.screen import Screen
 from textual.widgets import (
-    Button, Checkbox, DataTable, Footer, Header, Label,
-    Log, Static, SelectionList
+    Footer, Header, Log, Static, SelectionList
 )
 from textual.widgets.selection_list import Selection
 
@@ -19,14 +19,17 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "lib"))
 
 from config import Config
 from lib.proxmox import ClusterStatus, fetch_cluster_status
-from lib.ssh import UpdateTarget, run_update
+from lib.ssh import UpdateTarget, run_dry_run, run_update
+
+_Phase = Literal["idle", "dry_running", "awaiting_confirm", "applying", "done"]
 
 
 class UpdateScreen(Screen):
     BINDINGS = [
         ("escape", "app.pop_screen", "Back"),
-        ("ctrl+a", "select_all", "Select All"),
+        ("ctrl+a", "select_all",   "Select All"),
         ("ctrl+n", "deselect_all", "Deselect All"),
+        ("ctrl+r", "run_updates",  "Run / Confirm"),
     ]
 
     DEFAULT_CSS = """
@@ -48,14 +51,6 @@ class UpdateScreen(Screen):
         height: 1fr;
         border: round $accent;
     }
-    #controls {
-        height: auto;
-        layout: horizontal;
-        margin-top: 1;
-    }
-    #controls Button {
-        margin-right: 1;
-    }
     #output-log {
         height: 1fr;
         border: round $accent;
@@ -75,7 +70,7 @@ class UpdateScreen(Screen):
         super().__init__()
         self.config = config
         self._cluster = cluster
-        self._running = False
+        self._phase: _Phase = "idle"
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -83,9 +78,6 @@ class UpdateScreen(Screen):
             with Vertical(id="left-panel"):
                 yield Static("Select Update Targets", classes="section-label")
                 yield SelectionList(id="target-list")
-                with Horizontal(id="controls"):
-                    yield Button("▶  Run Updates", id="run-btn", variant="success")
-                    yield Button("✕ Back", id="back-btn", variant="default")
             with Vertical(id="right-panel"):
                 yield Static("Output", classes="section-label")
                 yield Log(id="output-log", highlight=True)
@@ -104,14 +96,12 @@ class UpdateScreen(Screen):
             self._load_cluster()
             return
 
-        # Add LXC section
         lxcs = [g for g in self._cluster.guests if g.type == "lxc" and g.status == "running"]
         if lxcs:
             sel.add_option(Selection("── LXC Containers ──", "lxc-header", disabled=True))
             for ct in sorted(lxcs, key=lambda g: g.name):
                 sel.add_option(Selection(f"  📦 {ct.name}  [{ct.node}]", f"lxc:{ct.name}:{ct.node}"))
 
-        # Add VM section
         vms = [g for g in self._cluster.guests if g.type == "qemu" and g.status == "running"]
         if vms:
             sel.add_option(Selection("── Virtual Machines ──", "vm-header", disabled=True))
@@ -123,19 +113,18 @@ class UpdateScreen(Screen):
         self._cluster = await fetch_cluster_status(self.config.proxmox)
         self._populate_targets()
 
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "run-btn":
-            self._start_updates()
-        elif event.button.id == "back-btn":
-            self.app.pop_screen()
+    def action_run_updates(self) -> None:
+        if self._phase == "idle":
+            self._start_dry_run()
+        elif self._phase == "awaiting_confirm":
+            self._apply_updates()
+        # dry_running / applying / done: ignore keypress
 
     def action_select_all(self) -> None:
-        sel = self.query_one("#target-list", SelectionList)
-        sel.select_all()
+        self.query_one("#target-list", SelectionList).select_all()
 
     def action_deselect_all(self) -> None:
-        sel = self.query_one("#target-list", SelectionList)
-        sel.deselect_all()
+        self.query_one("#target-list", SelectionList).deselect_all()
 
     def _get_selected_targets(self) -> list[UpdateTarget]:
         sel = self.query_one("#target-list", SelectionList)
@@ -144,8 +133,6 @@ class UpdateScreen(Screen):
             parts = str(value).split(":")
             if len(parts) == 3:
                 _, name, node = parts
-                # Look up IP from cluster — guests only have name/node from Proxmox API
-                # The user must configure SSH access; we use name as hostname fallback
                 host = self._resolve_host(name)
                 targets.append(UpdateTarget(
                     name=name,
@@ -155,34 +142,86 @@ class UpdateScreen(Screen):
         return targets
 
     def _resolve_host(self, name: str) -> str:
-        """Try to resolve a guest name to an IP. Falls back to name (relies on DNS/hosts)."""
-        # In most homelabs, the hostname is resolvable via Pi-hole/DNS
-        # Future: could look up IP from Proxmox guest agent
         return name
 
+    # ── Phase 1: dry-run ──────────────────────────────────────────────────────
+
     @work(exclusive=True)
-    async def _start_updates(self) -> None:
-        if self._running:
-            return
+    async def _start_dry_run(self) -> None:
         targets = self._get_selected_targets()
         if not targets:
             self.query_one("#summary", Static).update("⚠️  No targets selected.")
             return
 
-        self._running = True
+        self._phase = "dry_running"
         log = self.query_one("#output-log", Log)
         log.clear()
-        self.query_one("#summary", Static).update(f"⏳ Updating {len(targets)} target(s)…")
-        self.query_one("#run-btn", Button).disabled = True
+        self.query_one("#summary", Static).update(
+            f"🔍  Simulating upgrade on {len(targets)} target(s)… (no changes applied)"
+        )
+
+        any_upgrades = False
+        for target in targets:
+            log.write_line(f"\n{'─'*50}")
+            log.write_line(f"🔍  Dry-run: {target.name} ({target.host})")
+            log.write_line(f"{'─'*50}")
+
+            pkg_lines: list[str] = []
+
+            def on_line(line: str, t=target) -> None:
+                # Highlight lines that show packages that would be upgraded
+                if line.startswith("Inst ") or line.startswith("Remv "):
+                    self.app.call_from_thread(log.write_line, f"  [yellow]{line}[/yellow]")
+                    pkg_lines.append(line)
+                elif line.strip():
+                    self.app.call_from_thread(log.write_line, f"  {line}")
+
+            result = await run_dry_run(target, self.config.ssh, on_line=on_line)
+
+            if result.success and pkg_lines:
+                any_upgrades = True
+                log.write_line(f"  → {len(pkg_lines)} package(s) would be upgraded")
+            elif result.success:
+                log.write_line("  ✅  Already up to date")
+            else:
+                log.write_line("  ❌  Dry-run failed — check SSH access")
+
+        self._phase = "awaiting_confirm"
+
+        if any_upgrades:
+            self.query_one("#summary", Static).update(
+                "⚠️  Upgrades available above.  "
+                "Press [bold]Ctrl+R[/bold] to apply  |  [bold]Escape[/bold] to cancel"
+            )
+        else:
+            self.query_one("#summary", Static).update(
+                "✅  All targets up to date — nothing to apply."
+            )
+            self._phase = "done"
+
+    # ── Phase 2: apply ────────────────────────────────────────────────────────
+
+    @work(exclusive=True)
+    async def _apply_updates(self) -> None:
+        targets = self._get_selected_targets()
+        if not targets:
+            self._phase = "idle"
+            return
+
+        self._phase = "applying"
+        log = self.query_one("#output-log", Log)
+        log.clear()
+        self.query_one("#summary", Static).update(
+            f"⏳  Applying upgrade on {len(targets)} target(s)…"
+        )
 
         results = []
         for target in targets:
             log.write_line(f"\n{'─'*50}")
-            log.write_line(f"🔄  Updating {target.name} ({target.host})…")
+            log.write_line(f"🔄  Upgrading {target.name} ({target.host})…")
             log.write_line(f"{'─'*50}")
 
             def on_line(line: str, t=target) -> None:
-                # Strip ANSI for cleaner display
                 self.app.call_from_thread(log.write_line, f"  {line}")
 
             result = await run_update(target, self.config.ssh, on_line=on_line)
@@ -196,5 +235,4 @@ class UpdateScreen(Screen):
         if fail:
             summary += f"  ❌ {fail} failed"
         self.query_one("#summary", Static).update(summary)
-        self.query_one("#run-btn", Button).disabled = False
-        self._running = False
+        self._phase = "done"

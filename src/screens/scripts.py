@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import asyncio
 import os
-import subprocess
 import sys
 from pathlib import Path
 
@@ -12,7 +11,7 @@ from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.screen import Screen
 from textual.widgets import (
-    Button, Footer, Header, Label, ListItem, ListView, Log, Static
+    Footer, Header, Label, ListItem, ListView, Log, Static
 )
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -37,15 +36,24 @@ def _get_script_description(path: Path) -> str:
 
 
 def _find_scripts(scripts_dir: Path) -> list[Path]:
-    """Recursively find all *.sh files, excluding .venv and hidden dirs."""
+    """Recursively find all *.sh files, excluding hidden dirs, .venv, and symlinked dirs.
+
+    Uses os.walk with followlinks=False so symlinked directories (e.g. notes/ → Obsidian
+    vault) are not traversed — rglob would scan the entire vault before returning.
+    """
+    _SKIP = {"__pycache__", ".venv"}
     found = []
-    for p in sorted(scripts_dir.rglob("*.sh")):
-        # Skip hidden dirs and virtual envs
-        parts = p.parts
-        if any(part.startswith(".") or part == "__pycache__" or part == ".venv" for part in parts):
-            continue
-        found.append(p)
-    return found
+    for root, dirs, files in os.walk(scripts_dir, followlinks=False):
+        # Prune dirs in-place so os.walk doesn't descend into them
+        dirs[:] = sorted(
+            d for d in dirs
+            if not d.startswith(".") and d not in _SKIP
+        )
+        root_path = Path(root)
+        for fname in files:
+            if fname.endswith(".sh"):
+                found.append(root_path / fname)
+    return sorted(found)
 
 
 class ScriptItem(ListItem):
@@ -82,14 +90,6 @@ class ScriptsScreen(Screen):
         height: 1fr;
         border: round $accent;
     }
-    #controls {
-        height: auto;
-        layout: horizontal;
-        margin-top: 1;
-    }
-    #controls Button {
-        margin-right: 1;
-    }
     #output-log {
         height: 1fr;
         border: round $accent;
@@ -118,28 +118,33 @@ class ScriptsScreen(Screen):
             with Vertical(id="left-panel"):
                 yield Static("Repo Scripts", classes="section-label")
                 yield ListView(id="script-list")
-                with Horizontal(id="controls"):
-                    yield Button("▶  Run", id="run-btn", variant="success")
-                    yield Button("✕ Back", id="back-btn", variant="default")
             with Vertical(id="right-panel"):
                 yield Static("Output", classes="section-label")
-                yield Static("Select a script and press Run (or Enter)", id="script-info")
+                yield Static("Select a script and press Enter to run", id="script-info")
                 yield Log(id="output-log", highlight=True)
         yield Footer()
 
     def on_mount(self) -> None:
-        self._load_scripts()
+        self.call_after_refresh(self._load_scripts)
 
     def _load_scripts(self) -> None:
-        scripts_dir = self.config.resolved_scripts_dir
-        self._scripts = _find_scripts(scripts_dir)
-        lv = self.query_one("#script-list", ListView)
-        lv.clear()
-        if not self._scripts:
-            lv.append(ListItem(Label(f"  No scripts found in\n  {scripts_dir}")))
-        else:
-            for path in self._scripts:
-                lv.append(ScriptItem(path, scripts_dir))
+        try:
+            scripts_dir = self.config.resolved_scripts_dir
+            self._scripts = _find_scripts(scripts_dir)
+            lv = self.query_one("#script-list", ListView)
+            lv.clear()
+            if not self._scripts:
+                lv.append(ListItem(Label(f"  No scripts found in\n  {scripts_dir}")))
+            else:
+                for path in self._scripts:
+                    lv.append(ScriptItem(path, scripts_dir))
+        except Exception as e:
+            try:
+                lv = self.query_one("#script-list", ListView)
+                lv.clear()
+                lv.append(ListItem(Label(f"  [red]Error loading scripts:[/]\n  {e}", markup=True)))
+            except Exception:
+                pass
 
     def on_list_view_highlighted(self, event: ListView.Highlighted) -> None:
         if isinstance(event.item, ScriptItem):
@@ -147,12 +152,6 @@ class ScriptsScreen(Screen):
                 if event.item.script_path.is_relative_to(self.config.resolved_scripts_dir) \
                 else event.item.script_path
             self.query_one("#script-info", Static).update(f"📄 {rel}")
-
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "run-btn":
-            self.action_run_selected()
-        elif event.button.id == "back-btn":
-            self.app.pop_screen()
 
     def action_run_selected(self) -> None:
         lv = self.query_one("#script-list", ListView)
@@ -166,8 +165,6 @@ class ScriptsScreen(Screen):
         self._running = True
         log = self.query_one("#output-log", Log)
         log.clear()
-        self.query_one("#run-btn", Button).disabled = True
-
         rel = path.relative_to(self.config.resolved_scripts_dir) \
             if path.is_relative_to(self.config.resolved_scripts_dir) else path
         log.write_line(f"▶  Running: {rel}")
@@ -193,4 +190,3 @@ class ScriptsScreen(Screen):
             log.write_line(f"❌  Failed to run script: {e}")
         finally:
             self._running = False
-            self.query_one("#run-btn", Button).disabled = False

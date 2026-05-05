@@ -10,10 +10,17 @@ sys.path.insert(0, str(_SRC))
 sys.path.insert(0, str(_SRC / "lib"))
 
 from textual.app import App
+from textual.binding import Binding
 from config import load_config, Config
 from screens.dashboard import DashboardScreen
 from screens.update import UpdateScreen
 from screens.scripts import ScriptsScreen
+from screens.uptimekuma import UptimeKumaScreen
+from screens.seerr import SeerrScreen
+from screens.plex import PlexScreen
+from screens.pihole import PiholeScreen
+from screens.speedtest import SpeedtestScreen
+from screens.arr import ArrScreen
 
 
 class HomelabApp(App):
@@ -27,6 +34,20 @@ class HomelabApp(App):
     Footer { background: $primary-darken-1; }
     """
 
+    # Priority bindings live on the App so they're always active regardless
+    # of which widget has focus or which screen is on top.
+    BINDINGS = [
+        Binding("u", "nav_update",    "Update",    priority=True, show=True),
+        Binding("r", "nav_scripts",   "Scripts",   priority=True, show=True),
+        Binding("k", "nav_kuma",      "Kuma",      priority=True, show=True),
+        Binding("s", "nav_seerr",     "Seerr",     priority=True, show=True),
+        Binding("x", "nav_plex",      "Plex",      priority=True, show=True),
+        Binding("p", "nav_pihole",    "Pi-hole",   priority=True, show=True),
+        Binding("t", "nav_speedtest", "Speedtest", priority=True, show=True),
+        Binding("a", "nav_arr",       "Pipeline",  priority=True, show=True),
+        Binding("q", "quit",          "Quit",      priority=True, show=True),
+    ]
+
     def __init__(self, config: Config) -> None:
         super().__init__()
         self.config = config
@@ -35,7 +56,28 @@ class HomelabApp(App):
         self.install_screen(DashboardScreen(self.config), name="dashboard")
         self.install_screen(UpdateScreen(self.config), name="update")
         self.install_screen(ScriptsScreen(self.config), name="scripts")
+        self.install_screen(UptimeKumaScreen(self.config), name="uptimekuma")
+        self.install_screen(SeerrScreen(self.config), name="seerr")
+        self.install_screen(PlexScreen(self.config), name="plex")
+        self.install_screen(PiholeScreen(self.config), name="pihole")
+        self.install_screen(SpeedtestScreen(self.config), name="speedtest")
+        self.install_screen(ArrScreen(self.config), name="arr")
         self.push_screen("dashboard")
+
+    # ── Navigation actions ────────────────────────────────────────────────────
+    def action_nav_update(self)    -> None: self.push_screen("update")
+    def action_nav_scripts(self)   -> None: self.push_screen("scripts")
+    def action_nav_kuma(self)      -> None: self.push_screen("uptimekuma")
+    def action_nav_seerr(self)     -> None: self.push_screen("seerr")
+    def action_nav_plex(self)      -> None: self.push_screen("plex")
+    def action_nav_pihole(self)    -> None: self.push_screen("pihole")
+    def action_nav_speedtest(self) -> None: self.push_screen("speedtest")
+    def action_nav_arr(self)      -> None: self.push_screen("arr")
+
+    def check_action(self, action: str, parameters: tuple) -> bool | None:
+        if action.startswith("nav_") or action == "quit":
+            return True
+        return super().check_action(action, parameters)
 
 
 def main() -> None:

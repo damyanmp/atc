@@ -54,10 +54,7 @@ class SectionHeader(Static):
 
 class DashboardScreen(Screen):
     BINDINGS = [
-        ("u", "push_screen('update')", "Update"),
-        ("r", "push_screen('scripts')", "Scripts"),
         ("c", "refresh_data", "Refresh"),
-        ("q", "app.quit", "Quit"),
     ]
 
     DEFAULT_CSS = """
@@ -163,7 +160,7 @@ class DashboardScreen(Screen):
             from datetime import datetime
             ts = datetime.now().strftime("%H:%M:%S")
             self.query_one("#status-bar", Static).update(
-                f"✅ Last updated: {ts}  |  [u] Update  [r] Scripts  [c] Refresh  [q] Quit"
+                f"✅ {ts}  |  \[u]Update \[r]Scripts \[k]Kuma \[s]Seerr \[x]Plex \[p]Pi-hole \[t]Speedtest \[a]Pipeline \[c]Refresh \[q]Quit"
             )
         except Exception as e:
             self.query_one("#status-bar", Static).update(f"❌ Error refreshing: {e}")
@@ -286,6 +283,27 @@ class DashboardScreen(Screen):
 
     def action_refresh_data(self) -> None:
         self.refresh_data()
+
+    def action_open_update(self) -> None:
+        self.app.push_screen("update")
+
+    def action_open_scripts(self) -> None:
+        self.app.push_screen("scripts")
+
+    def action_open_kuma(self) -> None:
+        self.app.push_screen("uptimekuma")
+
+    def action_open_seerr(self) -> None:
+        self.app.push_screen("seerr")
+
+    def action_open_plex(self) -> None:
+        self.app.push_screen("plex")
+
+    def action_open_pihole(self) -> None:
+        self.app.push_screen("pihole")
+
+    def action_open_speedtest(self) -> None:
+        self.app.push_screen("speedtest")
 
 
 def _fmt_uptime(seconds: int) -> str:
