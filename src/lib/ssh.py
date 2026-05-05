@@ -87,6 +87,12 @@ UPDATE_COMMAND = (
     "apt-get autoremove -y -q"
 )
 
+# Simulate only — no packages are installed. Used for the dry-run confirmation gate.
+DRY_RUN_COMMAND = (
+    "DEBIAN_FRONTEND=noninteractive apt-get update -q 2>&1 && "
+    "apt-get upgrade --dry-run -q 2>&1"
+)
+
 
 @dataclass
 class UpdateTarget:
@@ -95,6 +101,28 @@ class UpdateTarget:
     user: str = "root"
     update_cmd: str | None = None       # custom post-apt command
     update_cmd_headless: bool = False   # if True, stream output; if False, hand off PTY
+
+
+async def run_dry_run(
+    target: UpdateTarget,
+    ssh_cfg: SSHConfig,
+    on_line: callable | None = None,
+) -> CommandResult:
+    """Simulate apt upgrade — show what would change without installing anything."""
+    lines: list[str] = []
+    async for line in stream_command(target.host, DRY_RUN_COMMAND, ssh_cfg, user=target.user):
+        lines.append(line)
+        if on_line:
+            on_line(line)
+    full_output = "\n".join(lines)
+    failed = any(kw in full_output.lower() for kw in ["error:", "e: "])
+    return CommandResult(
+        host=target.host,
+        name=target.name,
+        exit_code=0 if not failed else 1,
+        stdout=full_output,
+        stderr="",
+    )
 
 
 async def run_update(
