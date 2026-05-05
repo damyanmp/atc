@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from urllib.parse import quote
 
 import httpx
 
@@ -137,15 +138,40 @@ async def set_blocking_all(
 
 # ── Custom DNS ────────────────────────────────────────────────────────────────
 
+def _parse_hosts(raw: list[str]) -> list[dict]:
+    """Convert dnsmasq-style host entries ("ip domain") to {"domain", "ip"} dicts."""
+    out = []
+    for entry in raw:
+        parts = entry.strip().split(None, 1)
+        if len(parts) == 2:
+            out.append({"ip": parts[0], "domain": parts[1]})
+    return out
+
+
 async def list_custom_dns(cfg: PiholeInstanceConfig) -> list[dict]:
-    """Returns list of {"domain": ..., "ip": ...} dicts from the primary."""
-    try:
-        async with _session(cfg) as (client, headers):
-            r = await client.get(f"{cfg.base_url}/api/customdns", headers=headers)
-            r.raise_for_status()
-            return r.json().get("custom_records", [])
-    except Exception:
-        return []
+    """Returns list of {"domain": ..., "ip": ...} dicts from the primary.
+
+    Pi-hole v6 FTL stores custom DNS under /api/config/dns/hosts as an array
+    of dnsmasq-format strings ("ip domain").
+
+    Raises on auth failure, network error, or unexpected API response so callers
+    can surface a meaningful error instead of silently returning empty.
+    """
+    async with _session(cfg) as (client, headers):
+        r = await client.get(f"{cfg.base_url}/api/config/dns/hosts", headers=headers)
+        r.raise_for_status()
+        data = r.json()
+        # v6 config API: {"config": {"dns": {"hosts": ["ip domain", ...]}}}
+        hosts = (
+            data.get("config", {}).get("dns", {}).get("hosts")
+            or data.get("dns", {}).get("hosts")
+            or data.get("hosts")
+            or []
+        )
+        if hosts and isinstance(hosts[0], str):
+            return _parse_hosts(hosts)
+        # Already {"domain", "ip"} shaped (future-proof)
+        return hosts
 
 
 async def add_custom_dns(
@@ -153,9 +179,9 @@ async def add_custom_dns(
 ) -> tuple[bool, str]:
     try:
         async with _session(cfg) as (client, headers):
-            r = await client.post(
-                f"{cfg.base_url}/api/customdns",
-                json={"domain": domain, "ip": ip},
+            entry = quote(f"{ip} {domain}", safe="")
+            r = await client.put(
+                f"{cfg.base_url}/api/config/dns/hosts/{entry}",
                 headers=headers,
             )
             r.raise_for_status()
@@ -169,9 +195,9 @@ async def remove_custom_dns(
 ) -> tuple[bool, str]:
     try:
         async with _session(cfg) as (client, headers):
+            entry = quote(f"{ip} {domain}", safe="")
             r = await client.delete(
-                f"{cfg.base_url}/api/customdns",
-                json={"domain": domain, "ip": ip},
+                f"{cfg.base_url}/api/config/dns/hosts/{entry}",
                 headers=headers,
             )
             r.raise_for_status()
