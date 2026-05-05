@@ -254,6 +254,25 @@ class TLSCheckConfig:
     verify_ssl: bool = True
 
 
+# ── Docker Hub ───────────────────────────────────────────────────────────────
+
+@dataclass
+class DockerHubConfig:
+    """Optional Docker Hub credentials for authenticated tag-list API calls.
+
+    Without this, atc queries Docker Hub anonymously and will hit rate limits
+    quickly when checking many images. Create a Personal Access Token (PAT) at
+    hub.docker.com → Account Settings → Personal access tokens.
+
+    config.yaml:
+        docker_hub:
+          username: damyanmp
+          token: keychain:dockerhub-token
+    """
+    username: str
+    token: str    # Docker Hub PAT (read-only scope is enough)
+
+
 # ── Portainer ─────────────────────────────────────────────────────────────────
 
 @dataclass
@@ -336,6 +355,7 @@ class Config:
     prometheus: PrometheusConfig | None = None
     unifi: UniFiConfig | None = None
     blackbox: BlackboxConfig = field(default_factory=BlackboxConfig)
+    docker_hub: DockerHubConfig | None = None
     scripts_dir: str = "../../"
     refresh_interval: int = 30
     config_path: Path = field(default_factory=Path)
@@ -600,6 +620,15 @@ def load_config(config_path: Path | None = None) -> Config:
         ],
     )
 
+    # Docker Hub (optional — needed for authenticated tag-list API calls)
+    docker_hub: DockerHubConfig | None = None
+    if "docker_hub" in raw:
+        dh = raw["docker_hub"]
+        docker_hub = DockerHubConfig(
+            username=dh["username"],
+            token=_resolve_secret(dh["token"], "docker_hub/token"),
+        )
+
     return Config(
         proxmox=proxmox,
         ssh=ssh,
@@ -618,6 +647,7 @@ def load_config(config_path: Path | None = None) -> Config:
         prometheus=prometheus,
         unifi=unifi,
         blackbox=blackbox,
+        docker_hub=docker_hub,
         scripts_dir=raw.get("scripts_dir", "../../"),
         refresh_interval=int(raw.get("refresh_interval", 30)),
         config_path=config_path.resolve(),
@@ -648,6 +678,24 @@ def save_guest_update_cmd(config_path: Path, guest_name: str, cmd: str, headless
     data[guest_name] = {"cmd": cmd, "headless": headless}
     with open(sidecar, "w") as f:
         yaml.dump(data, f, default_flow_style=False)
+
+
+def remove_guest_update_cmd(config_path: Path, guest_name: str) -> bool:
+    """Remove a guest's custom update command from the sidecar file.
+
+    Returns True if the entry existed and was removed, False if it wasn't present.
+    """
+    sidecar = config_path.parent / "guest_update_cmds.yaml"
+    if not sidecar.exists():
+        return False
+    with open(sidecar) as f:
+        data = yaml.safe_load(f) or {}
+    if guest_name not in data:
+        return False
+    del data[guest_name]
+    with open(sidecar, "w") as f:
+        yaml.dump(data, f, default_flow_style=False)
+    return True
 
 
 # ── Keychain management helpers (used by `atc secrets`) ──────────────────────

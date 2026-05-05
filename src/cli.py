@@ -27,7 +27,7 @@ sys.path.insert(0, str(Path(__file__).parent / "lib"))
 from config import (
     Config, load_config,
     secret_set, secret_delete, secret_verify, secret_repair, secrets_scan_config, secrets_list,
-    save_guest_user, save_guest_update_cmd,
+    save_guest_user, save_guest_update_cmd, remove_guest_update_cmd,
     KEYCHAIN_SERVICE,
 )
 from lib.pihole import (
@@ -1227,6 +1227,25 @@ def update_set_cmd(
     console.print(f"[dim]Next [bold]atc update hosts {guest}[/bold] will run apt, then [bold]{cmd}[/bold].[/]")
 
 
+@update_app.command("remove-cmd")
+def update_remove_cmd(
+    guest: str = typer.Argument(..., help="Guest name whose custom update command should be removed"),
+) -> None:
+    """Remove a guest's custom post-apt update command.
+
+    After removal, [bold]atc update hosts[/] will only run the standard apt pass for that guest.
+
+    Example:
+      [cyan]atc update remove-cmd plex[/]
+    """
+    cfg = _load()
+    removed = remove_guest_update_cmd(cfg.config_path, guest)
+    if removed:
+        console.print(f"[green]✓[/] Removed custom update command for [cyan]{guest}[/].")
+    else:
+        console.print(f"[yellow]![/] No custom update command found for [cyan]{guest}[/].")
+
+
 def _parse_exit(lines: list[str]) -> bool:
     """Return True if the update command exited 0 (reads __ATC_EXIT__:N marker)."""
     for line in reversed(lines):
@@ -2130,8 +2149,12 @@ def pihole_dns_list(
     cfg = _load()
     primary = _pihole_primary(cfg)
 
-    with console.status(f"[bold]Fetching DNS records from {primary.name}…[/]"):
-        records = asyncio.run(list_custom_dns(primary))
+    try:
+        with console.status(f"[bold]Fetching DNS records from {primary.name}…[/]"):
+            records = asyncio.run(list_custom_dns(primary))
+    except Exception as e:
+        console.print(f"[red]Error fetching DNS records from {primary.name}:[/] {e}")
+        raise typer.Exit(1)
 
     if output == _Out.json:
         console.print_json(_json.dumps(records))
@@ -3027,10 +3050,10 @@ def _docker_action(
         with console.status(f"[bold]{verb.capitalize()}ing stack {s.name}…[/]"):
             try:
                 if verb == "restart":
-                    stack_action(pt_cfg, s.id, "stop")
-                    stack_action(pt_cfg, s.id, "start")
+                    stack_action(pt_cfg, s.id, "stop", s.env_id)
+                    stack_action(pt_cfg, s.id, "start", s.env_id)
                 else:
-                    stack_action(pt_cfg, s.id, verb)
+                    stack_action(pt_cfg, s.id, verb, s.env_id)
                 console.print(f"[green]✓[/] {s.name} — {verb} issued")
             except Exception as e:
                 console.print(f"[red]✗[/] {s.name} — {e}")
@@ -5335,6 +5358,227 @@ async def _speedtest_ui(
     console.print()
     console.rule()
     console.print()
+
+    if not ping_only:
+        from lib.speedtest import pick_fact
+        fact = pick_fact(ping_result.median_ms, dl_mbps_fin, ul_mbps_fin)
+        console.print(f"  [bold yellow]💡[/]  [italic dim]{fact}[/]")
+        console.print()
+
+
+# ── versions ──────────────────────────────────────────────────────────────────
+
+versions_app = typer.Typer(
+    help="Docker image version tracking — n-2 supply-chain policy.",
+    no_args_is_help=True,
+    rich_markup_mode="rich",
+)
+app.add_typer(versions_app, name="versions")
+
+
+@versions_app.command("check")
+def versions_check(
+    image: str = typer.Argument(..., help="Image ref — e.g. 'n8nio/n8n', 'couchdb:3', 'docker.n8n.io/n8nio/n8n'"),
+    n: int = typer.Option(2, "--lag", "-n", help="How many minor versions behind latest to recommend (default 2)"),
+) -> None:
+    """Show available semver tags and recommend the n-2 pin for an image."""
+    from lib.registry import check_image, DockerHubCreds
+
+    cfg = _load()
+    dh_creds = (
+        DockerHubCreds(cfg.docker_hub.username, cfg.docker_hub.token)
+        if cfg.docker_hub else None
+    )
+
+    console.print(f"[dim]Querying registry for [bold]{image}[/bold]…[/dim]")
+
+    info = check_image(image, docker_hub_creds=dh_creds)
+
+    if info.fetch_error:
+        console.print(f"[red]Registry error:[/] {info.fetch_error}")
+        raise typer.Exit(1)
+
+    if not info.semver_tags:
+        console.print(f"[yellow]⚠[/]  No semver tags found for [bold]{image}[/bold].")
+        console.print("    The image may use only non-semver tags (e.g. 'latest', 'stable', 'nightly').")
+        raise typer.Exit(0)
+
+    ref = info.ref
+    full = f"{ref.full_name}:{ref.tag}"
+
+    if info.is_floating:
+        console.print(
+            f"\n[yellow]⚠  Floating tag:[/] [bold]{full}[/bold] is not pinned to a specific version.\n"
+            f"   Supply-chain risk: any push to this tag is auto-deployed by Watchtower.\n"
+        )
+    else:
+        pos = info.current_position()
+        pos_color = "green" if pos in ("n-2", "n-1") else ("yellow" if pos == "latest" else "dim")
+        console.print(f"\n  Current:  [bold]{full}[/bold]  [[{pos_color}]{pos}[/{pos_color}]]\n")
+
+    t = Table(title=f"Version ladder — {ref.full_name}", box=box.SIMPLE, show_header=True, header_style="bold")
+    t.add_column("Position", style="dim", width=10)
+    t.add_column("Tag", width=20)
+    t.add_column("", width=28)
+
+    latest = info.latest_tag
+    if latest:
+        t.add_row("latest (n)", latest, "[dim]newest available[/dim]")
+
+    n1 = info.n_minus(1)
+    if n1:
+        t.add_row("n-1", n1, "")
+
+    rec = info.n_minus(n)
+    if rec:
+        t.add_row(
+            f"[green]n-{n}[/green]",
+            f"[green bold]{rec}[/green bold]",
+            f"[green]← recommended pin[/green]",
+        )
+    else:
+        console.print(f"[yellow]Not enough release history to identify n-{n}.[/yellow]")
+
+    console.print(t)
+
+    if rec:
+        pinned = f"{ref.full_name}:{rec}"
+        console.print(f"  Compose image pin:  [bold green]{pinned}[/bold green]")
+        console.print(
+            f"  Add Watchtower label: [dim]com.centurylinklabs.watchtower.enable=false[/dim]\n"
+        )
+
+
+@versions_app.command("list")
+def versions_list(
+    n: int = typer.Option(2, "--lag", "-n", help="Minor version lag to recommend (default 2)"),
+    floating_only: bool = typer.Option(False, "--floating", "-f", help="Show only containers with floating tags"),
+) -> None:
+    """List all Portainer-managed containers with their version status.
+
+    Queries Docker Hub / registry for each unique image and shows whether
+    each container is on latest, n-1, n-2, or a floating (unversioned) tag.
+    """
+    from lib.portainer import fetch_environments, fetch_containers
+    from lib.registry import check_image, parse_image_ref, DockerHubCreds
+
+    cfg = _load()
+    dh_creds = (
+        DockerHubCreds(cfg.docker_hub.username, cfg.docker_hub.token)
+        if cfg.docker_hub else None
+    )
+    if not dh_creds:
+        console.print(
+            "[yellow]⚠[/]  No Docker Hub credentials configured — Docker Hub images will be rate-limited.\n"
+            "   Add [bold]docker_hub:[/bold] (username + token) to config.yaml for reliable results.\n"
+        )
+
+    if not cfg.portainer:
+        console.print("[red]Portainer not configured.[/] Add a [bold]portainer:[/] section to config.yaml.")
+        raise typer.Exit(1)
+
+    console.print("[dim]Fetching containers from Portainer…[/dim]")
+    try:
+        envs = fetch_environments(cfg.portainer)
+        all_containers = []
+        for env in envs:
+            all_containers.extend(fetch_containers(cfg.portainer, env.id, env.name, all_containers=False))
+    except Exception as e:
+        console.print(f"[red]Portainer error:[/] {e}")
+        raise typer.Exit(1)
+
+    if not all_containers:
+        console.print("[dim]No running containers found.[/dim]")
+        raise typer.Exit(0)
+
+    # Deduplicate images — query each unique image ref once
+    unique_images: dict[str, str] = {}  # normalised image string → first container's raw image
+    for c in all_containers:
+        img = c.image.split("@")[0]  # strip digest suffix if present
+        ref = parse_image_ref(img)
+        key = ref.full_name  # registry+namespace+image without tag
+        if key not in unique_images:
+            unique_images[key] = img
+
+    console.print(f"[dim]Checking {len(unique_images)} unique image(s) against registries…[/dim]")
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import threading
+
+    version_cache: dict[str, object] = {}
+    lock = threading.Lock()
+    done = 0
+
+    def _check(key: str, img: str):
+        result = check_image(img, docker_hub_creds=dh_creds)
+        nonlocal done
+        with lock:
+            done += 1
+            console.print(f"[dim]  [{done}/{len(unique_images)}] {key}[/dim]")
+        return key, result
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = {pool.submit(_check, k, v): k for k, v in unique_images.items()}
+        for fut in as_completed(futures):
+            key, result = fut.result()
+            version_cache[key] = result
+
+    console.print()
+
+    t = Table(box=box.SIMPLE, show_header=True, header_style="bold")
+    t.add_column("Container", min_width=22)
+    t.add_column("Image", min_width=28)
+    t.add_column("Tag", min_width=14)
+    t.add_column("Status", min_width=10)
+    t.add_column(f"n-{n} pin", min_width=14)
+
+    shown = 0
+    for c in sorted(all_containers, key=lambda x: x.name):
+        img = c.image.split("@")[0]
+        ref = parse_image_ref(img)
+        key = ref.full_name
+        info = version_cache.get(key)
+
+        if info is None:
+            continue
+
+        is_float = info.is_floating  # type: ignore[union-attr]
+        if floating_only and not is_float:
+            continue
+
+        pos = info.current_position()  # type: ignore[union-attr]
+        rec = info.n_minus(n)          # type: ignore[union-attr]
+
+        if is_float:
+            status = "[red]floating[/red]"
+        elif pos == "latest":
+            status = "[yellow]latest[/yellow]"
+        elif pos == f"n-{n}":
+            status = f"[green]n-{n}[/green]"
+        elif pos.startswith("n-"):
+            status = f"[dim]{pos}[/dim]"
+        else:
+            status = f"[dim]{pos}[/dim]"
+
+        fetch_err = getattr(info, "fetch_error", "")
+        if fetch_err:
+            status = "[dim]registry err[/dim]"
+            rec = None
+
+        pin_str = f":{rec}" if rec else "[dim]—[/dim]"
+        t.add_row(c.name, ref.full_name, ref.tag, status, pin_str)
+        shown += 1
+
+    if shown == 0:
+        console.print("[dim]No containers match the filter.[/dim]")
+    else:
+        console.print(t)
+        console.print(
+            f"[dim]Legend: [red]floating[/red]=unversioned tag  "
+            f"[yellow]latest[/yellow]=on latest semver  "
+            f"[green]n-{n}[/green]=at recommended lag  "
+            f"[dim]n-X[/dim]=behind by X minor versions[/dim]"
+        )
 
 
 # ── radar ─────────────────────────────────────────────────────────────────────
