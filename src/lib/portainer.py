@@ -402,12 +402,14 @@ def stack_action(
     cfg: PortainerConfig,
     stack_id: int,
     action: str,
+    endpoint_id: int = 0,
 ) -> None:
     """Perform start/stop on a stack. Raises on failure."""
     with _client(cfg) as client:
         r = client.post(
             f"{cfg.base_url}/api/stacks/{stack_id}/{action}",
             headers=_headers(cfg),
+            params={"endpointId": endpoint_id},
         )
         if not r.is_success:
             raise RuntimeError(
