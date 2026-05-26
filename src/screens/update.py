@@ -7,6 +7,7 @@ from typing import Literal
 
 from textual import work
 from textual.app import ComposeResult
+from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.screen import Screen
 from textual.widgets import (
@@ -18,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 sys.path.insert(0, str(Path(__file__).parent.parent / "lib"))
 
 from config import Config
-from lib.proxmox import ClusterStatus, fetch_cluster_status
+from lib.proxmox import ClusterStatus, fetch_cluster_status, fetch_guest_ips
 from lib.ssh import UpdateTarget, run_dry_run, run_update
 
 _Phase = Literal["idle", "dry_running", "awaiting_confirm", "applying", "done"]
@@ -29,7 +30,7 @@ class UpdateScreen(Screen):
         ("escape", "app.pop_screen", "Back"),
         ("ctrl+a", "select_all",   "Select All"),
         ("ctrl+n", "deselect_all", "Deselect All"),
-        ("ctrl+r", "run_updates",  "Run / Confirm"),
+        Binding("enter", "run_updates", "Run / Confirm", priority=True),
     ]
 
     DEFAULT_CSS = """
@@ -126,29 +127,38 @@ class UpdateScreen(Screen):
     def action_deselect_all(self) -> None:
         self.query_one("#target-list", SelectionList).deselect_all()
 
-    def _get_selected_targets(self) -> list[UpdateTarget]:
+    def _get_selected_targets(self, ip_map: dict[int, str] | None = None) -> list[UpdateTarget]:
         sel = self.query_one("#target-list", SelectionList)
+        guests_by_name = {g.name: g for g in (self._cluster.guests if self._cluster else [])}
         targets: list[UpdateTarget] = []
         for value in sel.selected:
             parts = str(value).split(":")
             if len(parts) == 3:
                 _, name, node = parts
-                host = self._resolve_host(name)
+                g = guests_by_name.get(name)
+                host = (ip_map or {}).get(g.vmid) if g else None
                 targets.append(UpdateTarget(
                     name=name,
-                    host=host,
+                    host=host or name,
                     user=self.config.ssh.default_user,
                 ))
         return targets
 
-    def _resolve_host(self, name: str) -> str:
-        return name
+    async def _resolve_ips(self) -> dict[int, str]:
+        """Fetch Proxmox guest IPs for all currently selected targets."""
+        if not self._cluster:
+            return {}
+        sel = self.query_one("#target-list", SelectionList)
+        selected_names = {str(v).split(":")[1] for v in sel.selected if str(v).count(":") == 2}
+        guests = [g for g in self._cluster.guests if g.name in selected_names]
+        return await fetch_guest_ips(self.config.proxmox, guests)
 
     # ── Phase 1: dry-run ──────────────────────────────────────────────────────
 
     @work(exclusive=True)
     async def _start_dry_run(self) -> None:
-        targets = self._get_selected_targets()
+        ip_map = await self._resolve_ips()
+        targets = self._get_selected_targets(ip_map)
         if not targets:
             self.query_one("#summary", Static).update("⚠️  No targets selected.")
             return
@@ -171,10 +181,10 @@ class UpdateScreen(Screen):
             def on_line(line: str, t=target) -> None:
                 # Highlight lines that show packages that would be upgraded
                 if line.startswith("Inst ") or line.startswith("Remv "):
-                    self.app.call_from_thread(log.write_line, f"  [yellow]{line}[/yellow]")
+                    log.write_line(f"  [yellow]{line}[/yellow]")
                     pkg_lines.append(line)
                 elif line.strip():
-                    self.app.call_from_thread(log.write_line, f"  {line}")
+                    log.write_line(f"  {line}")
 
             result = await run_dry_run(target, self.config.ssh, on_line=on_line)
 
@@ -191,7 +201,7 @@ class UpdateScreen(Screen):
         if any_upgrades:
             self.query_one("#summary", Static).update(
                 "⚠️  Upgrades available above.  "
-                "Press [bold]Ctrl+R[/bold] to apply  |  [bold]Escape[/bold] to cancel"
+                "Press [bold]Enter[/bold] to apply  |  [bold]Escape[/bold] to cancel"
             )
         else:
             self.query_one("#summary", Static).update(
@@ -203,7 +213,8 @@ class UpdateScreen(Screen):
 
     @work(exclusive=True)
     async def _apply_updates(self) -> None:
-        targets = self._get_selected_targets()
+        ip_map = await self._resolve_ips()
+        targets = self._get_selected_targets(ip_map)
         if not targets:
             self._phase = "idle"
             return
@@ -222,7 +233,7 @@ class UpdateScreen(Screen):
             log.write_line(f"{'─'*50}")
 
             def on_line(line: str, t=target) -> None:
-                self.app.call_from_thread(log.write_line, f"  {line}")
+                log.write_line(f"  {line}")
 
             result = await run_update(target, self.config.ssh, on_line=on_line)
             results.append(result)
