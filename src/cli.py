@@ -1305,8 +1305,9 @@ def _confirm_and_update(targets: list[UpdateTarget], cfg: Config, yes: bool, ver
                 lines: list[str] = []
                 async for line in stream_command(target.host, _cmd_for(target), cfg.ssh, user=target.user):
                     lines.append(line)
-                    if not line.startswith(_EXIT_MARKER):
-                        console.print(f"  {line}")
+                    if line.startswith(_EXIT_MARKER):
+                        break
+                    console.print(f"  {line}")
                 success = _parse_exit(lines)
                 needs_reboot, failed_units = await _post_checks(target)
                 icon = "❌" if not success or failed_units else ("⚠️ " if needs_reboot else "✅")
@@ -1332,10 +1333,11 @@ def _confirm_and_update(targets: list[UpdateTarget], cfg: Config, yes: bool, ver
                     lines2: list[str] = []
                     async for line in stream_command(target.host, _cmd_for(target), cfg.ssh, user=target.user):
                         lines2.append(line)
-                        if not line.startswith(_EXIT_MARKER):
-                            short = line.strip()[:70]
-                            if short:
-                                progress.update(htask, status=short)
+                        if line.startswith(_EXIT_MARKER):
+                            break
+                        short = line.strip()[:70]
+                        if short:
+                            progress.update(htask, status=short)
                     success = _parse_exit(lines2)
                     needs_reboot, failed_units = await _post_checks(target)
                     icon = "❌" if not success or failed_units else ("⚠️ " if needs_reboot else "✅")
@@ -1358,10 +1360,11 @@ def _confirm_and_update(targets: list[UpdateTarget], cfg: Config, yes: bool, ver
         lines: list[str] = []
         async for line in stream_command(t.host, cmd, cfg.ssh, user=t.user):
             lines.append(line)
-            if not line.startswith(_EXIT_MARKER):
-                short = line.strip()[:70]
-                if short:
-                    console.print(f"  [dim]{short}[/]")
+            if line.startswith(_EXIT_MARKER):
+                break
+            short = line.strip()[:70]
+            if short:
+                console.print(f"  [dim]{short}[/]")
         return 0 if _parse_exit(lines) else 1
 
     if custom_targets:
