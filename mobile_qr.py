@@ -45,13 +45,15 @@ def build_mobile_yaml(cfg, only: set[str] | None) -> str:
     on Android.  Only includes services the app currently supports.
 
     CLI key      → Android key
-    proxmox      → proxmox        (same structure)
+    proxmox      → proxmox           (same structure)
     pihole       → pihole_instances  (list, key rename)
-    plex         → plex           (same)
-    tautulli     → tautulli       (same)
-    seerr        → seerr          (same)
-    portainer    → portainer      (same)
-    beszel       → beszel         (same)
+    plex         → plex              (same)
+    tautulli     → tautulli          (same)
+    radarr       → radarr            (same)
+    sonarr       → sonarr            (same)
+    seerr        → seerr             (same)
+    portainer    → portainer         (same)
+    beszel       → beszel            (same)
     """
     want = only  # None = include everything supported
 
@@ -97,11 +99,32 @@ def build_mobile_yaml(cfg, only: set[str] | None) -> str:
             "api_key": cfg.tautulli.api_key,
         }
 
+    # Radarr
+    if _want("radarr", want) and cfg.radarr:
+        mobile["radarr"] = {
+            "host":      cfg.radarr.host,
+            "port":      cfg.radarr.port,
+            "https":     cfg.radarr.https,
+            "api_key":   cfg.radarr.api_key,
+            "base_path": cfg.radarr.base_path,
+        }
+
+    # Sonarr
+    if _want("sonarr", want) and cfg.sonarr:
+        mobile["sonarr"] = {
+            "host":      cfg.sonarr.host,
+            "port":      cfg.sonarr.port,
+            "https":     cfg.sonarr.https,
+            "api_key":   cfg.sonarr.api_key,
+            "base_path": cfg.sonarr.base_path,
+        }
+
     # Seerr (Overseerr / Jellyseerr)
     if _want("seerr", want) and cfg.seerr:
         mobile["seerr"] = {
             "host":    cfg.seerr.host,
             "port":    cfg.seerr.port,
+            "https":   cfg.seerr.https,
             "api_key": cfg.seerr.api_key,
         }
 
@@ -161,7 +184,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--only", metavar="SERVICE[,SERVICE]",
-        help="Comma-separated services to include: proxmox,pihole,plex,tautulli,seerr,portainer,beszel",
+        help="Comma-separated services to include: proxmox,pihole,plex,tautulli,radarr,sonarr,seerr,portainer,beszel",
     )
     parser.add_argument(
         "--save", type=Path, metavar="FILE.png",
@@ -210,7 +233,8 @@ def _summarise(yaml_content: str) -> str:
     import re
     top_keys = re.findall(r"^(\w+):", yaml_content, re.MULTILINE)
     labels = {"proxmox": "Proxmox", "pihole_instances": "Pi-hole",
-              "plex": "Plex", "tautulli": "Tautulli", "seerr": "Seerr",
+              "plex": "Plex", "tautulli": "Tautulli",
+              "radarr": "Radarr", "sonarr": "Sonarr", "seerr": "Seerr",
               "portainer": "Portainer", "beszel": "Beszel"}
     return " · ".join(labels.get(k, k) for k in top_keys if k in labels)
 
