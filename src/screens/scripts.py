@@ -1,7 +1,6 @@
 """Script launcher screen — browse and run *.sh scripts from the repo."""
 from __future__ import annotations
 
-import asyncio
 import os
 import sys
 from pathlib import Path
@@ -36,15 +35,10 @@ def _get_script_description(path: Path) -> str:
 
 
 def _find_scripts(scripts_dir: Path) -> list[Path]:
-    """Recursively find all *.sh files, excluding hidden dirs, .venv, and symlinked dirs.
-
-    Uses os.walk with followlinks=False so symlinked directories (e.g. notes/ → Obsidian
-    vault) are not traversed — rglob would scan the entire vault before returning.
-    """
+    """Recursively find all *.sh files, excluding hidden dirs, .venv, and symlinked dirs."""
     _SKIP = {"__pycache__", ".venv"}
     found = []
     for root, dirs, files in os.walk(scripts_dir, followlinks=False):
-        # Prune dirs in-place so os.walk doesn't descend into them
         dirs[:] = sorted(
             d for d in dirs
             if not d.startswith(".") and d not in _SKIP
@@ -65,10 +59,28 @@ class ScriptItem(ListItem):
         super().__init__(Label(label, markup=True))
 
 
+class ScriptListView(ListView):
+    """ListView that triggers script execution on Enter via key_enter.
+
+    key_enter is invoked by dispatch_key directly on the focused widget,
+    bypassing the binding chain entirely — the most reliable hook for this.
+    """
+
+    def key_enter(self) -> None:
+        item = self.highlighted_child
+        if item is None and self._nodes:
+            self.index = 0
+            item = self.highlighted_child
+        if isinstance(item, ScriptItem):
+            # Cast is safe: ScriptListView is only used inside ScriptsScreen
+            screen = self.screen
+            if isinstance(screen, ScriptsScreen):
+                screen.run_script(item.script_path)
+
+
 class ScriptsScreen(Screen):
     BINDINGS = [
         ("escape", "app.pop_screen", "Back"),
-        ("enter", "run_selected", "Run"),
     ]
 
     DEFAULT_CSS = """
@@ -110,14 +122,13 @@ class ScriptsScreen(Screen):
         super().__init__()
         self.config = config
         self._scripts: list[Path] = []
-        self._running = False
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         with Horizontal():
             with Vertical(id="left-panel"):
                 yield Static("Repo Scripts", classes="section-label")
-                yield ListView(id="script-list")
+                yield ScriptListView(id="script-list")
             with Vertical(id="right-panel"):
                 yield Static("Output", classes="section-label")
                 yield Static("Select a script and press Enter to run", id="script-info")
@@ -131,16 +142,18 @@ class ScriptsScreen(Screen):
         try:
             scripts_dir = self.config.resolved_scripts_dir
             self._scripts = _find_scripts(scripts_dir)
-            lv = self.query_one("#script-list", ListView)
+            lv = self.query_one("#script-list", ScriptListView)
             lv.clear()
             if not self._scripts:
                 lv.append(ListItem(Label(f"  No scripts found in\n  {scripts_dir}")))
             else:
                 for path in self._scripts:
                     lv.append(ScriptItem(path, scripts_dir))
+                lv.index = 0
+            lv.focus()
         except Exception as e:
             try:
-                lv = self.query_one("#script-list", ListView)
+                lv = self.query_one("#script-list", ScriptListView)
                 lv.clear()
                 lv.append(ListItem(Label(f"  [red]Error loading scripts:[/]\n  {e}", markup=True)))
             except Exception:
@@ -153,40 +166,29 @@ class ScriptsScreen(Screen):
                 else event.item.script_path
             self.query_one("#script-info", Static).update(f"📄 {rel}")
 
-    def action_run_selected(self) -> None:
-        lv = self.query_one("#script-list", ListView)
-        if lv.highlighted_child and isinstance(lv.highlighted_child, ScriptItem):
-            self._run_script(lv.highlighted_child.script_path)
+    def run_script(self, path: Path) -> None:
+        """Public entry point called by ScriptListView.key_enter."""
+        self._run_script(path)
 
     @work(exclusive=True)
     async def _run_script(self, path: Path) -> None:
-        if self._running:
-            return
-        self._running = True
-        log = self.query_one("#output-log", Log)
-        log.clear()
+        import subprocess
+
         rel = path.relative_to(self.config.resolved_scripts_dir) \
             if path.is_relative_to(self.config.resolved_scripts_dir) else path
-        log.write_line(f"▶  Running: {rel}")
-        log.write_line("─" * 60)
 
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "bash", str(path),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
+        # Suspend the TUI and hand the terminal to the script directly.
+        # This gives scripts full stdin/stdout/stderr — interactive prompts work.
+        # The TUI resumes automatically when the script exits.
+        with self.app.suspend():
+            result = subprocess.run(
+                ["bash", str(path)],
                 cwd=str(path.parent),
             )
-            assert proc.stdout is not None
-            async for raw in proc.stdout:
-                line = raw.decode(errors="replace").rstrip("\n")
-                log.write_line(line)
 
-            await proc.wait()
-            icon = "✅" if proc.returncode == 0 else "❌"
-            log.write_line("─" * 60)
-            log.write_line(f"{icon}  Exit code: {proc.returncode}")
-        except Exception as e:
-            log.write_line(f"❌  Failed to run script: {e}")
-        finally:
-            self._running = False
+        log = self.query_one("#output-log", Log)
+        log.clear()
+        log.write_line(f"▶  Ran: {rel}")
+        log.write_line("─" * 60)
+        icon = "✅" if result.returncode == 0 else "❌"
+        log.write_line(f"{icon}  Exit code: {result.returncode}")
