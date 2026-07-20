@@ -151,6 +151,23 @@ class UniFiFirewallGroup:
 
 
 @dataclass
+class UniFiClient:
+    mac: str
+    ip: str
+    hostname: str       # device-reported hostname
+    name: str           # user-assigned alias, falls back to hostname
+    network: str        # network/VLAN name this client is on
+    is_wired: bool
+    essid: str          # empty when wired
+    last_seen: int
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @property
+    def display_name(self) -> str:
+        return self.name or self.hostname or self.mac
+
+
+@dataclass
 class UniFiNetwork:
     id: str
     name: str
@@ -268,6 +285,25 @@ def fetch_networks(cfg: UniFiConfig, site: str = "default") -> list[UniFiNetwork
             raw=n,
         ))
     return sorted(networks, key=lambda x: (x.purpose, x.vlan_id))
+
+
+def fetch_clients(cfg: UniFiConfig, site: str = "default") -> list[UniFiClient]:
+    """Return all currently-connected (active session) clients for the given site."""
+    data = _get(cfg, f"/api/s/{site}/stat/sta")
+    clients = []
+    for c in data.get("data", []):
+        clients.append(UniFiClient(
+            mac=c.get("mac", ""),
+            ip=c.get("ip", ""),
+            hostname=c.get("hostname", ""),
+            name=c.get("name") or c.get("hostname", ""),
+            network=c.get("network", ""),
+            is_wired=bool(c.get("is_wired", False)),
+            essid=c.get("essid", ""),
+            last_seen=int(c.get("last_seen", 0) or 0),
+            raw=c,
+        ))
+    return sorted(clients, key=lambda x: (x.network, x.display_name.lower()))
 
 
 # ── Integration v1 fetch functions ───────────────────────────────────────────

@@ -38,6 +38,7 @@ from lib.pihole import (
     remove_custom_dns,
     trigger_gravity_all,
 )
+from lib.unifi import fetch_clients as unifi_fetch_clients
 from lib.ha import (
     get_status as ha_get_status,
     get_entity_state,
@@ -2090,6 +2091,60 @@ def auth_status() -> None:
         console.print("[green]●[/]  PIN is [bold]enabled[/]. Prompted once per terminal session.")
     else:
         console.print("[dim]●[/]  No PIN configured. Run [bold]atc auth set-pin[/] to enable.")
+
+
+# ── unifi ─────────────────────────────────────────────────────────────────────
+
+unifi_app = typer.Typer(
+    help="Query the UniFi Network controller",
+    no_args_is_help=True,
+    rich_markup_mode="rich",
+)
+app.add_typer(unifi_app, name="unifi")
+
+
+def _unifi_cfg(cfg):
+    if cfg.unifi is None:
+        console.print("[red]No unifi config in config.yaml[/]")
+        raise typer.Exit(1)
+    return cfg.unifi
+
+
+def _print_clients_table(clients: list) -> None:
+    t = Table(box=box.SIMPLE, show_header=True, pad_edge=False)
+    t.add_column("IP", min_width=15)
+    t.add_column("Name", style="bold", min_width=20)
+    t.add_column("MAC", style="dim", min_width=17)
+    t.add_column("Network", min_width=14)
+    t.add_column("Link", min_width=6)
+
+    for c in clients:
+        link = "wired" if c.is_wired else "wifi"
+        t.add_row(c.ip or "—", c.display_name, c.mac, c.network or "—", link)
+
+    console.print(t)
+
+
+@unifi_app.command("clients")
+def unifi_clients(
+    output: _Out = typer.Option(_Out.table, "-o", help="Output format: table | json"),
+) -> None:
+    """List currently-connected UniFi clients."""
+    cfg = _load()
+    unifi_cfg = _unifi_cfg(cfg)
+
+    with console.status("[bold]Fetching UniFi clients…[/]"):
+        clients = unifi_fetch_clients(unifi_cfg, site=unifi_cfg.site)
+
+    if output == _Out.json:
+        console.print_json(_json.dumps([
+            {"ip": c.ip, "mac": c.mac, "name": c.display_name, "network": c.network, "wired": c.is_wired}
+            for c in clients
+        ]))
+        return
+
+    _print_clients_table(clients)
+    console.print(f"\n[dim]{len(clients)} connected client(s)[/]")
 
 
 # ── pihole ────────────────────────────────────────────────────────────────────
