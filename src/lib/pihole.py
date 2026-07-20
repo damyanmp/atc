@@ -206,6 +206,53 @@ async def remove_custom_dns(
         return False, str(e)
 
 
+# ── Network devices (clients seen making queries) ────────────────────────────
+
+async def fetch_seen_ips(cfg: PiholeInstanceConfig) -> set[str]:
+    """Return every IP address Pi-hole's network table has ever seen a query from.
+
+    Uses GET /api/network/devices, which defaults to returning only the 10
+    most recently active devices — pass a high max_devices/max_addresses to
+    get the full picture instead of just the top talkers.
+    """
+    async with _session(cfg) as (client, headers):
+        r = await client.get(
+            f"{cfg.base_url}/api/network/devices",
+            params={"max_devices": 1000, "max_addresses": 50},
+            headers=headers,
+        )
+        r.raise_for_status()
+        data = r.json()
+        return {
+            addr["ip"]
+            for device in data.get("devices", [])
+            for addr in device.get("ips", [])
+            if addr.get("ip")
+        }
+
+
+async def fetch_seen_ips_all(
+    cfgs: list[PiholeInstanceConfig],
+) -> tuple[set[str], list[tuple[str, str]]]:
+    """Union of seen IPs across all Pi-hole instances.
+
+    Returns (ips, errors) where errors is [(instance_name, message), ...] for
+    instances that could not be queried, so a single unreachable instance
+    doesn't hide the rest of the result.
+    """
+    results = await asyncio.gather(
+        *[fetch_seen_ips(cfg) for cfg in cfgs], return_exceptions=True
+    )
+    seen: set[str] = set()
+    errors: list[tuple[str, str]] = []
+    for cfg, r in zip(cfgs, results):
+        if isinstance(r, Exception):
+            errors.append((cfg.name, str(r)))
+        else:
+            seen |= r
+    return seen, errors
+
+
 # ── Gravity ───────────────────────────────────────────────────────────────────
 
 async def trigger_gravity(cfg: PiholeInstanceConfig) -> tuple[bool, str]:

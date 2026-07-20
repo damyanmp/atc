@@ -37,6 +37,7 @@ from lib.pihole import (
     add_custom_dns,
     remove_custom_dns,
     trigger_gravity_all,
+    fetch_seen_ips_all,
 )
 from lib.unifi import fetch_clients as unifi_fetch_clients
 from lib.ha import (
@@ -2389,6 +2390,48 @@ def pihole_gravity(
         console.print(f"{icon} {inst.name} — {msg}")
 
     console.print("\n[dim]Updates run in the background on each instance.[/]")
+
+
+@pihole_app.command("audit")
+def pihole_audit(
+    output: _Out = typer.Option(_Out.table, "-o", help="Output format: table | json"),
+) -> None:
+    """Flag connected UniFi clients that Pi-hole has never seen a query from.
+
+    Cross-checks the live UniFi client list against every Pi-hole instance's
+    network table (devices that have ever queried it). Anything connected to
+    the network but missing from Pi-hole's history is likely using a
+    different DNS server — misconfigured DHCP, a hardcoded resolver, or DoH.
+    """
+    cfg = _load()
+    instances = _pihole_instances(cfg)
+    unifi_cfg = _unifi_cfg(cfg)
+
+    with console.status("[bold]Fetching UniFi clients and Pi-hole query history…[/]"):
+        clients = [c for c in unifi_fetch_clients(unifi_cfg, site=unifi_cfg.site) if c.ip]
+        seen_ips, errors = asyncio.run(fetch_seen_ips_all(instances))
+
+    for name, err in errors:
+        console.print(f"[yellow]⚠[/]  {name}: could not fetch query history — {err}")
+
+    bypassing = [c for c in clients if c.ip not in seen_ips]
+
+    if output == _Out.json:
+        console.print_json(_json.dumps([
+            {"ip": c.ip, "mac": c.mac, "name": c.display_name, "network": c.network, "wired": c.is_wired}
+            for c in bypassing
+        ]))
+        return
+
+    if not bypassing:
+        console.print(f"\n[green]✓[/] All {len(clients)} connected client(s) have been seen by Pi-hole.")
+        return
+
+    _print_clients_table(sorted(bypassing, key=lambda x: x.ip))
+    console.print(
+        f"\n[yellow]{len(bypassing)}[/] of [bold]{len(clients)}[/] connected client(s) "
+        f"have not been seen by any Pi-hole instance — check their DNS settings."
+    )
 
 
 # ── ha ────────────────────────────────────────────────────────────────────────
