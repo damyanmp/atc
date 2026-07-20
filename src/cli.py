@@ -3923,6 +3923,10 @@ from lib.plex import (
     empty_trash as plex_empty_trash,
     clean_bundles as plex_clean_bundles,
     _section_key as plex_section_key,
+    get_activities as plex_get_activities,
+    get_butler_tasks as plex_get_butler_tasks,
+    list_sessions as plex_list_sessions,
+    terminate_session as plex_terminate_session,
 )
 
 
@@ -5335,11 +5339,11 @@ def media_search_today_cmd(
 # ── plex ──────────────────────────────────────────────────────────────────────
 
 plex_app = typer.Typer(
-    help="Manage Plex Media Server",
+    help="Manage Plex Media Server, plus stream monitoring via Tautulli",
     no_args_is_help=True,
     rich_markup_mode="rich",
 )
-media_app.add_typer(plex_app, name="plex")
+app.add_typer(plex_app, name="plex")
 
 
 def _plex(cfg: Config):
@@ -5347,6 +5351,13 @@ def _plex(cfg: Config):
         console.print("[red]No plex section in config.yaml[/]")
         raise typer.Exit(1)
     return cfg.plex
+
+
+def _tautulli(cfg: Config):
+    if cfg.tautulli is None:
+        console.print("[red]No tautulli section in config.yaml[/]")
+        raise typer.Exit(1)
+    return cfg.tautulli
 
 
 @plex_app.command("status")
@@ -5380,6 +5391,46 @@ def plex_libraries_cmd() -> None:
     t.add_column("Items", justify="right")
     for lib in libs:
         t.add_row(str(lib.key), lib.title, lib.lib_type, str(lib.count))
+    console.print(t)
+
+
+@plex_app.command("clients")
+def plex_clients_cmd(
+    user: str = typer.Option("", "--user", "-u", help="Filter by last user (substring match)"),
+    platform: str = typer.Option("", "--platform", "-p", help="Filter by platform (substring match)"),
+    search: str = typer.Option("", "--search", "-s", help="Filter by player/platform/product/user (substring match)"),
+) -> None:
+    """List distinct devices/players seen in Plex play history, most recent first."""
+    cfg = _load()
+    from lib.tautulli import list_devices as _tt_list_devices
+    with console.status("[bold]Fetching client history…[/]"):
+        devices = _tt_list_devices(_tautulli(cfg))
+
+    if user:
+        devices = [d for d in devices if user.lower() in d.user.lower()]
+    if platform:
+        devices = [d for d in devices if platform.lower() in d.platform.lower()]
+    if search:
+        needle = search.lower()
+        devices = [
+            d for d in devices
+            if needle in d.player.lower() or needle in d.platform.lower()
+            or needle in d.product.lower() or needle in d.user.lower()
+        ]
+
+    if not devices:
+        msg = "No devices match the given filters." if (user or platform or search) else "No devices found in play history."
+        console.print(f"[dim]{msg}[/]")
+        return
+
+    t = Table(box=box.SIMPLE, show_edge=False, pad_edge=False)
+    t.add_column("Player",    style="bold")
+    t.add_column("Platform")
+    t.add_column("Product")
+    t.add_column("Last User")
+    t.add_column("Last Seen")
+    for d in devices:
+        t.add_row(d.player or "—", d.platform or "—", d.product or "—", d.user or "—", d.last_seen or "—")
     console.print(t)
 
 
@@ -5503,35 +5554,13 @@ def plex_clean_bundles_cmd() -> None:
     console.print("[green]✓[/] Bundle clean queued")
 
 
-# ── tautulli ──────────────────────────────────────────────────────────────────
-
-from lib.tautulli import (
-    get_activity as tautulli_get_activity,
-    get_history  as tautulli_get_history,
-    terminate_session as tautulli_terminate_session,
-)
-
-tautulli_app = typer.Typer(
-    help="Plex stream monitoring via Tautulli — active, history, terminate",
-    no_args_is_help=True,
-    rich_markup_mode="rich",
-)
-media_app.add_typer(tautulli_app, name="streams")
-
-
-def _tautulli(cfg: Config):
-    if cfg.tautulli is None:
-        console.print("[red]No tautulli section in config.yaml[/]")
-        raise typer.Exit(1)
-    return cfg.tautulli
-
-
-@tautulli_app.command("active")
-def tautulli_active_cmd() -> None:
-    """Show all currently active Plex streams."""
+@plex_app.command("sessions")
+def plex_sessions_cmd() -> None:
+    """Show active Plex streams."""
     cfg = _load()
+    from lib.tautulli import get_activity as _tt_activity
     with console.status("[bold]Fetching active streams…[/]"):
-        streams = tautulli_get_activity(_tautulli(cfg))
+        streams = _tt_activity(_tautulli(cfg))
 
     if not streams:
         console.print("[dim]No active streams.[/]")
@@ -5544,6 +5573,7 @@ def tautulli_active_cmd() -> None:
     console.print()
 
     t = Table(box=box.SIMPLE, show_edge=False, pad_edge=False)
+    t.add_column("Session",   style="dim",  no_wrap=True)
     t.add_column("User",      style="bold", no_wrap=True)
     t.add_column("State",     no_wrap=True)
     t.add_column("Title",     no_wrap=True)
@@ -5552,17 +5582,16 @@ def tautulli_active_cmd() -> None:
     t.add_column("Transcode", no_wrap=True)
     t.add_column("Player",    no_wrap=True)
 
-    state_styles = {"playing": "green", "paused": "yellow", "buffering": "cyan"}
-
+    _state_styles = {"playing": "green", "paused": "yellow", "buffering": "cyan"}
     for s in streams:
         if s.media_type == "episode" and s.grandparent_title:
             ep_tag = f"S{s.season:02d}E{s.episode:02d}" if s.season else ""
             display_title = s.grandparent_title + (f" · {ep_tag}" if ep_tag else "")
         else:
             display_title = s.title + (f" ({s.year})" if s.year else "")
-
-        state_style = state_styles.get(s.state, "dim")
+        state_style = _state_styles.get(s.state, "dim")
         t.add_row(
+            s.session_key or "—",
             s.user,
             f"[{state_style}]{s.state}[/]",
             display_title,
@@ -5574,11 +5603,88 @@ def tautulli_active_cmd() -> None:
 
     console.print(t)
     console.print()
-    console.rule(f"[dim]session keys: {', '.join(s.session_key for s in streams)}[/]")
+    console.rule(f"[dim]terminate: atc plex terminate <session_key>  ·  history: atc plex history[/]")
     console.print()
 
 
-@tautulli_app.command("history")
+@plex_app.command("stats")
+def plex_stats_cmd() -> None:
+    """Show Plex server stats: library scan times, running tasks, and butler schedule."""
+    cfg = _load()
+    pc = _plex(cfg)
+
+    with console.status("[bold]Fetching Plex stats…[/]"):
+        libs       = plex_list_libraries(pc)
+        activities = plex_get_activities(pc)
+        butler     = plex_get_butler_tasks(pc)
+
+    # ── Running activities ────────────────────────────────────────────────────
+    if activities:
+        console.print(f"\n[bold]Running ({len(activities)})[/]")
+        for a in activities:
+            pct_str = f" [{a.progress}%]" if a.progress > 0 else ""
+            sub_str = f"  [dim]{a.subtitle}[/]" if a.subtitle else ""
+            console.print(f"  [cyan]⟳[/]  {a.title}{pct_str}{sub_str}")
+    else:
+        console.print("\n[dim]No activities running.[/]")
+
+    # ── Library scan times ────────────────────────────────────────────────────
+    console.print()
+    if isinstance(libs, str):
+        console.print(f"[red]Library error:[/] {libs}")
+    else:
+        t = Table(title="Libraries", box=box.SIMPLE, show_header=True, pad_edge=False)
+        t.add_column("ID",      style="dim",   justify="right", width=4)
+        t.add_column("Library", style="bold")
+        t.add_column("Type",    style="dim")
+        t.add_column("Items",   justify="right")
+        t.add_column("Last Scan")
+        t.add_column("Updated")
+        for lib in libs:
+            t.add_row(
+                str(lib.key),
+                lib.title,
+                lib.lib_type,
+                str(lib.count),
+                lib.scanned_at or "[dim]—[/]",
+                lib.updated_at or "[dim]—[/]",
+            )
+        console.print(t)
+
+    # ── Butler scheduled tasks ────────────────────────────────────────────────
+    console.print()
+    if isinstance(butler, str):
+        console.print(f"[red]Butler error:[/] {butler}")
+    elif butler:
+        t2 = Table(title="Scheduled Tasks", box=box.SIMPLE, show_header=True, pad_edge=False)
+        t2.add_column("",        width=2)
+        t2.add_column("Task",    style="dim")
+        t2.add_column("Schedule")
+        t2.add_column("Last Result")
+        t2.add_column("Last Run")
+        for task in butler:
+            dot = "[green]●[/]" if task.enabled else "[dim]●[/]"
+            if task.last_result == "Success":
+                result_str = "[green]Success[/]"
+            elif task.last_result == "Error":
+                result_str = "[red]Error[/]"
+            else:
+                result_str = "[dim]—[/]"
+            schedule = task.schedule or (f"every {task.interval}h" if task.interval else "—")
+            last_run = task.last_run or "[dim]—[/]"
+            t2.add_row(dot, task.title or task.name, schedule, result_str, last_run)
+        console.print(t2)
+
+
+# ── tautulli (blended into `atc plex`) ────────────────────────────────────────
+
+from lib.tautulli import (
+    get_history  as tautulli_get_history,
+    terminate_session as tautulli_terminate_session,
+)
+
+
+@plex_app.command("history")
 def tautulli_history_cmd(
     count:  int = typer.Option(20, "--count", "-n", help="Number of records to show"),
     user:   str = typer.Option("", "--user", "-u", help="Filter by username"),
@@ -5643,23 +5749,57 @@ def tautulli_history_cmd(
     console.print(t)
 
 
-@tautulli_app.command("terminate")
+@plex_app.command("terminate")
 def tautulli_terminate_cmd(
-    session_key: str = typer.Argument(..., help="Session key shown in 'atc media streams active'"),
+    session_key: str = typer.Argument(..., help="Session key shown in 'atc plex sessions'"),
     message: str = typer.Option("", "--message", "-m", help="Message shown to the user"),
     yes: bool    = typer.Option(False, "--yes", "-y", help="Skip confirmation"),
 ) -> None:
     """Terminate an active Plex stream."""
     cfg = _load()
+    tcfg = _tautulli(cfg)
+    pc = _plex(cfg)
     if not yes:
         if not Confirm.ask(f"Terminate session [bold]{session_key}[/]?"):
             raise typer.Exit(0)
     with console.status(f"[bold]Terminating session {session_key}…[/]"):
+        # Resolve the Plex session_id from current activity — Tautulli's own
+        # session_key-only lookup often fails with "Missing session_id".
+        from lib.tautulli import get_activity as _tt_activity
+        session_id = next(
+            (s.session_id for s in _tt_activity(tcfg) if s.session_key == session_key and s.session_id),
+            "",
+        )
+        tautulli_error: str | None = None
         try:
-            tautulli_terminate_session(_tautulli(cfg), session_key, message=message)
+            tautulli_terminate_session(tcfg, session_key=session_key, session_id=session_id, message=message)
         except Exception as e:
-            console.print(f"[red]✗[/] Failed: {e}")
-            raise typer.Exit(1)
+            tautulli_error = str(e)
+
+        if tautulli_error:
+            # Fall back to hitting the Plex API directly — Tautulli's terminate_session
+            # depends on its own internal activity cache having a session_id recorded,
+            # which isn't always the case even for a live, currently-playing session.
+            sessions = plex_list_sessions(pc)
+            plex_session_id = "" if isinstance(sessions, str) else next(
+                (s.session_id for s in sessions if s.session_key == session_key and s.session_id),
+                "",
+            )
+            if not plex_session_id:
+                console.print(f"[red]✗[/] Failed: {tautulli_error}")
+                if isinstance(sessions, str):
+                    console.print(f"[dim]Plex fallback also failed: {sessions}[/]")
+                else:
+                    console.print(
+                        "[dim]This session has no session_id in Plex or Tautulli — "
+                        "some clients (often mobile apps on direct play) don't report one, "
+                        "which makes it untargetable by Plex's terminate API.[/]"
+                    )
+                raise typer.Exit(1)
+            err = plex_terminate_session(pc, plex_session_id, reason=message)
+            if err:
+                console.print(f"[red]✗[/] Failed: {tautulli_error} (Plex fallback also failed: {err})")
+                raise typer.Exit(1)
     console.print(f"[green]✓[/] Session [bold]{session_key}[/] terminated")
 
 

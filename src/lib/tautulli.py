@@ -26,6 +26,7 @@ class TautulliStatus:
 @dataclass
 class TautulliStream:
     session_key: str
+    session_id: str           # Plex's actual session identifier — required to terminate reliably
     user: str
     title: str                # episode title (or movie title)
     media_type: str           # "movie", "episode", "track"
@@ -40,6 +41,16 @@ class TautulliStream:
     state: str                # "playing", "paused", "buffering"
     ip_address: str = ""
     quality_profile: str = ""
+
+
+@dataclass
+class TautulliDevice:
+    player: str            # client device name, e.g. "Living Room Roku"
+    platform: str = ""     # e.g. "Roku", "Android", "Chrome"
+    product: str = ""      # e.g. "Plex for Roku", "Plex Web"
+    user: str = ""         # most recent user seen on this device
+    last_seen: str = ""    # YYYY-MM-DD HH:MM
+    ip_address: str = ""
 
 
 @dataclass
@@ -99,6 +110,7 @@ def get_activity(cfg: TautulliConfig) -> list[TautulliStream]:
         pct = round((view_offset / duration * 100) if duration else 0.0, 1)
         streams.append(TautulliStream(
             session_key=str(s.get("session_key", "")),
+            session_id=s.get("session_id", ""),
             user=s.get("friendly_name") or s.get("user", ""),
             title=s.get("title", ""),
             media_type=s.get("media_type", ""),
@@ -155,9 +167,46 @@ def get_history(
     return result
 
 
-def terminate_session(cfg: TautulliConfig, session_key: str, message: str = "") -> None:
-    """Terminate an active stream. Raises RuntimeError on failure."""
-    params: dict = {"session_key": session_key}
+def list_devices(cfg: TautulliConfig, length: int = 1000) -> list[TautulliDevice]:
+    """Return distinct devices/players seen in Tautulli play history, most recent first.
+
+    Derived from local history data (no external calls) — only includes devices that
+    have actually streamed something, not every device ever registered to the account.
+    """
+    try:
+        data = _api(cfg, "get_history", length=length, order_column="date", order_dir="desc")
+    except Exception:
+        return []
+    records = data.get("data") or []
+    seen: dict[tuple[str, str], TautulliDevice] = {}
+    for rec in records:
+        key = (rec.get("player", ""), rec.get("platform", ""))
+        if key in seen:
+            continue
+        ts = rec.get("date") or rec.get("started") or 0
+        try:
+            last_seen = datetime.fromtimestamp(int(ts)).strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            last_seen = str(ts)
+        seen[key] = TautulliDevice(
+            player=rec.get("player", ""),
+            platform=rec.get("platform", ""),
+            product=rec.get("product", ""),
+            user=rec.get("friendly_name") or rec.get("user", ""),
+            last_seen=last_seen,
+            ip_address=rec.get("ip_address", ""),
+        )
+    return list(seen.values())
+
+
+def terminate_session(cfg: TautulliConfig, session_key: str = "", session_id: str = "", message: str = "") -> None:
+    """Terminate an active stream. Raises RuntimeError on failure.
+
+    Prefers session_id when available — Tautulli's session_key lookup depends on its
+    internal activity cache having recorded a session_id, which isn't always the case
+    and fails with "Missing session_id" even for a valid, currently-playing session_key.
+    """
+    params: dict = {"session_id": session_id} if session_id else {"session_key": session_key}
     if message:
         params["message"] = message
     _api(cfg, "terminate_session", **params)

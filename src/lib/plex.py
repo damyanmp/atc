@@ -29,6 +29,28 @@ class PlexLibrary:
     lib_type: str     # "movie", "show", "music", etc.
     count: int = 0    # number of items in the library
     agent: str = ""
+    scanned_at: str = ""   # last filesystem scan (YYYY-MM-DD HH:MM)
+    updated_at: str = ""   # last metadata update (YYYY-MM-DD HH:MM)
+
+
+@dataclass
+class PlexActivity:
+    uuid: str
+    type: str      # e.g. "com.plexapp.butler.LibraryUpdateScanner"
+    title: str     # human-readable label
+    subtitle: str  # progress detail
+    progress: int  # 0–100
+
+
+@dataclass
+class PlexButlerTask:
+    name: str          # internal key, e.g. "BackupDatabase"
+    title: str         # display label
+    enabled: bool
+    interval: int      # hours between runs (0 if not applicable)
+    schedule: str      # human-readable schedule, e.g. "The first time each day."
+    last_result: str   # "Success", "Error", or ""
+    last_run: str      # YYYY-MM-DD HH:MM or ""
 
 
 @dataclass
@@ -37,6 +59,14 @@ class PlexServerInfo:
     machine_id: str = ""
     friendly_name: str = ""
     error: str = ""
+
+
+@dataclass
+class PlexSession:
+    session_key: str
+    session_id: str  # Plex's actual session identifier, required to terminate
+    title: str = ""
+    user: str = ""
 
 
 @dataclass
@@ -200,13 +230,16 @@ def get_server_info(cfg: PlexConfig) -> PlexServerInfo:
 
 # ── Libraries ─────────────────────────────────────────────────────────────────
 
-def _section_count(client: httpx.Client, cfg: PlexConfig, key: int) -> int:
+def _section_count(client: httpx.Client, cfg: PlexConfig, key: int, type_num: int | None = None) -> int:
     """Fetch the real item count for a library section via a zero-size container request."""
     try:
+        params = {"X-Plex-Container-Start": 0, "X-Plex-Container-Size": 0}
+        if type_num is not None:
+            params["type"] = type_num
         r = client.get(
             f"{cfg.base_url}/library/sections/{key}/all",
             headers=_headers(cfg),
-            params={"X-Plex-Container-Start": 0, "X-Plex-Container-Size": 0},
+            params=params,
         )
         if r.is_success:
             mc = r.json().get("MediaContainer") or {}
@@ -227,17 +260,34 @@ def list_libraries(cfg: PlexConfig) -> list[PlexLibrary] | str:
             libs = []
             for d in dirs:
                 key = int(d.get("key", 0))
-                # Plex sometimes returns count in the sections listing; fall back to a
-                # lightweight size-0 request to get totalSize from the actual section.
-                count = int(d.get("count", 0) or d.get("size", 0))
-                if count == 0 and key:
-                    count = _section_count(client, cfg, key)
+                lib_type = d.get("type", "")
+                # Music sections default to counting artists via /all; request tracks
+                # (type=10) instead so "Items" reflects song count, not artist count.
+                if lib_type == "artist" and key:
+                    count = _section_count(client, cfg, key, type_num=10)
+                else:
+                    # Plex sometimes returns count in the sections listing; fall back to a
+                    # lightweight size-0 request to get totalSize from the actual section.
+                    count = int(d.get("count", 0) or d.get("size", 0))
+                    if count == 0 and key:
+                        count = _section_count(client, cfg, key)
+
+                def _ts(raw) -> str:
+                    if not raw:
+                        return ""
+                    try:
+                        return datetime.fromtimestamp(int(raw)).strftime("%Y-%m-%d %H:%M")
+                    except Exception:
+                        return ""
+
                 libs.append(PlexLibrary(
                     key=key,
                     title=d.get("title", ""),
                     lib_type=d.get("type", ""),
                     count=count,
                     agent=d.get("agent", ""),
+                    scanned_at=_ts(d.get("scannedAt") or d.get("refreshedAt")),
+                    updated_at=_ts(d.get("updatedAt")),
                 ))
             return libs
     except Exception as e:
@@ -425,5 +475,111 @@ def clean_bundles(cfg: PlexConfig) -> str | None:
             if not r.is_success:
                 return f"HTTP {r.status_code}: {r.text[:200]}"
             return None
+    except Exception as e:
+        return str(e)
+
+
+# ── Sessions ──────────────────────────────────────────────────────────────────
+
+def list_sessions(cfg: PlexConfig) -> list[PlexSession] | str:
+    """Return currently active sessions directly from the PMS, bypassing Tautulli.
+
+    Used as a fallback for termination when Tautulli's own activity cache lacks a
+    session_id for a session_key, which makes Tautulli's terminate_session API fail.
+    """
+    try:
+        with _client(cfg) as client:
+            r = client.get(f"{cfg.base_url}/status/sessions", headers=_headers(cfg))
+            if not r.is_success:
+                return f"HTTP {r.status_code}: {r.text[:200]}"
+            items = (r.json().get("MediaContainer") or {}).get("Metadata") or []
+            sessions = []
+            for item in items:
+                session_info = item.get("Session") or {}
+                user_info = item.get("User") or {}
+                sessions.append(PlexSession(
+                    session_key=str(item.get("sessionKey", "")),
+                    session_id=session_info.get("id", ""),
+                    title=item.get("title", ""),
+                    user=user_info.get("title", ""),
+                ))
+            return sessions
+    except Exception as e:
+        return str(e)
+
+
+def terminate_session(cfg: PlexConfig, session_id: str, reason: str = "") -> str | None:
+    """Terminate a session directly via the Plex API. Returns an error string on failure."""
+    try:
+        with _client(cfg) as client:
+            r = client.get(
+                f"{cfg.base_url}/status/sessions/terminate",
+                headers=_headers(cfg),
+                params={"sessionId": session_id, "reason": reason},
+            )
+            if not r.is_success:
+                return f"HTTP {r.status_code}: {r.text[:200]}"
+            return None
+    except Exception as e:
+        return str(e)
+
+
+# ── Activities & butler tasks ──────────────────────────────────────────────────
+
+def get_activities(cfg: PlexConfig) -> list[PlexActivity]:
+    """Return currently running Plex activities (scans, analysis, etc.)."""
+    try:
+        with _client(cfg) as client:
+            r = client.get(f"{cfg.base_url}/activities", headers=_headers(cfg))
+            if not r.is_success:
+                return []
+            items = (r.json().get("MediaContainer") or {}).get("Activity") or []
+            return [
+                PlexActivity(
+                    uuid=a.get("uuid", ""),
+                    type=a.get("type", ""),
+                    title=a.get("title", ""),
+                    subtitle=a.get("subtitle", ""),
+                    progress=int(a.get("progress", 0)),
+                )
+                for a in items
+            ]
+    except Exception:
+        return []
+
+
+def get_butler_tasks(cfg: PlexConfig) -> list[PlexButlerTask] | str:
+    """Return Plex scheduled maintenance tasks with last-run info.
+
+    Returns an error string on failure.
+    """
+    def _ts(raw: str) -> str:
+        if not raw:
+            return ""
+        raw = raw.replace("Z", "+00:00")
+        try:
+            dt = datetime.fromisoformat(raw)
+            return dt.strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            return raw[:16]
+
+    try:
+        with _client(cfg) as client:
+            r = client.get(f"{cfg.base_url}/butler", headers=_headers(cfg))
+            if not r.is_success:
+                return f"HTTP {r.status_code}: {r.text[:200]}"
+            tasks = (r.json().get("MediaContainer") or {}).get("ButlerTask") or []
+            return [
+                PlexButlerTask(
+                    name=t.get("name", ""),
+                    title=t.get("description") or t.get("title") or t.get("name", ""),
+                    enabled=bool(t.get("enabled", True)),
+                    interval=int(t.get("interval", 0)),
+                    schedule=t.get("scheduleDescription", ""),
+                    last_result=t.get("lastResult", ""),
+                    last_run=_ts(t.get("lastRunTime") or t.get("lastRun", "")),
+                )
+                for t in tasks
+            ]
     except Exception as e:
         return str(e)
