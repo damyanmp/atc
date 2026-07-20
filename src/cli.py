@@ -55,6 +55,7 @@ from lib.proxmox import (
     list_backup_jobs, BackupJob,
     run_backup_job, backup_guest, find_backup_storage,
     push_ssh_key_qemu, ssh_key_inject_script,
+    fetch_storage_status_async, StorageStatus,
 )
 from lib.beszel import fetch_systems as fetch_beszel, BeszelSystem
 from lib.hosts import NormalizedHost, merge_hosts
@@ -235,6 +236,24 @@ def _nodes_to_json(cluster: ClusterStatus) -> list[dict]:
             "uptime": n.uptime,
         }
         for n in cluster.nodes
+    ]
+
+
+def _storage_to_json(storages: list[StorageStatus]) -> list[dict]:
+    return [
+        {
+            "node": s.node,
+            "storage": s.storage,
+            "type": s.type,
+            "used": s.used,
+            "total": s.total,
+            "avail": s.avail,
+            "pct": round(s.used / s.total * 100, 2) if s.total else None,
+            "shared": s.shared,
+            "enabled": s.enabled,
+            "active": s.active,
+        }
+        for s in storages
     ]
 
 
@@ -558,6 +577,45 @@ def _render_nodes_table(cluster: ClusterStatus) -> None:
     console.print(t)
 
 
+def _render_storage_table(storages: list[StorageStatus], wide: bool = False) -> None:
+    t = Table(
+        title="Proxmox Storage Pools" if wide else None,
+        box=box.ROUNDED if wide else box.SIMPLE,
+        show_header=True,
+        pad_edge=False,
+    )
+    t.add_column("Node", style="bold", min_width=14)
+    t.add_column("Storage", min_width=12)
+    t.add_column("Type", min_width=8)
+    t.add_column("Used", justify="right")
+    if wide:
+        t.add_column("Used/Total", justify="right")
+    else:
+        t.add_column("Total", justify="right")
+    t.add_column("Shared", justify="center")
+
+    if not storages:
+        console.print("[dim]No storage pools found (or all nodes offline).[/]")
+        return
+
+    for s in storages:
+        if not s.enabled:
+            used = "[dim]disabled[/]"
+        elif not s.active:
+            used = "[dim]inactive[/]"
+        else:
+            pct = s.used / s.total if s.total else 0
+            used = _fmt_pct(pct, warn=0.70, crit=0.90)
+        shared = "[cyan]●[/]" if s.shared else "[dim]—[/]"
+        if wide:
+            total_col = f"{_fmt_bytes(s.used)}/{_fmt_bytes(s.total)}"
+            t.add_row(s.node, s.storage, s.type, used, total_col, shared)
+        else:
+            t.add_row(s.node, s.storage, s.type, used, _fmt_bytes(s.total), shared)
+
+    console.print(t)
+
+
 def _render_guests_table(
     cluster: ClusterStatus,
     guest_type: str | None,
@@ -717,6 +775,34 @@ def get_lxcs(
         _render_guests_wide(cluster, "lxc", ip_map=ip_map)
     else:
         _render_guests_table(cluster, "lxc", label_filter=label, ip_map=ip_map)
+
+
+@get_app.command("storage")
+def get_storage(
+    output: _Out = typer.Option(_Out.table, "-o", help="Output format: table | wide | json"),
+    json_flag: bool = typer.Option(False, "-j", is_flag=True, hidden=True, help="JSON output (shorthand for -o json)"),
+) -> None:
+    """List Proxmox storage pool capacity/usage (the datastores backing VM/LXC disks).
+
+    Unlike the Disk column on [cyan]atc get nodes[/], which reflects the node's
+    root filesystem, this shows the actual storage pools (local-lvm, ZFS, NFS, etc.)
+    where guest virtual disks live — the thing that fills up when VMs run out of space.
+    """
+    if json_flag:
+        output = _Out.json
+    cfg = _load()
+    with console.status("[bold]Fetching cluster state…[/]"):
+        cluster = asyncio.run(fetch_cluster_status(cfg.proxmox))
+    online_nodes = [n.name for n in cluster.nodes if n.online]
+    with console.status("[bold]Fetching storage pools…[/]"):
+        storages = asyncio.run(fetch_storage_status_async(cfg.proxmox, online_nodes))
+
+    if output == _Out.json:
+        console.print_json(_json.dumps(_storage_to_json(storages)))
+    elif output == _Out.wide:
+        _render_storage_table(storages, wide=True)
+    else:
+        _render_storage_table(storages, wide=False)
 
 
 def _do_get_hosts(label: Optional[str], output: _Out) -> None:

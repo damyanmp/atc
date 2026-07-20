@@ -317,6 +317,66 @@ def restart_guest(cfg: ProxmoxClusterConfig, node: str, vmid: int, guest_type: s
         return False
 
 
+# ── Storage dataclasses ─────────────────────────────────────────────────────────
+
+@dataclass
+class StorageStatus:
+    node: str
+    storage: str
+    type: str        # "dir", "lvmthin", "zfspool", "nfs", etc.
+    used: int         # bytes
+    total: int        # bytes
+    avail: int        # bytes
+    shared: bool
+    enabled: bool
+    active: bool
+
+
+def fetch_storage_status(cfg: ProxmoxClusterConfig, online_nodes: list[str]) -> list[StorageStatus]:
+    """List storage pool capacity/usage across the cluster.
+
+    This is distinct from NodeStatus.disk_used/disk_total, which only reflects
+    the node's root filesystem — not the datastore(s) backing VM/LXC disks.
+    Deduplicates shared storages (they'd otherwise appear once per node).
+    """
+    px = _connect(cfg)
+    results: list[StorageStatus] = []
+    seen: set[str] = set()  # (shared-storage-name | node/local-storage-name)
+
+    for node in online_nodes:
+        try:
+            storages = px.nodes(node).storage.get()
+        except Exception:
+            continue
+        for s in storages:
+            storage_name = s.get("storage", "unknown")
+            shared = bool(s.get("shared", 0))
+            key = storage_name if shared else f"{node}/{storage_name}"
+            if key in seen:
+                continue
+            seen.add(key)
+            results.append(StorageStatus(
+                node=node,
+                storage=storage_name,
+                type=s.get("type", ""),
+                used=int(s.get("used", 0)),
+                total=int(s.get("total", 0)),
+                avail=int(s.get("avail", 0)),
+                shared=shared,
+                enabled=bool(s.get("enabled", 1)),
+                active=bool(s.get("active", 0)),
+            ))
+
+    results.sort(key=lambda s: (s.node, s.storage))
+    return results
+
+
+async def fetch_storage_status_async(cfg: ProxmoxClusterConfig, online_nodes: list[str]) -> list[StorageStatus]:
+    """Async wrapper — runs the blocking proxmoxer calls in a thread pool."""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, fetch_storage_status, cfg, online_nodes)
+
+
 # ── Backup dataclasses ────────────────────────────────────────────────────────
 
 @dataclass
