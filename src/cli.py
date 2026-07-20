@@ -2903,6 +2903,164 @@ def cmd_uptimekuma_not(
     _uk_render(failed=True, output=output)
 
 
+# ── acars ────────────────────────────────────────────────────────────────────
+
+def _acars_fetch_prometheus(cfg) -> list[dict]:
+    """Fetch firing/pending Prometheus alerts. Returns [{text, severity}], raises on error."""
+    import httpx
+    _SKIP = {"Watchdog", "NoAlertsFiring", "DeadMansSwitch"}
+    result = []
+    with httpx.Client(verify=cfg.verify_ssl, timeout=10) as client:
+        r = client.get(f"{cfg.base_url}/api/v1/alerts")
+        r.raise_for_status()
+        for alert in r.json().get("data", {}).get("alerts", []):
+            if alert.get("state") not in ("firing", "pending"):
+                continue
+            labels = alert.get("labels", {})
+            name = labels.get("alertname", "?")
+            if name in _SKIP:
+                continue
+            annotations = alert.get("annotations", {})
+            severity = labels.get("severity", "")
+            summary = annotations.get("summary", annotations.get("description", ""))
+            state = alert.get("state", "")
+            text = name
+            if severity:
+                text += f" ({severity})"
+            if state == "pending":
+                text += " [pending]"
+            if summary:
+                text += f" — {summary}"
+            result.append({"text": text, "severity": severity})
+    return result
+
+
+@app.command("acars")
+def cmd_acars(
+    certs_warn: int = typer.Option(30, "--certs-warn", help="Warn when cert expires within N days"),
+    certs_crit: int = typer.Option(14, "--certs-crit", help="Critical when cert expires within N days"),
+) -> None:
+    """Active alerts across all configured infrastructure.
+
+    Checks: Uptime Kuma monitors · TLS cert expiry · Proxmox nodes
+            · Prometheus · Pi-hole instances.
+
+    Exit code 1 when any CRIT alerts are present.
+    """
+    cfg = _load()
+
+    alerts: list[tuple[str, str, str]] = []   # (sev, source, message)
+    source_errors: list[str] = []
+
+    async def _collect_all():
+        async def _sync(fn, *args):
+            return await asyncio.get_event_loop().run_in_executor(None, fn, *args)
+
+        coros: dict = {}
+        if cfg.uptimekuma:
+            coros["uk"] = _sync(_uk_fetch, cfg.uptimekuma)
+        if cfg.tls_checks:
+            coros["certs"] = check_all_certs(cfg.tls_checks)
+        coros["proxmox"] = fetch_cluster_status(cfg.proxmox)
+        if cfg.prometheus:
+            coros["prometheus"] = _sync(_acars_fetch_prometheus, cfg.prometheus)
+        if cfg.pihole_instances:
+            coros["pihole"] = pihole_fetch_all(cfg.pihole_instances)
+
+        results = await asyncio.gather(*coros.values(), return_exceptions=True)
+        return dict(zip(coros.keys(), results))
+
+    with console.status("[bold]Checking all sources…[/]"):
+        result_map = asyncio.run(_collect_all())
+
+    # ── Uptime Kuma ──────────────────────────────────────────────────────────
+    if "uk" in result_map:
+        v = result_map["uk"]
+        if isinstance(v, Exception):
+            source_errors.append(f"Uptime Kuma: {v}")
+        else:
+            for m in v:
+                if m.status != 1:
+                    label, _ = _uk_status(m.status)
+                    sev = "WARN" if m.status == 3 else "CRIT"  # maintenance=WARN, down/pending=CRIT
+                    alerts.append((sev, "Uptime Kuma", f"{m.name} — {label} (24h: {m.uptime_24h*100:.0f}%)"))
+
+    # ── TLS certs ────────────────────────────────────────────────────────────
+    if "certs" in result_map:
+        v = result_map["certs"]
+        if isinstance(v, Exception):
+            source_errors.append(f"TLS certs: {v}")
+        else:
+            for c in v:
+                if not c.ok:
+                    alerts.append(("CRIT", "TLS Certs", f"{c.name} ({c.host}:{c.port}) — {c.error[:60]}"))
+                elif c.days_left <= certs_crit:
+                    alerts.append(("CRIT", "TLS Certs", f"{c.name} — {c.days_left}d remaining"))
+                elif c.days_left <= certs_warn:
+                    alerts.append(("WARN", "TLS Certs", f"{c.name} — {c.days_left}d remaining"))
+
+    # ── Proxmox ──────────────────────────────────────────────────────────────
+    if "proxmox" in result_map:
+        v = result_map["proxmox"]
+        if isinstance(v, Exception):
+            source_errors.append(f"Proxmox: {v}")
+        else:
+            for node in v.nodes:
+                if not node.online:
+                    alerts.append(("CRIT", "Proxmox", f"Node {node.name} — offline"))
+
+    # ── Prometheus ───────────────────────────────────────────────────────────
+    if "prometheus" in result_map:
+        v = result_map["prometheus"]
+        if isinstance(v, Exception):
+            source_errors.append(f"Prometheus: {v}")
+        else:
+            for a in v:
+                sev = "CRIT" if a["severity"] in ("critical", "error") else "WARN"
+                alerts.append((sev, "Prometheus", a["text"]))
+
+    # ── Pi-hole ──────────────────────────────────────────────────────────────
+    if "pihole" in result_map:
+        v = result_map["pihole"]
+        if isinstance(v, Exception):
+            source_errors.append(f"Pi-hole: {v}")
+        else:
+            for s in v:
+                if not s.online:
+                    alerts.append(("CRIT", "Pi-hole", f"{s.name} ({s.host}) — offline"))
+
+    # ── Render ────────────────────────────────────────────────────────────────
+
+    n_sources = len(result_map)
+    n_crits = sum(1 for sev, _, _ in alerts if sev == "CRIT")
+
+    if not alerts and not source_errors:
+        console.print(f"[green]✓[/]  ACARS — all clear  [dim]({n_sources} source(s) checked)[/]")
+        return
+
+    if alerts:
+        console.print()
+        t = Table(box=box.SIMPLE, show_header=False, pad_edge=False)
+        t.add_column("Sev", width=6)
+        t.add_column("Source", min_width=14, style="dim")
+        t.add_column("Message")
+        for sev, source, msg in sorted(alerts, key=lambda x: (0 if x[0] == "CRIT" else 1, x[1])):
+            sev_str = f"[red bold]{sev}[/]" if sev == "CRIT" else f"[yellow]{sev}[/]"
+            t.add_row(sev_str, source, msg)
+        console.print(t)
+        n_issues = len(alerts)
+        crits_str = f"  [red bold]{n_crits} critical[/]" if n_crits else ""
+        console.print(f"\n[dim]{n_issues} issue(s) · {n_sources} source(s) checked{crits_str}[/]\n")
+
+    if source_errors:
+        for e in source_errors:
+            console.print(f"  [yellow]⚠[/]  Source error — [dim]{e}[/]")
+        console.print()
+
+    if n_crits:
+        raise typer.Exit(1)
+
+
 # ── blackbox ──────────────────────────────────────────────────────────────────
 
 from lib.blackbox import collect_all as _bb_collect, render_dump as _bb_render
