@@ -398,6 +398,78 @@ def fetch_stacks(
     ]
 
 
+def fetch_stack_file(cfg: PortainerConfig, stack_id: int) -> str:
+    """Return the current Compose file content for an existing stack."""
+    with _client(cfg) as client:
+        r = client.get(f"{cfg.base_url}/api/stacks/{stack_id}/file", headers=_headers(cfg))
+        if not r.is_success:
+            raise RuntimeError(f"Stack file HTTP {r.status_code} (stack {stack_id}): {r.text[:200]}")
+    return r.json().get("StackFileContent", "")
+
+
+def create_stack(
+    cfg: PortainerConfig,
+    env_id: int,
+    name: str,
+    compose_content: str,
+    env_vars: "list[dict] | None" = None,
+) -> int:
+    """Create a new standalone Compose stack on the given environment. Returns the new stack id."""
+    with _client(cfg) as client:
+        r = client.post(
+            f"{cfg.base_url}/api/stacks/create/standalone/string",
+            headers=_headers(cfg),
+            params={"endpointId": env_id},
+            json={"name": name, "stackFileContent": compose_content, "env": env_vars or []},
+        )
+        if not r.is_success:
+            raise RuntimeError(f"Stack create HTTP {r.status_code} (env {env_id}): {r.text[:300]}")
+    return r.json().get("Id", 0)
+
+
+def update_stack(
+    cfg: PortainerConfig,
+    stack_id: int,
+    env_id: int,
+    compose_content: str,
+    env_vars: "list[dict] | None" = None,
+    prune: bool = True,
+    pull_image: bool = False,
+) -> None:
+    """Redeploy an existing Compose stack with new file content.
+
+    pull_image forces Portainer to re-pull images before redeploying — needed
+    for `:latest`-style tags to actually refresh, since Docker otherwise only
+    pulls images it doesn't already have locally.
+    """
+    with _client(cfg) as client:
+        r = client.put(
+            f"{cfg.base_url}/api/stacks/{stack_id}",
+            headers=_headers(cfg),
+            params={"endpointId": env_id},
+            json={
+                "stackFileContent": compose_content,
+                "env": env_vars or [],
+                "prune": prune,
+                "pullImage": pull_image,
+            },
+        )
+        if not r.is_success:
+            raise RuntimeError(f"Stack update HTTP {r.status_code} (stack {stack_id}): {r.text[:300]}")
+
+
+def delete_stack(cfg: PortainerConfig, stack_id: int, env_id: int) -> None:
+    """Remove a Compose stack and its containers."""
+    with _client(cfg) as client:
+        r = client.delete(
+            f"{cfg.base_url}/api/stacks/{stack_id}",
+            headers=_headers(cfg),
+            params={"endpointId": env_id},
+        )
+        if not r.is_success:
+            raise RuntimeError(f"Stack delete HTTP {r.status_code} (stack {stack_id}): {r.text[:300]}")
+
+
 def stack_action(
     cfg: PortainerConfig,
     stack_id: int,

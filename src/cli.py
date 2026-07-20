@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import difflib
 import getpass
 import json as _json
 import subprocess
@@ -3274,6 +3275,38 @@ def docker_ls(
     console.print(table)
 
 
+@docker_app.command("logs")
+def docker_logs(
+    selector: str = typer.Argument(..., help="Container name (substring match)"),
+    env: str | None = typer.Option(None, "--env", "-e", help="Scope to a specific environment"),
+    tail: int = typer.Option(200, "--tail", "-n", help="Number of lines to show"),
+    since: int = typer.Option(7200, "--since", help="Look back this many seconds"),
+) -> None:
+    """Show recent logs for a container."""
+    cfg = _load()
+    pt_cfg = _require_portainer(cfg)
+
+    from lib.portainer import fetch_container_logs
+    with console.status("[bold]Fetching containers…[/]"):
+        _, containers = _fetch_all_containers(pt_cfg)
+        matches = _match_containers(containers, selector, env)
+
+    if not matches:
+        console.print(f"[yellow]No container found matching '{selector}'[/]")
+        raise typer.Exit(1)
+    if len(matches) > 1:
+        names = ", ".join(f"{c.name} ({c.env_name})" for c in matches)
+        console.print(f"[red]❌  '{selector}' matches multiple containers: {names}[/]")
+        raise typer.Exit(1)
+    c = matches[0]
+
+    with console.status(f"[bold]Fetching logs for {c.name}…[/]"):
+        logs = fetch_container_logs(pt_cfg, c.env_id, c.id, since_seconds=since, tail=tail)
+
+    console.print(f"[dim]── {c.name} ({c.env_name}) — last {tail} line(s) ──[/]")
+    console.print(logs)
+
+
 @docker_app.command("stacks")
 def docker_stacks(
     env: str | None = typer.Option(None, "--env", "-e", help="Filter by environment name"),
@@ -3321,6 +3354,204 @@ def docker_stacks(
         table.add_row(s.env_name, s.name, status, "compose labels")
 
     console.print(table)
+
+
+def _parse_env_file(path: Path) -> list[dict]:
+    """Parse a .env file into Portainer's [{name, value}] stack-env format."""
+    entries = []
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+            value = value[1:-1]
+        entries.append({"name": key, "value": value})
+    return entries
+
+
+def _resolve_single_env(envs, target: str):
+    """Match a single active environment by substring; exit with an error if 0 or 2+ match."""
+    matches = [e for e in envs if target.lower() in e.name.lower()]
+    if not matches:
+        console.print(f"[red]❌  No active environment matching '{target}'[/]")
+        raise typer.Exit(1)
+    if len(matches) > 1:
+        names = ", ".join(e.name for e in matches)
+        console.print(f"[red]❌  '{target}' matches multiple environments: {names}[/]")
+        raise typer.Exit(1)
+    return matches[0]
+
+
+compose_app = typer.Typer(
+    help="Deploy, update, or remove Compose stacks via Portainer",
+    no_args_is_help=True,
+    rich_markup_mode="rich",
+)
+docker_app.add_typer(compose_app, name="compose")
+
+
+@compose_app.command("up")
+def docker_compose_up(
+    compose_file: Path = typer.Argument(
+        ..., exists=True, dir_okay=False, readable=True, help="Path to a docker-compose.yml file",
+    ),
+    target: str = typer.Option(
+        "docker-1", "--target", "-t", help="Environment name to deploy to (substring match)",
+    ),
+    name: str | None = typer.Option(
+        None, "--name", "-n", help="Stack name (defaults to the compose file's parent directory name)",
+    ),
+    env_file: Path | None = typer.Option(
+        None, "--env-file", "-f",
+        help="Path to a .env file (default: a .env next to the compose file, if it exists)",
+    ),
+    pull: bool = typer.Option(
+        False, "--pull", help="Force a fresh image pull before redeploying an existing stack",
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Show what would change without deploying",
+    ),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation"),
+) -> None:
+    """Deploy or update a Compose stack on a Portainer environment.
+
+    Creates a new stack if one with this name doesn't yet exist on the target
+    environment (default: docker-1, the local node), otherwise redeploys it
+    with the new file content. Variables from .env are passed through to
+    Portainer for ${VAR} substitution in the compose file, same as `docker compose`.
+    """
+    cfg = _load()
+    pt_cfg = _require_portainer(cfg)
+
+    compose_content = compose_file.read_text()
+    stack_name = name or compose_file.resolve().parent.name
+
+    if env_file is not None:
+        if not env_file.exists():
+            console.print(f"[red]❌  {env_file} not found[/]")
+            raise typer.Exit(1)
+        resolved_env_file = env_file
+    else:
+        resolved_env_file = compose_file.resolve().parent / ".env"
+
+    env_vars = _parse_env_file(resolved_env_file) if resolved_env_file.exists() else []
+
+    from lib.portainer import (
+        fetch_environments, fetch_containers, fetch_stacks, fetch_stack_file,
+        infer_compose_stacks, create_stack, update_stack,
+    )
+    with console.status("[bold]Resolving target environment…[/]"):
+        envs = [e for e in fetch_environments(pt_cfg) if e.status == 1]
+        env = _resolve_single_env(envs, target)
+
+    with console.status(f"[bold]Checking existing stacks on {env.name}…[/]"):
+        portainer_stacks = fetch_stacks(pt_cfg, envs)
+        existing = [s for s in portainer_stacks if s.env_id == env.id and s.name == stack_name]
+        if not existing:
+            # Not Portainer-managed by this name — but it might still be running
+            # under the same compose project name via a route Portainer doesn't
+            # track (e.g. Synology Container Manager on Globemaster/Greyhound).
+            # Creating a stack on top of that would either collide on container
+            # names or, worse, silently split-brain the same project name across
+            # two management systems. Refuse rather than risk either.
+            env_containers = fetch_containers(pt_cfg, env.id, env.name, all_containers=True)
+            known_names = {s.name for s in portainer_stacks}
+            inferred = infer_compose_stacks(env_containers, portainer_stack_names=known_names)
+            if any(s.name == stack_name for s in inferred):
+                console.print(
+                    f"[red]❌  '{stack_name}' already exists as an unmanaged Compose project "
+                    f"on {env.name} (not registered in Portainer — likely deployed via Synology "
+                    f"Container Manager or plain `docker compose`). Deploying through atc would "
+                    f"either collide on container names or split-brain the project across two "
+                    f"management systems. Use a different --name, or manage this one outside atc.[/]"
+                )
+                raise typer.Exit(1)
+
+    if dry_run:
+        if existing:
+            try:
+                current = fetch_stack_file(pt_cfg, existing[0].id)
+            except Exception as e:
+                console.print(f"[red]❌  Could not fetch current stack file: {e}[/]")
+                raise typer.Exit(1)
+            diff = list(difflib.unified_diff(
+                current.splitlines(keepends=True),
+                compose_content.splitlines(keepends=True),
+                fromfile=f"{stack_name} (deployed)",
+                tofile=f"{compose_file} (local)",
+            ))
+            if diff:
+                console.print("".join(diff), end="")
+            else:
+                console.print(f"[dim]No changes — {stack_name} is already up to date on {env.name}[/]")
+        else:
+            console.print(f"[bold]Would create[/] new stack [cyan]{stack_name}[/] on [cyan]{env.name}[/]:\n")
+            console.print(compose_content)
+        raise typer.Exit(0)
+
+    action = "Update" if existing else "Create"
+    console.print(f"\n[bold]{action}[/] stack [cyan]{stack_name}[/] on [cyan]{env.name}[/] from {compose_file}")
+    if env_vars:
+        console.print(f"[dim]Loaded {len(env_vars)} var(s) from {resolved_env_file}[/]")
+    if pull and existing:
+        console.print("[dim]Will force a fresh image pull[/]")
+    if not yes and not Confirm.ask(f"\n{action} stack '{stack_name}'?"):
+        raise typer.Exit(0)
+
+    try:
+        with console.status(f"[bold]{action.rstrip('e')}ing stack {stack_name}…[/]"):
+            if existing:
+                update_stack(pt_cfg, existing[0].id, env.id, compose_content, env_vars, pull_image=pull)
+            else:
+                create_stack(pt_cfg, env.id, stack_name, compose_content, env_vars)
+        console.print(f"[green]✓[/] {stack_name} — {action.lower()}d on {env.name}")
+    except Exception as e:
+        console.print(f"[red]✗[/] {stack_name} — {e}")
+        raise typer.Exit(1)
+
+
+@compose_app.command("down")
+def docker_compose_down(
+    name: str = typer.Argument(..., help="Stack name"),
+    target: str = typer.Option(
+        "docker-1", "--target", "-t", help="Environment the stack lives on (substring match)",
+    ),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation"),
+) -> None:
+    """Remove a Portainer-managed Compose stack and its containers."""
+    cfg = _load()
+    pt_cfg = _require_portainer(cfg)
+
+    from lib.portainer import fetch_environments, fetch_stacks, delete_stack
+    with console.status("[bold]Resolving target environment…[/]"):
+        envs = [e for e in fetch_environments(pt_cfg) if e.status == 1]
+        env = _resolve_single_env(envs, target)
+
+    with console.status(f"[bold]Looking up stack '{name}' on {env.name}…[/]"):
+        found = [s for s in fetch_stacks(pt_cfg, envs) if s.env_id == env.id and s.name == name]
+
+    if not found:
+        console.print(f"[yellow]No stack named '{name}' found on {env.name}[/]")
+        raise typer.Exit(1)
+    stack = found[0]
+
+    console.print(
+        f"\n[bold red]Remove[/] stack [cyan]{stack.name}[/] on [cyan]{env.name}[/] "
+        f"(stops and deletes all its containers)"
+    )
+    if not yes and not Confirm.ask(f"\nRemove stack '{stack.name}'?"):
+        raise typer.Exit(0)
+
+    try:
+        with console.status(f"[bold]Removing stack {stack.name}…[/]"):
+            delete_stack(pt_cfg, stack.id, env.id)
+        console.print(f"[green]✓[/] {stack.name} — removed from {env.name}")
+    except Exception as e:
+        console.print(f"[red]✗[/] {stack.name} — {e}")
+        raise typer.Exit(1)
 
 
 def _docker_action(
