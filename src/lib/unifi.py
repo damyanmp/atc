@@ -308,6 +308,26 @@ def fetch_firewall_groups(cfg: UniFiConfig, site: str = "default") -> list[UniFi
     ]
 
 
+def fetch_port_forwards(cfg: UniFiConfig, site: str = "default") -> list[dict]:
+    """Return all port-forward rules (raw dicts) for the given site (legacy REST API)."""
+    data = _get(cfg, f"/api/s/{site}/rest/portforward")
+    return data.get("data", [])
+
+
+def delete_port_forward(cfg: UniFiConfig, site: str, forward_id: str) -> None:
+    """Delete a port-forward rule by its _id (legacy REST API)."""
+    _write_legacy(cfg, "DELETE", f"/api/s/{site}/rest/portforward/{forward_id}")
+
+
+def update_port_forward(cfg: UniFiConfig, site: str, current: dict, updated_fields: dict) -> dict:
+    """Update a port-forward rule. `current` is a raw dict from fetch_port_forwards();
+    the legacy REST API expects the full object (including _id) on PUT.
+    """
+    body = dict(current)
+    body.update(updated_fields)
+    return _write_legacy(cfg, "PUT", f"/api/s/{site}/rest/portforward/{body['_id']}", body)
+
+
 def fetch_networks(cfg: UniFiConfig, site: str = "default") -> list[UniFiNetwork]:
     """Return all configured networks (VLANs, WAN, etc.)."""
     data = _get(cfg, f"/api/s/{site}/rest/networkconf")
