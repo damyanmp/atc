@@ -441,6 +441,29 @@ def fetch_firewall_policies_v1(
     return sorted(policies, key=lambda x: (x.src_zone_name, x.dst_zone_name, x.index))
 
 
+def update_firewall_policy_v1(cfg: UniFiConfig, site_id: str, policy_id: str, updated_fields: dict) -> dict:
+    """Fetch the current policy, merge updated_fields (shallow) into it, PUT the full object back.
+
+    The integration v1 API expects the full policy object on PUT, not a partial patch.
+    """
+    current = _get_v1(cfg, f"/sites/{site_id}/firewall/policies/{policy_id}")
+    current.pop("id", None)
+    current.pop("index", None)
+    current.pop("metadata", None)
+    current.update(updated_fields)
+    return _write_v1(cfg, "PUT", f"/sites/{site_id}/firewall/policies/{policy_id}", current)
+
+
+def delete_firewall_policy_v1(cfg: UniFiConfig, site_id: str, policy_id: str) -> None:
+    """Delete a firewall policy by its id (integration v1 API)."""
+    _write_v1(cfg, "DELETE", f"/sites/{site_id}/firewall/policies/{policy_id}")
+
+
+def create_firewall_policy_v1(cfg: UniFiConfig, site_id: str, body: dict) -> dict:
+    """Create a new firewall policy (integration v1 API). Returns the created policy."""
+    return _write_v1(cfg, "POST", f"/sites/{site_id}/firewall/policies", body)
+
+
 # ── Export ────────────────────────────────────────────────────────────────────
 
 def export_firewall_config(
