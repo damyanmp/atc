@@ -1064,13 +1064,16 @@ def run_update_hosts(
         raise SystemExit(1)
 
     with console.status("[bold]Resolving guest IPs…[/]"):
-        ips = {g.name: get_node_ip(cfg.proxmox, g.node, g.vmid, g.type) for g in matched}
+        # Keyed by vmid, not name — Proxmox guest names aren't unique across a
+        # cluster (e.g. every community-script Pi-hole LXC is named "pihole"),
+        # so a name-keyed dict silently collapses distinct guests onto one IP.
+        ips = {g.vmid: get_node_ip(cfg.proxmox, g.node, g.vmid, g.type) for g in matched}
 
     # Separate HA OS guest (matched by IP) from regular apt targets
     ha_guest: GuestInfo | None = None
     ssh_guests: list[GuestInfo] = []
     for g in matched:
-        if cfg.ha and ips.get(g.name) == cfg.ha.host:
+        if cfg.ha and ips.get(g.vmid) == cfg.ha.host:
             ha_guest = g
         else:
             ssh_guests.append(g)
@@ -1088,7 +1091,7 @@ def run_update_hosts(
         custom = cfg.ssh.guest_update_cmd(g.name)
         targets.append(UpdateTarget(
             name=f"{g.name} [dim]({'lxc' if g.type == 'lxc' else 'vm'} #{g.vmid} @ {g.node})[/dim]",
-            host=ips[g.name] or g.name,
+            host=ips[g.vmid] or g.name,
             user=user,
             update_cmd=custom.cmd if custom else None,
             update_cmd_headless=custom.headless if custom else False,
