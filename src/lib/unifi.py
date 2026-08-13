@@ -71,18 +71,60 @@ def _get(cfg: UniFiConfig, path: str) -> dict:
 
 
 def _get_v1(cfg: UniFiConfig, path: str):
-    """GET an integration v1 API path.
+    """GET an integration v1 API path, auto-paginating list endpoints.
 
     Base: /proxy/network/integration/v1{path}
-    Returns the parsed JSON as-is (may be a dict or a list depending on endpoint).
+    List endpoints return {"offset", "limit", "count", "totalCount", "data": [...]}.
+    This transparently pages through offset until all totalCount items are fetched
+    and returns the dict with a fully-populated "data" list. Non-paginated responses
+    (single-resource GETs, or a bare list) are returned as-is.
     """
+    base = f"{cfg.base_url}/proxy/network/integration/v1" if cfg.udm else f"{cfg.base_url}/integration/v1"
+
+    def _one_page(offset: int):
+        sep = "&" if "?" in path else "?"
+        url = f"{base}{path}{sep}offset={offset}" if offset else f"{base}{path}"
+        with _client(cfg) as client:
+            r = client.get(url, headers=_auth_headers(cfg))
+            if not r.is_success:
+                raise RuntimeError(f"UniFi v1 GET {path} HTTP {r.status_code}: {r.text[:200]}")
+            return r.json()
+
+    result = _one_page(0)
+    if isinstance(result, dict) and "totalCount" in result and "data" in result:
+        all_data = list(result["data"])
+        while len(all_data) < result["totalCount"]:
+            page = _one_page(len(all_data))
+            page_data = page.get("data", [])
+            if not page_data:
+                break
+            all_data.extend(page_data)
+        result["data"] = all_data
+        result["count"] = len(all_data)
+    return result
+
+
+def _write_v1(cfg: UniFiConfig, method: str, path: str, json_body: dict | None = None):
+    """PUT/DELETE against the integration v1 API. Requires api_key auth."""
     base = f"{cfg.base_url}/proxy/network/integration/v1" if cfg.udm else f"{cfg.base_url}/integration/v1"
     url = f"{base}{path}"
     with _client(cfg) as client:
-        r = client.get(url, headers=_auth_headers(cfg))
+        r = client.request(method, url, headers=_auth_headers(cfg), json=json_body)
         if not r.is_success:
-            raise RuntimeError(f"UniFi v1 GET {path} HTTP {r.status_code}: {r.text[:200]}")
-        return r.json()
+            raise RuntimeError(f"UniFi v1 {method} {path} HTTP {r.status_code}: {r.text[:300]}")
+        return r.json() if r.text else None
+
+
+def _write_legacy(cfg: UniFiConfig, method: str, path: str, json_body: dict | None = None):
+    """PUT/POST/DELETE against a legacy UniFi API path (cookie or api_key auth)."""
+    url = f"{cfg.base_url}{_api_prefix(cfg)}{path}"
+    with _client(cfg) as client:
+        if not cfg.api_key:
+            _login(client, cfg)
+        r = client.request(method, url, headers=_auth_headers(cfg), json=json_body)
+        if not r.is_success:
+            raise RuntimeError(f"UniFi {method} {path} HTTP {r.status_code}: {r.text[:300]}")
+        return r.json() if r.text else None
 
 
 # ── Data models ───────────────────────────────────────────────────────────────
