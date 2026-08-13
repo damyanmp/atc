@@ -1,12 +1,6 @@
 pihole:
   cmd: pihole updatePihole --unattended
   headless: true
-draken:
-  cmd: pihole updatePihole --unattended
-  headless: true
-viggen:
-  cmd: pihole updatePihole --unattended
-  headless: true
 postgresql:
   cmd: update
   headless: false
