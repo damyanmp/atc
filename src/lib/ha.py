@@ -100,6 +100,9 @@ def call_service(
         return r.json()
 
 
+_UPDATE_FEATURE_INSTALL = 1  # homeassistant.components.update.UpdateEntityFeature.INSTALL
+
+
 @dataclass
 class HAUpdateEntity:
     entity_id: str
@@ -108,10 +111,21 @@ class HAUpdateEntity:
     latest_version: str
     release_url: str = ""
     category: str = ""  # "core", "supervisor", "os", "hacs", "integration", "addon", etc.
+    supported_features: int = 0
 
     @property
     def is_pending(self) -> bool:
         return self.installed_version != self.latest_version
+
+    @property
+    def supports_install(self) -> bool:
+        """Whether HA's update.install service will actually work for this entity.
+
+        Some integrations (e.g. Pi-hole) only report update availability and never
+        implement install — calling update.install on them always 500s. HA exposes
+        this via the INSTALL bit of the entity's supported_features bitmask.
+        """
+        return bool(self.supported_features & _UPDATE_FEATURE_INSTALL)
 
     @property
     def short_category(self) -> str:
@@ -149,6 +163,7 @@ def list_updates(cfg: HAConfig, pending_only: bool = True) -> list[HAUpdateEntit
                 latest_version=latest,
                 release_url=attrs.get("release_url") or "",
                 category=attrs.get("entity_category") or "",
+                supported_features=attrs.get("supported_features") or 0,
             )
             if pending_only and not ue.is_pending:
                 continue

@@ -1567,22 +1567,23 @@ def _update_ha_via_api(guest: GuestInfo, cfg: Config, yes: bool) -> None:
         console.print("[green]✓[/] Home Assistant — all up to date.")
         return
 
-    # Separate firmware (not API-installable) from everything else,
-    # and sort restarters (core/os/supervisor) to run last.
-    firmware = [u for u in pending if u.short_category == "firmware"]
+    # Separate updates HA can't actually install via the API (no INSTALL support —
+    # e.g. Pi-hole, most Zigbee firmware) from everything else, and sort restarters
+    # (core/os/supervisor) to run last.
+    not_installable = [u for u in pending if not u.supports_install]
     restarters = [u for u in pending if u.short_category in _HA_RESTART_CATEGORIES]
-    normal = [u for u in pending if u not in firmware and u not in restarters]
+    normal = [u for u in pending if u not in not_installable and u not in restarters]
     installable = normal + restarters
 
     console.print(f"[bold]{len(pending)}[/] update(s) available:")
     for u in sorted(pending, key=lambda x: (x.short_category, x.title)):
-        note = " [dim](install via HA UI)[/]" if u in firmware else ""
+        note = " [dim](install via HA UI)[/]" if u in not_installable else ""
         console.print(f"  [dim]•[/] [bold]{u.title}[/]  {u.installed_version} → [yellow]{u.latest_version}[/]  [dim]({u.short_category})[/]{note}")
 
     if restarters:
         console.print(f"\n[yellow]⚠[/]  {', '.join(u.title for u in restarters)} will restart HA — install last.")
-    if firmware:
-        console.print(f"[dim]ℹ  {len(firmware)} firmware update(s) skipped — trigger from the HA UI.[/]")
+    if not_installable:
+        console.print(f"[dim]ℹ  {len(not_installable)} update(s) skipped — no API install support, trigger from the HA UI.[/]")
 
     if not installable:
         return
@@ -2705,6 +2706,14 @@ def ha_update(
     if not targets:
         console.print("[green]✓[/] Nothing to update.")
         return
+
+    not_installable = [u for u in targets if not u.supports_install]
+    if not_installable:
+        targets = [u for u in targets if u.supports_install]
+        for u in not_installable:
+            console.print(f"[dim]ℹ  {u.title} — no API install support, skipped. Use the HA UI.[/]")
+        if not targets:
+            raise typer.Exit(0)
 
     console.print(f"Installing [bold]{len(targets)}[/] update(s):")
     for u in targets:
