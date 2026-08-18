@@ -2948,6 +2948,54 @@ def _acars_fetch_prometheus(cfg) -> list[dict]:
     return result
 
 
+_ACARS_LOG_WINDOW_MINUTES = 15  # "current", not historical — see atc blackbox for the deep dump
+
+
+def _acars_fetch_unifi(cfg) -> list[dict]:
+    """Devices offline, or rebooted/firmware-updated in the last _ACARS_LOG_WINDOW_MINUTES.
+    Returns [{text, severity}], raises on error."""
+    import time
+    from lib.unifi import fetch_devices
+
+    result = []
+    now = int(time.time())
+    since = now - (_ACARS_LOG_WINDOW_MINUTES * 60)
+
+    for d in fetch_devices(cfg, site=cfg.site):
+        if d.state != 1:
+            result.append({"text": f"{d.name} ({d.model}) — offline (state={d.state})", "severity": "CRIT"})
+            continue
+
+        boot_time = now - d.uptime if d.uptime else d.startup_timestamp
+        if not boot_time or boot_time < since:
+            continue
+        mins_ago = max(0, (now - boot_time) // 60)
+        if d.previous_firmware_version and d.previous_firmware_version != d.version:
+            text = f"{d.name} ({d.model}) firmware {d.previous_firmware_version} → {d.version}, rebooted {mins_ago}m ago"
+        else:
+            text = f"{d.name} ({d.model}) rebooted {mins_ago}m ago"
+        result.append({"text": text, "severity": "WARN"})
+
+    return result
+
+
+def _acars_fetch_loki(cfg) -> list[dict]:
+    """Flagged syslog/pihole lines in the last _ACARS_LOG_WINDOW_MINUTES.
+    Returns [{text, severity}], raises on error. Always WARN — these are
+    heuristic log-line matches, not a clean up/down signal like the other
+    sources, so they shouldn't trip acars' CRIT/exit-1 behavior."""
+    from lib.loki import fetch_network_events, fetch_pihole_events
+
+    result = []
+    for ts, host, line in fetch_network_events(cfg, _ACARS_LOG_WINDOW_MINUTES):
+        prefix = f"{host}: " if host else ""
+        result.append({"text": f"{prefix}{line.strip()}", "severity": "WARN"})
+    for ts, host, line in fetch_pihole_events(cfg, _ACARS_LOG_WINDOW_MINUTES):
+        prefix = f"{host}: " if host else ""
+        result.append({"text": f"{prefix}{line.strip()}", "severity": "WARN"})
+    return result
+
+
 @app.command("acars")
 def cmd_acars(
     certs_warn: int = typer.Option(30, "--certs-warn", help="Warn when cert expires within N days"),
@@ -2956,7 +3004,9 @@ def cmd_acars(
     """Active alerts across all configured infrastructure.
 
     Checks: Uptime Kuma monitors · TLS cert expiry · Proxmox nodes
-            · Prometheus · Pi-hole instances.
+            · Prometheus · Pi-hole instances · UniFi device state/firmware
+            · Loki syslog/pihole log events (last 15 min — live, not historical;
+            see `atc blackbox` for a deep historical dump).
 
     Exit code 1 when any CRIT alerts are present.
     """
@@ -2979,6 +3029,10 @@ def cmd_acars(
             coros["prometheus"] = _sync(_acars_fetch_prometheus, cfg.prometheus)
         if cfg.pihole_instances:
             coros["pihole"] = pihole_fetch_all(cfg.pihole_instances)
+        if cfg.unifi:
+            coros["unifi"] = _sync(_acars_fetch_unifi, cfg.unifi)
+        if cfg.loki:
+            coros["loki"] = _sync(_acars_fetch_loki, cfg.loki)
 
         results = await asyncio.gather(*coros.values(), return_exceptions=True)
         return dict(zip(coros.keys(), results))
@@ -3042,6 +3096,24 @@ def cmd_acars(
                 if not s.online:
                     alerts.append(("CRIT", "Pi-hole", f"{s.name} ({s.host}) — offline"))
 
+    # ── UniFi ────────────────────────────────────────────────────────────────
+    if "unifi" in result_map:
+        v = result_map["unifi"]
+        if isinstance(v, Exception):
+            source_errors.append(f"UniFi: {v}")
+        else:
+            for e in v:
+                alerts.append((e["severity"], "UniFi", e["text"]))
+
+    # ── Loki (syslog/pihole, live) ───────────────────────────────────────────
+    if "loki" in result_map:
+        v = result_map["loki"]
+        if isinstance(v, Exception):
+            source_errors.append(f"Loki: {v}")
+        else:
+            for e in v:
+                alerts.append((e["severity"], "Loki", e["text"]))
+
     # ── Render ────────────────────────────────────────────────────────────────
 
     n_sources = len(result_map)
@@ -3097,7 +3169,8 @@ def cmd_blackbox(
 
     Gathers data from Uptime Kuma (outage history), Proxmox, SSH host
     journals, Portainer Docker environments, Home Assistant error log,
-    and Prometheus firing alerts — all in parallel.
+    Prometheus firing alerts, Loki syslog/pihole log events, and UniFi
+    device reboots/firmware updates — all in parallel.
     """
     cfg = _load()
 
@@ -3114,6 +3187,10 @@ def cmd_blackbox(
         sources.append("Home Assistant")
     if cfg.prometheus:
         sources.append("Prometheus")
+    if cfg.loki:
+        sources.append("Loki (syslog/pihole)")
+    if cfg.unifi:
+        sources.append("UniFi Network")
 
     console.print(f"[bold]Collecting blackbox dump[/] (window: {hours}h)")
     console.print(f"Sources: {', '.join(sources)}")
@@ -3194,6 +3271,31 @@ def cmd_blackbox(
         n = len(dump.prometheus.firing_alerts)
         color = "red" if n else "green"
         console.print(f"  Prometheus   [{color}]{n} firing alert(s)[/]")
+
+    if dump.loki:
+        if dump.loki.error:
+            console.print(f"  Loki         [yellow]ERROR: {dump.loki.error}[/]")
+        else:
+            n_syslog = len(dump.loki.syslog_events)
+            n_pihole = len(dump.loki.pihole_events)
+            color = "yellow" if n_syslog or n_pihole else "green"
+            console.print(
+                f"  Loki         [{color}]{n_syslog} syslog event(s),"
+                f" {n_pihole} pihole event(s)[/]"
+            )
+
+    if dump.unifi:
+        if dump.unifi.error:
+            console.print(f"  UniFi        [yellow]ERROR: {dump.unifi.error}[/]")
+        else:
+            n_reboot = len(dump.unifi.recent_reboots)
+            n_fw = len(dump.unifi.firmware_updates)
+            n_off = len(dump.unifi.offline_devices)
+            color = "red" if n_off else ("yellow" if n_reboot or n_fw else "green")
+            console.print(
+                f"  UniFi        [{color}]{len(dump.unifi.devices)} device(s),"
+                f" {n_reboot} reboot(s), {n_fw} firmware update(s), {n_off} offline[/]"
+            )
 
     console.print("")
     console.print(f"Open: [dim]{out}[/]")

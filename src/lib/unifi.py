@@ -210,6 +210,21 @@ class UniFiClient:
 
 
 @dataclass
+class UniFiDevice:
+    name: str
+    model: str
+    type: str                          # "usw", "uap", "udm", "usg", ...
+    state: int                         # 1 = connected/online
+    version: str
+    previous_firmware_version: str     # empty if never upgraded
+    uptime: int                        # seconds
+    startup_timestamp: int             # epoch seconds — device boot time (0 if unknown)
+    upgrade_duration: int              # seconds; 0 unless a firmware upgrade just ran
+    uplink_device_name: str            # empty for the gateway itself
+    raw: dict = field(default_factory=dict, repr=False)
+
+
+@dataclass
 class UniFiNetwork:
     id: str
     name: str
@@ -366,6 +381,34 @@ def fetch_clients(cfg: UniFiConfig, site: str = "default") -> list[UniFiClient]:
             raw=c,
         ))
     return sorted(clients, key=lambda x: (x.network, x.display_name.lower()))
+
+
+def fetch_devices(cfg: UniFiConfig, site: str = "default") -> list[UniFiDevice]:
+    """Return all adopted UniFi devices (switches, APs, gateway) for the given site.
+
+    Includes uptime/boot-time and firmware-version fields, which is enough to detect
+    recent reboots and firmware auto-updates without a true event-log endpoint — the
+    legacy stat/event and stat/alarm endpoints return 404 under API-key auth on
+    current Network app versions.
+    """
+    data = _get(cfg, f"/api/s/{site}/stat/device")
+    devices = []
+    for d in data.get("data", []):
+        uplink = d.get("uplink") or {}
+        devices.append(UniFiDevice(
+            name=d.get("name") or d.get("model", ""),
+            model=d.get("model", ""),
+            type=d.get("type", ""),
+            state=int(d.get("state", 0) or 0),
+            version=d.get("version", ""),
+            previous_firmware_version=d.get("previous_firmware_version", ""),
+            uptime=int(d.get("uptime", 0) or 0),
+            startup_timestamp=int(d.get("startup_timestamp", 0) or 0),
+            upgrade_duration=int(d.get("upgrade_duration", 0) or 0),
+            uplink_device_name=uplink.get("uplink_device_name", ""),
+            raw=d,
+        ))
+    return sorted(devices, key=lambda x: x.name.lower())
 
 
 # ── Integration v1 fetch functions ───────────────────────────────────────────

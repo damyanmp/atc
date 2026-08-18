@@ -10,6 +10,7 @@ Sources collected (each optional/skipped if not configured):
   - Portainer: container health + logs for unhealthy/exited containers
   - Home Assistant: error log tail
   - Prometheus: active/firing alert rules
+  - UniFi Network: device inventory, recent reboots, firmware updates, offline devices
 """
 from __future__ import annotations
 
@@ -72,6 +73,24 @@ class BBPrometheus:
 
 
 @dataclass
+class BBLoki:
+    syslog_events: list[str] = field(default_factory=list)   # filtered, formatted "[ts] host: line"
+    pihole_events: list[str] = field(default_factory=list)
+    syslog_lines_scanned: int = 0
+    pihole_lines_scanned: int = 0
+    error: str = ""
+
+
+@dataclass
+class BBUniFi:
+    devices: list[str] = field(default_factory=list)           # full device table, one line each
+    recent_reboots: list[str] = field(default_factory=list)    # boot time inside window
+    firmware_updates: list[str] = field(default_factory=list)  # version changed, inside window
+    offline_devices: list[str] = field(default_factory=list)   # state != 1 (not connected)
+    error: str = ""
+
+
+@dataclass
 class BlackboxDump:
     collected_at: str
     window_hours: int
@@ -81,6 +100,8 @@ class BlackboxDump:
     docker_envs: list[BBDockerEnv] = field(default_factory=list)
     homeassistant: BBHomeAssistant | None = None
     prometheus: BBPrometheus | None = None
+    loki: BBLoki | None = None
+    unifi: BBUniFi | None = None
 
 
 # ── Collectors ────────────────────────────────────────────────────────────────
@@ -340,6 +361,94 @@ def _collect_prometheus(prometheus_url: str, verify_ssl: bool = False) -> BBProm
     return result
 
 
+def _collect_loki(cfg, window_hours: int) -> BBLoki:
+    from lib.loki import fetch_network_events, fetch_pihole_events, count_over_window
+
+    result = BBLoki()
+    window_minutes = window_hours * 60
+
+    try:
+        result.syslog_lines_scanned = count_over_window(cfg.loki, '{job="syslog"}', window_minutes)
+        for ts, host, line in fetch_network_events(cfg.loki, window_minutes):
+            prefix = f"{host}: " if host else ""
+            result.syslog_events.append(f"[{ts}] {prefix}{line.strip()}")
+        result.syslog_events = result.syslog_events[:300]
+    except Exception as e:
+        result.error = f"syslog query failed: {e}"
+
+    try:
+        result.pihole_lines_scanned = count_over_window(cfg.loki, '{job="pihole"}', window_minutes)
+        for ts, host, line in fetch_pihole_events(cfg.loki, window_minutes):
+            prefix = f"{host}: " if host else ""
+            result.pihole_events.append(f"[{ts}] {prefix}{line.strip()}")
+        result.pihole_events = result.pihole_events[:300]
+    except Exception as e:
+        if result.error:
+            result.error += f"; pihole query failed: {e}"
+        else:
+            result.error = f"pihole query failed: {e}"
+
+    return result
+
+
+def _fmt_duration(seconds: int) -> str:
+    if seconds <= 0:
+        return "0s"
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, _ = divmod(rem, 60)
+    parts = []
+    if days:
+        parts.append(f"{days}d")
+    if hours:
+        parts.append(f"{hours}h")
+    if minutes and not days:
+        parts.append(f"{minutes}m")
+    return " ".join(parts) or "<1m"
+
+
+def _collect_unifi(cfg, window_hours: int) -> BBUniFi:
+    from lib.unifi import fetch_devices
+    import time
+
+    result = BBUniFi()
+    try:
+        devices = fetch_devices(cfg.unifi, site=cfg.unifi.site)
+    except Exception as e:
+        result.error = str(e)
+        return result
+
+    now = int(time.time())
+    since = now - (window_hours * 3600)
+
+    for d in devices:
+        state_tag = "up" if d.state == 1 else f"DOWN(state={d.state})"
+        uplink = f" ← {d.uplink_device_name}" if d.uplink_device_name else ""
+        result.devices.append(
+            f"  {d.name:<20} {d.type:<5} {d.model:<10} v{d.version:<14} {state_tag:<14}"
+            f" up {_fmt_duration(d.uptime)}{uplink}"
+        )
+
+        if d.state != 1:
+            result.offline_devices.append(f"{d.name} ({d.model}) — state={d.state}")
+
+        boot_time = now - d.uptime if d.uptime else d.startup_timestamp
+        if boot_time and boot_time >= since:
+            boot_iso = datetime.fromtimestamp(boot_time, tz=timezone.utc).isoformat()[:19]
+            result.recent_reboots.append(
+                f"[{boot_iso}] {d.name} ({d.model}) rebooted — up {_fmt_duration(d.uptime)}{uplink}"
+            )
+
+        if d.previous_firmware_version and d.previous_firmware_version != d.version and boot_time >= since:
+            boot_iso = datetime.fromtimestamp(boot_time, tz=timezone.utc).isoformat()[:19]
+            dur = f" ({d.upgrade_duration}s)" if d.upgrade_duration else ""
+            result.firmware_updates.append(
+                f"[{boot_iso}] {d.name} ({d.model}): {d.previous_firmware_version} → {d.version}{dur}"
+            )
+
+    return result
+
+
 # ── Orchestration ─────────────────────────────────────────────────────────────
 
 async def collect_all(
@@ -377,6 +486,12 @@ async def collect_all(
             _wrap_sync(_collect_prometheus, prometheus_url, prometheus_verify_ssl)
         )
 
+    if cfg.loki:
+        tasks["loki"] = asyncio.create_task(_wrap_sync(_collect_loki, cfg, window_hours))
+
+    if cfg.unifi:
+        tasks["unifi"] = asyncio.create_task(_wrap_sync(_collect_unifi, cfg, window_hours))
+
     results = await asyncio.gather(*tasks.values(), return_exceptions=True)
     result_map = dict(zip(tasks.keys(), results))
 
@@ -401,6 +516,14 @@ async def collect_all(
     if "prometheus" in result_map:
         v = result_map["prometheus"]
         dump.prometheus = v if isinstance(v, BBPrometheus) else BBPrometheus(error=str(v))
+
+    if "loki" in result_map:
+        v = result_map["loki"]
+        dump.loki = v if isinstance(v, BBLoki) else BBLoki(error=str(v))
+
+    if "unifi" in result_map:
+        v = result_map["unifi"]
+        dump.unifi = v if isinstance(v, BBUniFi) else BBUniFi(error=str(v))
 
     return dump
 
@@ -459,6 +582,26 @@ def render_dump(dump: BlackboxDump) -> str:
             lines.append(f"  Prometheus  : ERROR — {dump.prometheus.error}")
         else:
             lines.append(f"  Prometheus  : {len(dump.prometheus.firing_alerts)} firing alert(s)")
+    if dump.loki:
+        if dump.loki.error:
+            lines.append(f"  Loki        : ERROR — {dump.loki.error}")
+        else:
+            lines.append(
+                f"  Loki        : {len(dump.loki.syslog_events)} syslog event(s)"
+                f" (of {dump.loki.syslog_lines_scanned} scanned),"
+                f" {len(dump.loki.pihole_events)} pihole event(s)"
+                f" (of {dump.loki.pihole_lines_scanned} scanned)"
+            )
+    if dump.unifi:
+        if dump.unifi.error:
+            lines.append(f"  UniFi       : ERROR — {dump.unifi.error}")
+        else:
+            lines.append(
+                f"  UniFi       : {len(dump.unifi.devices)} device(s),"
+                f" {len(dump.unifi.recent_reboots)} recent reboot(s),"
+                f" {len(dump.unifi.firmware_updates)} firmware update(s),"
+                f" {len(dump.unifi.offline_devices)} offline"
+            )
 
     # Uptime Kuma
     if dump.uptime_kuma:
@@ -558,6 +701,70 @@ def render_dump(dump: BlackboxDump) -> str:
                 lines.append(f"  {a}")
         else:
             lines.append("  No firing alerts.")
+
+    # Loki — syslog / pihole
+    if dump.loki:
+        lines.append(_section("LOKI — SYSLOG / PIHOLE"))
+        if dump.loki.error:
+            lines.append(f"ERROR: {dump.loki.error}")
+        else:
+            lines.append(
+                f"Syslog events in last {dump.window_hours}h"
+                f" ({dump.loki.syslog_lines_scanned} lines scanned):"
+            )
+            if dump.loki.syslog_events:
+                for s in dump.loki.syslog_events:
+                    lines.append(f"  {s}")
+            else:
+                lines.append("  No flagged syslog events.")
+            lines.append("")
+
+            lines.append(
+                f"Pi-hole events in last {dump.window_hours}h"
+                f" ({dump.loki.pihole_lines_scanned} lines scanned):"
+            )
+            if dump.loki.pihole_events:
+                for p in dump.loki.pihole_events:
+                    lines.append(f"  {p}")
+            else:
+                lines.append("  No flagged pihole events.")
+
+    # UniFi Network
+    if dump.unifi:
+        lines.append(_section("UNIFI NETWORK"))
+        if dump.unifi.error:
+            lines.append(f"ERROR: {dump.unifi.error}")
+        else:
+            if dump.unifi.firmware_updates:
+                lines.append(f"Firmware updates in last {dump.window_hours}h:")
+                for u in dump.unifi.firmware_updates:
+                    lines.append(f"  ⬆ {u}")
+            else:
+                lines.append(f"  No firmware updates in last {dump.window_hours}h.")
+            lines.append("")
+
+            if dump.unifi.recent_reboots:
+                lines.append(f"Reboots in last {dump.window_hours}h:")
+                for r in dump.unifi.recent_reboots:
+                    lines.append(f"  ↻ {r}")
+            else:
+                lines.append(f"  No device reboots in last {dump.window_hours}h.")
+            lines.append("")
+
+            if dump.unifi.offline_devices:
+                lines.append("Currently offline / not connected:")
+                for o in dump.unifi.offline_devices:
+                    lines.append(f"  ✗ {o}")
+            else:
+                lines.append("  All devices online.")
+            lines.append("")
+
+            if dump.unifi.devices:
+                lines.append("Devices:")
+                for d in dump.unifi.devices:
+                    lines.append(d)
+            else:
+                lines.append("  No devices found.")
 
     lines.append(f"\n{_SEP}")
     lines.append(f"# End of blackbox dump — {dump.collected_at}")
