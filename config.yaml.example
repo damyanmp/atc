@@ -185,6 +185,14 @@ prometheus:
   https: false
   verify_ssl: false
 
+loki:
+  # Loki — used by blackbox to include filtered syslog (job="syslog") and
+  # Pi-hole (job="pihole") log lines. No auth required for most self-hosted instances.
+  host: 192.168.x.x
+  port: 3100
+  https: false
+  verify_ssl: false
+
 openspeedtest:
   # Self-hosted OpenSpeedTest server (docker: openspeedtest/latest).
   # No auth required — just point at the host and port.

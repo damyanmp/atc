@@ -319,6 +319,19 @@ class PrometheusConfig:
         return f"{scheme}://{self.host}:{self.port}"
 
 
+@dataclass
+class LokiConfig:
+    host: str
+    port: int = 3100
+    https: bool = False
+    verify_ssl: bool = False
+
+    @property
+    def base_url(self) -> str:
+        scheme = "https" if self.https else "http"
+        return f"{scheme}://{self.host}:{self.port}"
+
+
 # ── Blackbox ──────────────────────────────────────────────────────────────────
 
 @dataclass
@@ -353,6 +366,7 @@ class Config:
     uptimekuma: UptimeKumaConfig | None = None
     portainer: PortainerConfig | None = None
     prometheus: PrometheusConfig | None = None
+    loki: LokiConfig | None = None
     unifi: UniFiConfig | None = None
     blackbox: BlackboxConfig = field(default_factory=BlackboxConfig)
     docker_hub: DockerHubConfig | None = None
@@ -591,6 +605,17 @@ def load_config(config_path: Path | None = None) -> Config:
             verify_ssl=bool(pm.get("verify_ssl", False)),
         )
 
+    # Loki
+    loki: LokiConfig | None = None
+    if "loki" in raw:
+        lk = raw["loki"]
+        loki = LokiConfig(
+            host=lk["host"],
+            port=int(lk.get("port", 3100)),
+            https=bool(lk.get("https", False)),
+            verify_ssl=bool(lk.get("verify_ssl", False)),
+        )
+
     # UniFi
     unifi: UniFiConfig | None = None
     if "unifi" in raw:
@@ -645,6 +670,7 @@ def load_config(config_path: Path | None = None) -> Config:
         uptimekuma=uptimekuma,
         portainer=portainer,
         prometheus=prometheus,
+        loki=loki,
         unifi=unifi,
         blackbox=blackbox,
         docker_hub=docker_hub,
