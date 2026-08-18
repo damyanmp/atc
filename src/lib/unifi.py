@@ -442,6 +442,15 @@ def fetch_firewall_zones_v1(cfg: UniFiConfig, site_id: str) -> list[UniFiFirewal
     ]
 
 
+def update_firewall_zone_v1(cfg: UniFiConfig, site_id: str, zone_id: str, updated_fields: dict) -> dict:
+    """Fetch the current zone, merge updated_fields (shallow) into it, PUT the full object back."""
+    current = _get_v1(cfg, f"/sites/{site_id}/firewall/zones/{zone_id}")
+    current.pop("id", None)
+    current.pop("metadata", None)
+    current.update(updated_fields)
+    return _write_v1(cfg, "PUT", f"/sites/{site_id}/firewall/zones/{zone_id}", current)
+
+
 def fetch_firewall_policies_v1(
     cfg: UniFiConfig,
     site_id: str,
