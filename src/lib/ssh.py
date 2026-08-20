@@ -83,14 +83,14 @@ async def stream_command(
 
 UPDATE_COMMAND = (
     "DEBIAN_FRONTEND=noninteractive apt-get update -q && "
-    "DEBIAN_FRONTEND=noninteractive apt-get upgrade -y -q && "
+    "DEBIAN_FRONTEND=noninteractive apt-get full-upgrade -y -q && "
     "apt-get autoremove -y -q"
 )
 
 # Simulate only — no packages are installed. Used for the dry-run confirmation gate.
 DRY_RUN_COMMAND = (
     "DEBIAN_FRONTEND=noninteractive apt-get update -q 2>&1 && "
-    "apt-get upgrade --dry-run -q 2>&1"
+    "apt-get full-upgrade --dry-run -q 2>&1"
 )
 
 
