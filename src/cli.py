@@ -1183,6 +1183,19 @@ def _power_action(
         console.print(f"[yellow]No guests found matching '{selector}'{hint}[/]")
         raise typer.Exit(1)
 
+    if verb in ("restart", "stop"):
+        pihole_label_by_node = {p.name.lower(): p.name for p in cfg.pihole_instances}
+        dns_hits = [
+            pihole_label_by_node.get(g.node.lower(), f"{g.name} @ {g.node}")
+            for g in matched
+            if "pihole" in g.name.lower() or "pihole" in _guest_tags(g) or "adblock" in _guest_tags(g)
+        ]
+        if dns_hits:
+            console.print(
+                f"\n[bold red]⚠  DNS server(s) in this batch: {', '.join(dns_hits)}[/] — "
+                "clients pointed at it will lose DNS resolution while it's down."
+            )
+
     console.print(f"\nGuests to {verb}:")
     for g in matched:
         kind = "lxc" if g.type == "lxc" else "vm"
@@ -1364,7 +1377,7 @@ def _confirm_and_update(targets: list[UpdateTarget], cfg: Config, yes: bool, ver
 
     def _cmd_for(target: UpdateTarget) -> str:
         if target.user != "root":
-            return f'sudo bash -c "{base_cmd}"'
+            return f"sudo bash -c '{base_cmd}'"
         return base_cmd
 
     # (target, success, needs_reboot, failed_units, output_lines)
@@ -1448,7 +1461,7 @@ def _confirm_and_update(targets: list[UpdateTarget], cfg: Config, yes: bool, ver
         """Stream a headless custom command, return exit code."""
         cmd = f"{{ TERM=xterm-256color {t.update_cmd}; }} 2>&1; echo {_EXIT_MARKER}:$?"
         if t.user != "root":
-            cmd = f'sudo bash -c "{cmd}"'
+            cmd = f"sudo bash -c '{cmd}'"
         lines: list[str] = []
         async for line in stream_command(t.host, cmd, cfg.ssh, user=t.user):
             lines.append(line)
@@ -1616,13 +1629,13 @@ _EXIT_MARKER = "__ATC_EXIT__"
 
 _UPDATE_CMD_QUIET = (
     "{ DEBIAN_FRONTEND=noninteractive apt-get update -q && "
-    "DEBIAN_FRONTEND=noninteractive apt-get upgrade -y -q && "
+    "DEBIAN_FRONTEND=noninteractive apt-get full-upgrade -y -q && "
     f"apt-get autoremove -y -q; }} 2>&1; echo {_EXIT_MARKER}:$?"
 )
 
 _UPDATE_CMD_VERBOSE = (
     "{ DEBIAN_FRONTEND=noninteractive apt-get update && "
-    "DEBIAN_FRONTEND=noninteractive apt-get upgrade -y && "
+    "DEBIAN_FRONTEND=noninteractive apt-get full-upgrade -y && "
     f"apt-get autoremove -y; }} 2>&1; echo {_EXIT_MARKER}:$?"
 )
 
