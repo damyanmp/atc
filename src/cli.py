@@ -3577,6 +3577,22 @@ def docker_compose_up(
     with console.status(f"[bold]Checking existing stacks on {env.name}…[/]"):
         portainer_stacks = fetch_stacks(pt_cfg, envs)
         existing = [s for s in portainer_stacks if s.env_id == env.id and s.name == stack_name]
+        if len(existing) > 1:
+            # Two stacks with this name means an earlier deploy already went
+            # sideways (e.g. a client-side timeout on `up` that actually
+            # succeeded server-side, retried into a duplicate create).
+            # Silently updating existing[0] would leave the true duplicate
+            # in place and risks touching the wrong one. Refuse and point at
+            # manual cleanup instead of compounding the ambiguity.
+            ids = ", ".join(str(s.id) for s in existing)
+            console.print(
+                f"[red]❌  {len(existing)} stacks named '{stack_name}' already exist "
+                f"on {env.name} (ids: {ids}) — refusing to guess which one to update. "
+                f"This usually means a prior deploy timed out client-side but actually "
+                f"succeeded server-side, and a retry created a duplicate. Resolve by id "
+                f"via the Portainer UI/API before deploying again.[/]"
+            )
+            raise typer.Exit(1)
         if not existing:
             # Not Portainer-managed by this name — but it might still be running
             # under the same compose project name via a route Portainer doesn't
@@ -3637,6 +3653,21 @@ def docker_compose_up(
         console.print(f"[green]✓[/] {stack_name} — {action.lower()}d on {env.name}")
     except Exception as e:
         console.print(f"[red]✗[/] {stack_name} — {e}")
+        if not existing:
+            # A create call can time out client-side (slow image pull) while
+            # still completing server-side — Portainer doesn't cancel the
+            # deploy just because our connection dropped. Retrying blind
+            # risks creating a second stack of the same name sharing the
+            # same underlying Compose project, which silently collides.
+            # Always re-check before retrying a failed create.
+            console.print(
+                f"[yellow]⚠  This was a CREATE — before retrying, run "
+                f"`atc docker stacks --env {env.name}` to check whether "
+                f"'{stack_name}' actually landed despite the error "
+                f"(common with slow first-time image pulls). If it did, "
+                f"re-run this command — it will update the existing stack "
+                f"instead of creating a duplicate.[/]"
+            )
         raise typer.Exit(1)
 
 
@@ -3662,6 +3693,21 @@ def docker_compose_down(
 
     if not found:
         console.print(f"[yellow]No stack named '{name}' found on {env.name}[/]")
+        raise typer.Exit(1)
+    if len(found) > 1:
+        # Two stacks can share a name (e.g. a client-side timeout on `up`
+        # that actually succeeded server-side, retried into a duplicate
+        # create). Silently taking found[0] risks deleting the wrong one —
+        # including one with live, in-use containers. Force the caller to
+        # disambiguate by id via the raw Portainer API instead.
+        ids = ", ".join(str(s.id) for s in found)
+        console.print(
+            f"[red]❌  {len(found)} stacks named '{name}' exist on {env.name} "
+            f"(ids: {ids}) — refusing to guess which one to remove. Inspect "
+            f"each with `atc docker compose up ... --dry-run` (diffs against "
+            f"a given stack id isn't exposed here) or delete the unwanted "
+            f"one directly via the Portainer UI/API by id.[/]"
+        )
         raise typer.Exit(1)
     stack = found[0]
 
