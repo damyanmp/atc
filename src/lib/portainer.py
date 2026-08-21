@@ -72,8 +72,8 @@ def _headers(cfg: PortainerConfig) -> dict:
     return {"X-API-Key": cfg.api_key}
 
 
-def _client(cfg: PortainerConfig) -> httpx.Client:
-    return httpx.Client(verify=cfg.verify_ssl, timeout=15)
+def _client(cfg: PortainerConfig, timeout: float = 15) -> httpx.Client:
+    return httpx.Client(verify=cfg.verify_ssl, timeout=timeout)
 
 
 def fetch_environments(cfg: PortainerConfig) -> list[PortainerEnvironment]:
@@ -414,8 +414,16 @@ def create_stack(
     compose_content: str,
     env_vars: "list[dict] | None" = None,
 ) -> int:
-    """Create a new standalone Compose stack on the given environment. Returns the new stack id."""
-    with _client(cfg) as client:
+    """Create a new standalone Compose stack on the given environment. Returns the new stack id.
+
+    Uses a long timeout: Portainer pulls every image referenced in the
+    compose file synchronously before returning, which can take minutes for
+    a multi-service stack with large/uncached images. A short timeout here
+    doesn't cancel the deploy — Portainer keeps running it server-side — it
+    just makes the CLI report a false failure while a real stack silently
+    comes up, risking an accidental duplicate on retry.
+    """
+    with _client(cfg, timeout=300) as client:
         r = client.post(
             f"{cfg.base_url}/api/stacks/create/standalone/string",
             headers=_headers(cfg),
@@ -441,8 +449,11 @@ def update_stack(
     pull_image forces Portainer to re-pull images before redeploying — needed
     for `:latest`-style tags to actually refresh, since Docker otherwise only
     pulls images it doesn't already have locally.
+
+    Uses a long timeout for the same reason as create_stack: an image pull
+    (forced or first-time) runs synchronously inside this request.
     """
-    with _client(cfg) as client:
+    with _client(cfg, timeout=300) as client:
         r = client.put(
             f"{cfg.base_url}/api/stacks/{stack_id}",
             headers=_headers(cfg),
@@ -460,7 +471,7 @@ def update_stack(
 
 def delete_stack(cfg: PortainerConfig, stack_id: int, env_id: int) -> None:
     """Remove a Compose stack and its containers."""
-    with _client(cfg) as client:
+    with _client(cfg, timeout=60) as client:
         r = client.delete(
             f"{cfg.base_url}/api/stacks/{stack_id}",
             headers=_headers(cfg),
@@ -476,8 +487,12 @@ def stack_action(
     action: str,
     endpoint_id: int = 0,
 ) -> None:
-    """Perform start/stop on a stack. Raises on failure."""
-    with _client(cfg) as client:
+    """Perform start/stop on a stack. Raises on failure.
+
+    start can trigger an image pull the same way create/update do, so this
+    also gets a long timeout rather than the 15s default.
+    """
+    with _client(cfg, timeout=300) as client:
         r = client.post(
             f"{cfg.base_url}/api/stacks/{stack_id}/{action}",
             headers=_headers(cfg),
