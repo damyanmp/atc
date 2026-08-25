@@ -2750,9 +2750,15 @@ def ha_update(
 
 # ── certs ─────────────────────────────────────────────────────────────────────
 
-@app.command("certs")
-def cmd_certs() -> None:
-    """Show TLS certificate expiry for all configured endpoints."""
+certs_app = typer.Typer(
+    help="Show TLS certificate expiry, or deploy a fresh cert to Pi-hole instances.",
+    no_args_is_help=False,
+    rich_markup_mode="rich",
+)
+app.add_typer(certs_app, name="certs")
+
+
+def _certs_check() -> None:
     cfg = _load()
     if not cfg.tls_checks:
         console.print("[yellow]No TLS checks configured. Add a 'tls:' section to config.yaml.[/]")
@@ -2783,6 +2789,75 @@ def cmd_certs() -> None:
         t.add_row(r.name, host_port, r.subject, expiry_str, days_str)
 
     console.print(t)
+
+
+@certs_app.callback(invoke_without_command=True)
+def certs_default(ctx: typer.Context) -> None:
+    """Show TLS certificate expiry for all configured endpoints."""
+    if ctx.invoked_subcommand is None:
+        _certs_check()
+
+
+@certs_app.command("check")
+def certs_check() -> None:
+    """Show TLS certificate expiry for all configured endpoints. (same as bare 'atc certs')"""
+    _certs_check()
+
+
+@certs_app.command("deploy")
+def certs_deploy(
+    target: Optional[str] = typer.Argument(
+        None, help="Target name (substring, e.g. 'globemaster', 'viggen'). Omit for all targets."
+    ),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation"),
+) -> None:
+    """Deploy the current nginx-proxy-manager cert to Pi-hole instances.
+
+    Fetches fullchain+privkey from Docker-01 (nginx-proxy-manager) and
+    installs it on Globemaster (Synology) and the Viggen/Draken LXCs,
+    backing up each existing cert first and restarting pihole-FTL after.
+    Mirrors infrastructure/pihole/certs/deploy-pihole-tls.sh, but callable
+    directly (no interactive script, scriptable with -y, JSON-friendly errors).
+    """
+    from lib.tls_deploy import ALL_TARGETS, fetch_combined_pem, deploy_target
+
+    targets = ALL_TARGETS
+    if target:
+        tf = target.lower()
+        targets = [t for t in ALL_TARGETS if tf in t.name.lower()]
+        if not targets:
+            names = ", ".join(t.name for t in ALL_TARGETS)
+            console.print(f"[red]No target matching '{target}'. Available: {names}[/]")
+            raise typer.Exit(1)
+
+    console.print("[bold]Cert deploy targets:[/]")
+    for t in targets:
+        console.print(f"  [cyan]•[/] {t.name} [dim]({t.host})[/]")
+
+    if not yes and not Confirm.ask(f"\nDeploy cert to {len(targets)} target(s)?"):
+        raise typer.Exit(0)
+
+    async def _run() -> int:
+        console.print("\n[bold]Fetching cert from Docker-01…[/]")
+        pem = await fetch_combined_pem(lambda line: console.print(line))
+
+        failed = 0
+        for t in targets:
+            console.print(f"\n[bold]{t.name}[/]")
+            ok = await deploy_target(t, pem, lambda line: console.print(line))
+            if ok:
+                console.print(f"  [green]✓[/] {t.name} done")
+            else:
+                console.print(f"  [red]✗[/] {t.name} failed")
+                failed += 1
+        return failed
+
+    failed = asyncio.run(_run())
+    console.print()
+    if failed:
+        console.print(f"[red]{failed}/{len(targets)} target(s) failed.[/]")
+        raise typer.Exit(1)
+    console.print(f"[green]✓[/] Cert deployed to {len(targets)} target(s).")
 
 
 # ── uptimekuma ────────────────────────────────────────────────────────────────
