@@ -64,6 +64,7 @@ from lib.beszel import fetch_systems as fetch_beszel, BeszelSystem
 from lib.hosts import NormalizedHost, merge_hosts
 from lib.tls import check_all_certs, CertStatus
 from lib.ssh import UpdateTarget, run_update, run_command, stream_command
+from lib.prometheus import query as prom_query, query_range as prom_query_range, list_metric_names as prom_list_names
 from screens.scripts import _find_scripts, _get_script_description
 
 console = Console()
@@ -2858,6 +2859,140 @@ def certs_deploy(
         console.print(f"[red]{failed}/{len(targets)} target(s) failed.[/]")
         raise typer.Exit(1)
     console.print(f"[green]✓[/] Cert deployed to {len(targets)} target(s).")
+
+
+# ── metrics (Prometheus) ─────────────────────────────────────────────────────
+
+metrics_app = typer.Typer(
+    help="Run ad-hoc PromQL queries against Prometheus.",
+    no_args_is_help=True,
+    rich_markup_mode="rich",
+)
+app.add_typer(metrics_app, name="metrics")
+
+
+def _require_prometheus(cfg: Config):
+    if not cfg.prometheus:
+        console.print("[yellow]No Prometheus configured. Add a 'prometheus:' section to config.yaml.[/]")
+        raise typer.Exit(0)
+    return cfg.prometheus
+
+
+@metrics_app.command("query")
+def metrics_query(
+    promql: str = typer.Argument(..., help="PromQL expression, e.g. 'up' or 'node_load1'"),
+    output: _Out = typer.Option(_Out.table, "-o", help="Output format: table | json"),
+    json_flag: bool = typer.Option(False, "-j", is_flag=True, hidden=True, help="JSON output (shorthand for -o json)"),
+) -> None:
+    """Instant PromQL query — current value(s) of an expression."""
+    if json_flag:
+        output = _Out.json
+    cfg = _load()
+    pcfg = _require_prometheus(cfg)
+
+    try:
+        with console.status("[bold]Querying Prometheus…[/]"):
+            results = prom_query(pcfg, promql)
+    except Exception as e:
+        console.print(f"[red]❌  {e}[/]")
+        raise typer.Exit(1)
+
+    if not results:
+        console.print("[dim](no results)[/]")
+        return
+
+    if output == _Out.json:
+        console.print_json(_json.dumps([
+            {"metric": r.metric, "value": r.value, "timestamp": r.timestamp}
+            for r in results
+        ]))
+        return
+
+    t = Table(box=box.SIMPLE, pad_edge=False)
+    t.add_column("Labels", style="cyan")
+    t.add_column("Value", justify="right")
+    for r in results:
+        labels = ", ".join(f"{k}={v}" for k, v in r.metric.items() if k != "__name__")
+        name = r.metric.get("__name__", "")
+        label_str = f"{name}{{{labels}}}" if labels else (name or "[dim](scalar)[/]")
+        t.add_row(label_str, f"{r.value:g}")
+    console.print(t)
+
+
+@metrics_app.command("range")
+def metrics_range(
+    promql: str = typer.Argument(..., help="PromQL expression"),
+    minutes: int = typer.Option(60, "--minutes", "-m", help="Lookback window in minutes"),
+    step: int = typer.Option(60, "--step", "-s", help="Sample step in seconds"),
+    output: _Out = typer.Option(_Out.table, "-o", help="Output format: table | json"),
+    json_flag: bool = typer.Option(False, "-j", is_flag=True, hidden=True, help="JSON output (shorthand for -o json)"),
+) -> None:
+    """Range PromQL query — samples over a time window (for trend/history, not just a snapshot)."""
+    if json_flag:
+        output = _Out.json
+    cfg = _load()
+    pcfg = _require_prometheus(cfg)
+
+    try:
+        with console.status("[bold]Querying Prometheus…[/]"):
+            results = prom_query_range(pcfg, promql, minutes, step)
+    except Exception as e:
+        console.print(f"[red]❌  {e}[/]")
+        raise typer.Exit(1)
+
+    if not results:
+        console.print("[dim](no results)[/]")
+        return
+
+    if output == _Out.json:
+        console.print_json(_json.dumps([
+            {"metric": r.metric, "values": r.values}
+            for r in results
+        ]))
+        return
+
+    for r in results:
+        labels = ", ".join(f"{k}={v}" for k, v in r.metric.items() if k != "__name__")
+        name = r.metric.get("__name__", "")
+        label_str = f"{name}{{{labels}}}" if labels else (name or "(scalar)")
+        console.print(f"[cyan]{label_str}[/]")
+        if not r.values:
+            console.print("  [dim](no samples)[/]")
+            continue
+        vals = [v for _, v in r.values]
+        console.print(
+            f"  [dim]{len(r.values)} samples · "
+            f"min={min(vals):g} max={max(vals):g} last={vals[-1]:g}[/]"
+        )
+        t = Table(box=box.SIMPLE, pad_edge=False, show_header=True, header_style="dim")
+        t.add_column("Time")
+        t.add_column("Value", justify="right")
+        for ts, val in r.values[-20:]:
+            t.add_row(datetime.fromtimestamp(ts).strftime("%H:%M:%S"), f"{val:g}")
+        console.print(t)
+
+
+@metrics_app.command("names")
+def metrics_names(
+    match: str = typer.Argument("", help="Optional substring filter, e.g. 'cpu'"),
+) -> None:
+    """List available metric names (discovery — 'what can I query?')."""
+    cfg = _load()
+    pcfg = _require_prometheus(cfg)
+
+    try:
+        with console.status("[bold]Fetching metric names…[/]"):
+            names = prom_list_names(pcfg, match)
+    except Exception as e:
+        console.print(f"[red]❌  {e}[/]")
+        raise typer.Exit(1)
+
+    if not names:
+        console.print("[dim](no matching metric names)[/]")
+        return
+    for n in names:
+        console.print(n)
+    console.print(f"\n[dim]{len(names)} metric name(s)[/]")
 
 
 # ── uptimekuma ────────────────────────────────────────────────────────────────
