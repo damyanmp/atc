@@ -64,6 +64,7 @@ from lib.beszel import fetch_systems as fetch_beszel, BeszelSystem
 from lib.hosts import NormalizedHost, merge_hosts
 from lib.tls import check_all_certs, CertStatus
 from lib.ssh import UpdateTarget, run_update, run_command, stream_command
+from lib.prometheus import query as prom_query, query_range as prom_query_range, list_metric_names as prom_list_names
 from screens.scripts import _find_scripts, _get_script_description
 
 console = Console()
@@ -2750,9 +2751,15 @@ def ha_update(
 
 # ── certs ─────────────────────────────────────────────────────────────────────
 
-@app.command("certs")
-def cmd_certs() -> None:
-    """Show TLS certificate expiry for all configured endpoints."""
+certs_app = typer.Typer(
+    help="Show TLS certificate expiry, or deploy a fresh cert to Pi-hole instances.",
+    no_args_is_help=False,
+    rich_markup_mode="rich",
+)
+app.add_typer(certs_app, name="certs")
+
+
+def _certs_check() -> None:
     cfg = _load()
     if not cfg.tls_checks:
         console.print("[yellow]No TLS checks configured. Add a 'tls:' section to config.yaml.[/]")
@@ -2783,6 +2790,209 @@ def cmd_certs() -> None:
         t.add_row(r.name, host_port, r.subject, expiry_str, days_str)
 
     console.print(t)
+
+
+@certs_app.callback(invoke_without_command=True)
+def certs_default(ctx: typer.Context) -> None:
+    """Show TLS certificate expiry for all configured endpoints."""
+    if ctx.invoked_subcommand is None:
+        _certs_check()
+
+
+@certs_app.command("check")
+def certs_check() -> None:
+    """Show TLS certificate expiry for all configured endpoints. (same as bare 'atc certs')"""
+    _certs_check()
+
+
+@certs_app.command("deploy")
+def certs_deploy(
+    target: Optional[str] = typer.Argument(
+        None, help="Target name (substring, e.g. 'globemaster', 'viggen'). Omit for all targets."
+    ),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation"),
+) -> None:
+    """Deploy the current nginx-proxy-manager cert to Pi-hole instances.
+
+    Fetches fullchain+privkey from Docker-01 (nginx-proxy-manager) and
+    installs it on Globemaster (Synology) and the Viggen/Draken LXCs,
+    backing up each existing cert first and restarting pihole-FTL after.
+    Mirrors infrastructure/pihole/certs/deploy-pihole-tls.sh, but callable
+    directly (no interactive script, scriptable with -y, JSON-friendly errors).
+    """
+    from lib.tls_deploy import ALL_TARGETS, fetch_combined_pem, deploy_target
+
+    targets = ALL_TARGETS
+    if target:
+        tf = target.lower()
+        targets = [t for t in ALL_TARGETS if tf in t.name.lower()]
+        if not targets:
+            names = ", ".join(t.name for t in ALL_TARGETS)
+            console.print(f"[red]No target matching '{target}'. Available: {names}[/]")
+            raise typer.Exit(1)
+
+    console.print("[bold]Cert deploy targets:[/]")
+    for t in targets:
+        console.print(f"  [cyan]•[/] {t.name} [dim]({t.host})[/]")
+
+    if not yes and not Confirm.ask(f"\nDeploy cert to {len(targets)} target(s)?"):
+        raise typer.Exit(0)
+
+    async def _run() -> int:
+        console.print("\n[bold]Fetching cert from Docker-01…[/]")
+        pem = await fetch_combined_pem(lambda line: console.print(line))
+
+        failed = 0
+        for t in targets:
+            console.print(f"\n[bold]{t.name}[/]")
+            ok = await deploy_target(t, pem, lambda line: console.print(line))
+            if ok:
+                console.print(f"  [green]✓[/] {t.name} done")
+            else:
+                console.print(f"  [red]✗[/] {t.name} failed")
+                failed += 1
+        return failed
+
+    failed = asyncio.run(_run())
+    console.print()
+    if failed:
+        console.print(f"[red]{failed}/{len(targets)} target(s) failed.[/]")
+        raise typer.Exit(1)
+    console.print(f"[green]✓[/] Cert deployed to {len(targets)} target(s).")
+
+
+# ── metrics (Prometheus) ─────────────────────────────────────────────────────
+
+metrics_app = typer.Typer(
+    help="Run ad-hoc PromQL queries against Prometheus.",
+    no_args_is_help=True,
+    rich_markup_mode="rich",
+)
+app.add_typer(metrics_app, name="metrics")
+
+
+def _require_prometheus(cfg: Config):
+    if not cfg.prometheus:
+        console.print("[yellow]No Prometheus configured. Add a 'prometheus:' section to config.yaml.[/]")
+        raise typer.Exit(0)
+    return cfg.prometheus
+
+
+@metrics_app.command("query")
+def metrics_query(
+    promql: str = typer.Argument(..., help="PromQL expression, e.g. 'up' or 'node_load1'"),
+    output: _Out = typer.Option(_Out.table, "-o", help="Output format: table | json"),
+    json_flag: bool = typer.Option(False, "-j", is_flag=True, hidden=True, help="JSON output (shorthand for -o json)"),
+) -> None:
+    """Instant PromQL query — current value(s) of an expression."""
+    if json_flag:
+        output = _Out.json
+    cfg = _load()
+    pcfg = _require_prometheus(cfg)
+
+    try:
+        with console.status("[bold]Querying Prometheus…[/]"):
+            results = prom_query(pcfg, promql)
+    except Exception as e:
+        console.print(f"[red]❌  {e}[/]")
+        raise typer.Exit(1)
+
+    if not results:
+        console.print("[dim](no results)[/]")
+        return
+
+    if output == _Out.json:
+        console.print_json(_json.dumps([
+            {"metric": r.metric, "value": r.value, "timestamp": r.timestamp}
+            for r in results
+        ]))
+        return
+
+    t = Table(box=box.SIMPLE, pad_edge=False)
+    t.add_column("Labels", style="cyan")
+    t.add_column("Value", justify="right")
+    for r in results:
+        labels = ", ".join(f"{k}={v}" for k, v in r.metric.items() if k != "__name__")
+        name = r.metric.get("__name__", "")
+        label_str = f"{name}{{{labels}}}" if labels else (name or "[dim](scalar)[/]")
+        t.add_row(label_str, f"{r.value:g}")
+    console.print(t)
+
+
+@metrics_app.command("range")
+def metrics_range(
+    promql: str = typer.Argument(..., help="PromQL expression"),
+    minutes: int = typer.Option(60, "--minutes", "-m", help="Lookback window in minutes"),
+    step: int = typer.Option(60, "--step", "-s", help="Sample step in seconds"),
+    output: _Out = typer.Option(_Out.table, "-o", help="Output format: table | json"),
+    json_flag: bool = typer.Option(False, "-j", is_flag=True, hidden=True, help="JSON output (shorthand for -o json)"),
+) -> None:
+    """Range PromQL query — samples over a time window (for trend/history, not just a snapshot)."""
+    if json_flag:
+        output = _Out.json
+    cfg = _load()
+    pcfg = _require_prometheus(cfg)
+
+    try:
+        with console.status("[bold]Querying Prometheus…[/]"):
+            results = prom_query_range(pcfg, promql, minutes, step)
+    except Exception as e:
+        console.print(f"[red]❌  {e}[/]")
+        raise typer.Exit(1)
+
+    if not results:
+        console.print("[dim](no results)[/]")
+        return
+
+    if output == _Out.json:
+        console.print_json(_json.dumps([
+            {"metric": r.metric, "values": r.values}
+            for r in results
+        ]))
+        return
+
+    for r in results:
+        labels = ", ".join(f"{k}={v}" for k, v in r.metric.items() if k != "__name__")
+        name = r.metric.get("__name__", "")
+        label_str = f"{name}{{{labels}}}" if labels else (name or "(scalar)")
+        console.print(f"[cyan]{label_str}[/]")
+        if not r.values:
+            console.print("  [dim](no samples)[/]")
+            continue
+        vals = [v for _, v in r.values]
+        console.print(
+            f"  [dim]{len(r.values)} samples · "
+            f"min={min(vals):g} max={max(vals):g} last={vals[-1]:g}[/]"
+        )
+        t = Table(box=box.SIMPLE, pad_edge=False, show_header=True, header_style="dim")
+        t.add_column("Time")
+        t.add_column("Value", justify="right")
+        for ts, val in r.values[-20:]:
+            t.add_row(datetime.fromtimestamp(ts).strftime("%H:%M:%S"), f"{val:g}")
+        console.print(t)
+
+
+@metrics_app.command("names")
+def metrics_names(
+    match: str = typer.Argument("", help="Optional substring filter, e.g. 'cpu'"),
+) -> None:
+    """List available metric names (discovery — 'what can I query?')."""
+    cfg = _load()
+    pcfg = _require_prometheus(cfg)
+
+    try:
+        with console.status("[bold]Fetching metric names…[/]"):
+            names = prom_list_names(pcfg, match)
+    except Exception as e:
+        console.print(f"[red]❌  {e}[/]")
+        raise typer.Exit(1)
+
+    if not names:
+        console.print("[dim](no matching metric names)[/]")
+        return
+    for n in names:
+        console.print(n)
+    console.print(f"\n[dim]{len(names)} metric name(s)[/]")
 
 
 # ── uptimekuma ────────────────────────────────────────────────────────────────
