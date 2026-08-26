@@ -193,6 +193,21 @@ loki:
   https: false
   verify_ssl: false
 
+influxdb:
+  # InfluxDB 2.x — used for data sources with their own push-based metric
+  # server (e.g. Proxmox's built-in InfluxDB metric export), as an
+  # alternative to the pull-based Prometheus/exporter model.
+  # Generate a token: InfluxDB UI → Load Data → API Tokens → Generate.
+  # Prefer a Custom (per-bucket, read-only) token if your instance offers
+  # one; some deployments only expose "All Access" — if so, treat it as
+  # query-only in your own tooling regardless of what the token permits.
+  host: 192.168.x.x
+  org: <org-id-or-name>
+  port: 8086
+  https: false
+  verify_ssl: false
+  token: keychain:influxdb-api-key   # ← stored in keychain
+
 openspeedtest:
   # Self-hosted OpenSpeedTest server (docker: openspeedtest/latest).
   # No auth required — just point at the host and port.
