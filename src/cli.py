@@ -21,6 +21,7 @@ from rich import box
 from rich.prompt import Confirm, Prompt
 from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, MofNCompleteColumn
 from rich.text import Text
+from rich.markup import escape as rich_escape
 
 sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(Path(__file__).parent / "lib"))
@@ -41,6 +42,16 @@ from lib.pihole import (
     fetch_seen_ips_all,
 )
 from lib.unifi import fetch_clients as unifi_fetch_clients
+from lib.nginx_proxy_manager import (
+    list_proxy_hosts as npm_list_proxy_hosts,
+    find_proxy_host as npm_find_proxy_host,
+    create_proxy_host as npm_create_proxy_host,
+    update_proxy_host as npm_update_proxy_host,
+    delete_proxy_host as npm_delete_proxy_host,
+    enable_proxy_host as npm_enable_proxy_host,
+    disable_proxy_host as npm_disable_proxy_host,
+    list_certificates as npm_list_certificates,
+)
 from lib.ha import (
     get_status as ha_get_status,
     get_entity_state,
@@ -2411,6 +2422,212 @@ def pihole_gravity(
     console.print("\n[dim]Updates run in the background on each instance.[/]")
 
 
+# ── nginx proxy manager ─────────────────────────────────────────────────────
+
+npm_app = typer.Typer(
+    help="Manage Nginx Proxy Manager (NPM) reverse-proxy hosts",
+    no_args_is_help=True,
+    rich_markup_mode="rich",
+)
+app.add_typer(npm_app, name="npm")
+
+
+def _npm_cfg(cfg):
+    if not cfg.nginx_proxy_manager:
+        console.print("[red]nginx_proxy_manager not configured in config.yaml[/]")
+        raise typer.Exit(1)
+    return cfg.nginx_proxy_manager
+
+
+@npm_app.command("list")
+def npm_list(
+    output: str = typer.Option("table", "-o", "--output", help="table | json"),
+) -> None:
+    """List all configured proxy hosts."""
+    cfg = _load()
+    npm_cfg = _npm_cfg(cfg)
+    hosts = npm_list_proxy_hosts(npm_cfg)
+
+    if output == "json":
+        console.print_json(_json.dumps([
+            {
+                "id": h.id, "domains": h.domain_names, "forward": f"{h.forward_scheme}://{h.forward_host}:{h.forward_port}",
+                "enabled": h.enabled, "ssl_forced": h.ssl_forced, "certificate_id": h.certificate_id,
+            }
+            for h in hosts
+        ]))
+        return
+
+    t = Table(box=box.SIMPLE_HEAVY)
+    t.add_column("ID", justify="right")
+    t.add_column("Domain(s)", style="bold")
+    t.add_column("Forward")
+    t.add_column("SSL")
+    t.add_column("Enabled")
+    for h in sorted(hosts, key=lambda x: x.primary_domain):
+        ssl = "forced" if h.ssl_forced else ("cert" if h.certificate_id else "—")
+        t.add_row(
+            str(h.id),
+            ", ".join(h.domain_names),
+            f"{h.forward_scheme}://{h.forward_host}:{h.forward_port}",
+            ssl,
+            "[green]yes[/]" if h.enabled else "[red]no[/]",
+        )
+    console.print(t)
+    console.print(f"\n[dim]{len(hosts)} proxy host(s)[/]")
+
+
+@npm_app.command("create")
+def npm_create(
+    domain: str = typer.Argument(..., help="Domain name, e.g. myservice.local.damyanpetkov.com"),
+    forward_host: str = typer.Argument(..., help="IP or hostname to forward to"),
+    forward_port: int = typer.Argument(..., help="Port to forward to"),
+    scheme: str = typer.Option("http", "--scheme", help="http or https"),
+    websocket: bool = typer.Option(True, "--websocket/--no-websocket", help="Allow websocket upgrade"),
+    block_exploits: bool = typer.Option(True, "--block-exploits/--no-block-exploits"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation"),
+) -> None:
+    """Create a new proxy host. Fails loudly if the domain already exists — use 'update' instead."""
+    cfg = _load()
+    npm_cfg = _npm_cfg(cfg)
+
+    existing = npm_find_proxy_host(npm_cfg, domain)
+    if existing:
+        console.print(f"[red]✗[/] {domain} already exists as proxy host #{existing.id}. Use 'atc npm update' instead.")
+        raise typer.Exit(1)
+
+    console.print(f"Creating proxy host: [bold]{domain}[/] → [cyan]{scheme}://{forward_host}:{forward_port}[/]")
+    if not yes and not Confirm.ask("Continue?"):
+        raise typer.Exit(0)
+
+    with console.status("[bold]Creating…[/]"):
+        host = npm_create_proxy_host(
+            npm_cfg, domain, forward_host, forward_port,
+            forward_scheme=scheme, block_exploits=block_exploits, allow_websocket_upgrade=websocket,
+        )
+    console.print(f"[green]✓[/] Created proxy host #{host.id}: {domain}")
+
+
+@npm_app.command("delete")
+def npm_delete(
+    domain: str = typer.Argument(..., help="Domain of the proxy host to delete"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation"),
+) -> None:
+    """Delete a proxy host by domain."""
+    cfg = _load()
+    npm_cfg = _npm_cfg(cfg)
+
+    host = npm_find_proxy_host(npm_cfg, domain)
+    if not host:
+        console.print(f"[red]✗[/] No proxy host found for {domain}")
+        raise typer.Exit(1)
+
+    console.print(f"Deleting proxy host #{host.id}: [bold]{domain}[/] → {host.forward_scheme}://{host.forward_host}:{host.forward_port}")
+    if not yes and not Confirm.ask("Continue?"):
+        raise typer.Exit(0)
+
+    npm_delete_proxy_host(npm_cfg, host.id)
+    console.print(f"[green]✓[/] Deleted.")
+
+
+@npm_app.command("certs")
+def npm_certs(
+    output: str = typer.Option("table", "-o", "--output", help="table | json"),
+) -> None:
+    """List SSL certificates known to NPM."""
+    cfg = _load()
+    npm_cfg = _npm_cfg(cfg)
+    certs = npm_list_certificates(npm_cfg)
+
+    if output == "json":
+        console.print_json(_json.dumps([
+            {"id": c.id, "name": c.nice_name, "domains": c.domain_names, "provider": c.provider, "expires": c.expires_on}
+            for c in certs
+        ]))
+        return
+
+    t = Table(box=box.SIMPLE_HEAVY)
+    t.add_column("ID", justify="right")
+    t.add_column("Name", style="bold")
+    t.add_column("Domain(s)")
+    t.add_column("Provider")
+    t.add_column("Expires")
+    for c in certs:
+        t.add_row(str(c.id), c.nice_name, ", ".join(c.domain_names), c.provider, c.expires_on or "—")
+    console.print(t)
+
+
+# ── service publish (DNS + NPM combined) ─────────────────────────────────────
+
+service_app = typer.Typer(
+    help="Cross-cutting service deployment helpers (DNS + reverse proxy in one step)",
+    no_args_is_help=True,
+    rich_markup_mode="rich",
+)
+app.add_typer(service_app, name="service")
+
+
+@service_app.command("publish")
+def service_publish(
+    domain: str = typer.Argument(..., help="Local domain, e.g. myservice.local.damyanpetkov.com"),
+    forward_host: str = typer.Argument(..., help="IP the service actually runs on, e.g. 192.168.1.78"),
+    forward_port: int = typer.Argument(..., help="Port the service listens on"),
+    dns_ip: Optional[str] = typer.Option(
+        None, "--dns-ip",
+        help="IP to point the DNS record at. Defaults to forward_host — pass explicitly if NPM and the DNS target differ (e.g. NPM host IP vs. a Docker-internal service IP).",
+    ),
+    scheme: str = typer.Option("http", "--scheme", help="http or https, for the NPM forward"),
+    websocket: bool = typer.Option(True, "--websocket/--no-websocket"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation"),
+) -> None:
+    """One-shot: add the local DNS record (Pi-hole) AND the reverse-proxy host (NPM) for a new service.
+
+    This is the two manual steps (pihole dns add + npm create) collapsed into
+    one, for the common case of standing up a new internal service with its
+    own subdomain. Runs DNS first, then NPM — if NPM fails, the DNS record
+    is left in place (rerun 'atc npm create' once the issue is fixed rather
+    than re-running this whole command, to avoid a duplicate DNS attempt).
+    """
+    cfg = _load()
+    npm_cfg = _npm_cfg(cfg)
+    primary_pihole = _pihole_primary(cfg)
+    resolved_dns_ip = dns_ip or forward_host
+
+    console.print(f"[bold]Publishing service:[/] {domain}")
+    console.print(f"  DNS:   {domain} → {resolved_dns_ip}  (on {primary_pihole.name})")
+    console.print(f"  Proxy: {domain} → {scheme}://{forward_host}:{forward_port}  (NPM)")
+    if not yes and not Confirm.ask("Continue?"):
+        raise typer.Exit(0)
+
+    existing_host = npm_find_proxy_host(npm_cfg, domain)
+    if existing_host:
+        console.print(f"[red]✗[/] {domain} already exists as NPM proxy host #{existing_host.id} — aborting before touching DNS. Use 'atc npm update' for changes.")
+        raise typer.Exit(1)
+
+    with console.status("[bold]Adding DNS record…[/]"):
+        dns_ok, dns_err = asyncio.run(add_custom_dns(primary_pihole, domain, resolved_dns_ip))
+    if not dns_ok:
+        console.print(f"[red]✗[/] DNS record failed — {dns_err}")
+        raise typer.Exit(1)
+    console.print(f"[green]✓[/] DNS record added.")
+
+    with console.status("[bold]Creating NPM proxy host…[/]"):
+        try:
+            host = npm_create_proxy_host(
+                npm_cfg, domain, forward_host, forward_port,
+                forward_scheme=scheme, allow_websocket_upgrade=websocket,
+            )
+        except Exception as e:
+            console.print(f"[red]✗[/] NPM proxy host failed — {e}")
+            console.print(f"[yellow]![/] DNS record for {domain} was already added and was NOT rolled back. "
+                          f"Fix the NPM issue and run 'atc npm create {domain} {forward_host} {forward_port}' "
+                          f"directly rather than re-running publish (it would try to re-add the same DNS entry).")
+            raise typer.Exit(1)
+
+    console.print(f"[green]✓[/] NPM proxy host #{host.id} created.")
+    console.print(f"\n[bold green]{domain}[/] is live — https://{domain} once DNS propagates (Pi-hole is usually instant on your LAN).")
+
+
 @pihole_app.command("audit")
 def pihole_audit(
     output: _Out = typer.Option(_Out.table, "-o", help="Output format: table | json"),
@@ -3354,7 +3571,7 @@ def cmd_acars(
         t.add_column("Message")
         for sev, source, msg in sorted(alerts, key=lambda x: (0 if x[0] == "CRIT" else 1, x[1])):
             sev_str = f"[red bold]{sev}[/]" if sev == "CRIT" else f"[yellow]{sev}[/]"
-            t.add_row(sev_str, source, msg)
+            t.add_row(sev_str, source, rich_escape(msg))
         console.print(t)
         n_issues = len(alerts)
         crits_str = f"  [red bold]{n_crits} critical[/]" if n_crits else ""

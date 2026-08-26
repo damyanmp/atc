@@ -289,6 +289,24 @@ class PortainerConfig:
         return f"{scheme}://{self.host}:{self.port}"
 
 
+# ── Nginx Proxy Manager ──────────────────────────────────────────────────────
+
+@dataclass
+class NginxProxyManagerConfig:
+    host: str
+    email: str = ""         # admin login email (keychain-backed) — fallback auth
+    password: str = ""      # admin login password (keychain-backed) — fallback auth
+    token: str = ""         # pre-issued long-lived JWT (keychain-backed) — preferred auth
+    port: int = 81
+    https: bool = False
+    verify_ssl: bool = False
+
+    @property
+    def base_url(self) -> str:
+        scheme = "https" if self.https else "http"
+        return f"{scheme}://{self.host}:{self.port}"
+
+
 # ── Monitoring ────────────────────────────────────────────────────────────────
 
 @dataclass
@@ -332,6 +350,27 @@ class LokiConfig:
         return f"{scheme}://{self.host}:{self.port}"
 
 
+@dataclass
+class InfluxDBConfig:
+    host: str
+    org: str
+    token: str
+    port: int = 8086
+    https: bool = True
+    verify_ssl: bool = True
+
+    @property
+    def base_url(self) -> str:
+        scheme = "https" if self.https else "http"
+        # Support a bare hostname (reverse-proxied, no explicit port) as well
+        # as host:port — atc's other *Config classes always assume a port,
+        # but InfluxDB here sits behind a TLS-terminating reverse proxy on
+        # the default 443, so an explicit ':8086' would be wrong.
+        if self.port in (443, 80):
+            return f"{scheme}://{self.host}"
+        return f"{scheme}://{self.host}:{self.port}"
+
+
 # ── Blackbox ──────────────────────────────────────────────────────────────────
 
 @dataclass
@@ -365,8 +404,10 @@ class Config:
     tls_checks: list[TLSCheckConfig] = field(default_factory=list)
     uptimekuma: UptimeKumaConfig | None = None
     portainer: PortainerConfig | None = None
+    nginx_proxy_manager: NginxProxyManagerConfig | None = None
     prometheus: PrometheusConfig | None = None
     loki: LokiConfig | None = None
+    influxdb: InfluxDBConfig | None = None
     unifi: UniFiConfig | None = None
     blackbox: BlackboxConfig = field(default_factory=BlackboxConfig)
     docker_hub: DockerHubConfig | None = None
@@ -581,6 +622,25 @@ def load_config(config_path: Path | None = None) -> Config:
             verify_ssl=bool(pt.get("verify_ssl", False)),
         )
 
+    # Nginx Proxy Manager
+    nginx_proxy_manager: NginxProxyManagerConfig | None = None
+    if "nginx_proxy_manager" in raw:
+        npm = raw["nginx_proxy_manager"]
+        nginx_proxy_manager = NginxProxyManagerConfig(
+            host=npm["host"],
+            port=int(npm.get("port", 81)),
+            https=bool(npm.get("https", False)),
+            token=_resolve_secret(npm["token"], "nginx_proxy_manager/token") if npm.get("token") else "",
+            email=_resolve_secret(npm["email"], "nginx_proxy_manager/email") if npm.get("email") else "",
+            password=_resolve_secret(npm["password"], "nginx_proxy_manager/password") if npm.get("password") else "",
+            verify_ssl=bool(npm.get("verify_ssl", False)),
+        )
+        if not nginx_proxy_manager.token and not (nginx_proxy_manager.email and nginx_proxy_manager.password):
+            raise ValueError(
+                "nginx_proxy_manager config needs either 'token' (preferred) "
+                "or both 'email' and 'password'."
+            )
+
     # Uptime Kuma
     uptimekuma: UptimeKumaConfig | None = None
     if "uptimekuma" in raw:
@@ -614,6 +674,19 @@ def load_config(config_path: Path | None = None) -> Config:
             port=int(lk.get("port", 3100)),
             https=bool(lk.get("https", False)),
             verify_ssl=bool(lk.get("verify_ssl", False)),
+        )
+
+    # InfluxDB
+    influxdb: InfluxDBConfig | None = None
+    if "influxdb" in raw:
+        idb = raw["influxdb"]
+        influxdb = InfluxDBConfig(
+            host=idb["host"],
+            org=idb["org"],
+            token=_resolve_secret(idb["token"], "influxdb/token"),
+            port=int(idb.get("port", 8086)),
+            https=bool(idb.get("https", True)),
+            verify_ssl=bool(idb.get("verify_ssl", True)),
         )
 
     # UniFi
@@ -669,8 +742,10 @@ def load_config(config_path: Path | None = None) -> Config:
         tls_checks=tls_checks,
         uptimekuma=uptimekuma,
         portainer=portainer,
+        nginx_proxy_manager=nginx_proxy_manager,
         prometheus=prometheus,
         loki=loki,
+        influxdb=influxdb,
         unifi=unifi,
         blackbox=blackbox,
         docker_hub=docker_hub,
