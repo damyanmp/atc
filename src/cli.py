@@ -21,6 +21,7 @@ from rich import box
 from rich.prompt import Confirm, Prompt
 from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, MofNCompleteColumn
 from rich.text import Text
+from rich.markup import escape as rich_escape
 
 sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(Path(__file__).parent / "lib"))
@@ -3354,7 +3355,7 @@ def cmd_acars(
         t.add_column("Message")
         for sev, source, msg in sorted(alerts, key=lambda x: (0 if x[0] == "CRIT" else 1, x[1])):
             sev_str = f"[red bold]{sev}[/]" if sev == "CRIT" else f"[yellow]{sev}[/]"
-            t.add_row(sev_str, source, msg)
+            t.add_row(sev_str, source, rich_escape(msg))
         console.print(t)
         n_issues = len(alerts)
         crits_str = f"  [red bold]{n_crits} critical[/]" if n_crits else ""
