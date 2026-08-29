@@ -8,7 +8,7 @@ import json as _json
 import subprocess
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Optional
@@ -42,6 +42,7 @@ from lib.pihole import (
     fetch_seen_ips_all,
 )
 from lib.unifi import fetch_clients as unifi_fetch_clients
+from lib.influxdb import write_points as influx_write_points
 from lib.nginx_proxy_manager import (
     list_proxy_hosts as npm_list_proxy_hosts,
     find_proxy_host as npm_find_proxy_host,
@@ -2555,6 +2556,67 @@ def npm_certs(
     for c in certs:
         t.add_row(str(c.id), c.nice_name, ", ".join(c.domain_names), c.provider, c.expires_on or "—")
     console.print(t)
+
+
+# ── backup freshness reporting (writes to InfluxDB for Grafana) ───────────────
+# Read-only against Proxmox — Proxmox owns the actual backup schedule (e.g.
+# the weekly Sunday 04:00 vzdump job, see 'atc backup list' above). This just
+# snapshots freshness/size into InfluxDB so Grafana can show staleness trends
+# and catch things like a VM silently falling out of the backup rotation.
+
+
+@backup_app.command("snapshot")
+def backup_snapshot() -> None:
+    """Compute per-VM backup freshness and write it to InfluxDB for Grafana.
+
+    Read-only against Proxmox (just lists existing backup files) — writes
+    only to the 'proxmox' InfluxDB bucket, measurement 'backup_freshness'.
+    Run this manually whenever you want the dashboard refreshed (no cron
+    wired up by default).
+    """
+    cfg = _load()
+    cluster = asyncio.run(fetch_cluster_status(cfg.proxmox))
+    online = [n.name for n in cluster.nodes if n.online]
+    backups = list_backups(cfg.proxmox, online)
+
+    latest: dict[int, BackupFile] = {}
+    for b in backups:
+        if b.vmid not in latest or b.ctime > latest[b.vmid].ctime:
+            latest[b.vmid] = b
+
+    guest_names = {g.vmid: g.name for g in cluster.guests}
+    now = datetime.now(timezone.utc).timestamp()
+
+    points = []
+    for vmid, b in latest.items():
+        age_hours = (now - b.ctime) / 3600
+        points.append({
+            "tags": {
+                "vmid": str(vmid),
+                "name": guest_names.get(vmid, b.notes) or str(vmid),
+                "storage": b.storage,
+                "node": b.node,
+            },
+            "fields": {
+                "age_hours": round(age_hours, 2),
+                "size_bytes": int(b.size),
+                "last_backup_epoch": int(b.ctime),
+            },
+        })
+
+    if not cfg.influxdb:
+        console.print("[red]✗[/] influxdb not configured in config.yaml")
+        raise typer.Exit(1)
+
+    with console.status(f"[bold]Writing {len(points)} backup-freshness points to InfluxDB…[/]"):
+        influx_write_points(cfg.influxdb, "proxmox", "backup_freshness", points)
+
+    console.print(f"[green]✓[/] Wrote freshness data for {len(points)} VM(s)/CT(s) to InfluxDB.")
+    stale = [p for p in points if p["fields"]["age_hours"] > 24 * 8]
+    if stale:
+        console.print(f"[yellow]⚠[/]  {len(stale)} VM(s) with backups older than 8 days:")
+        for p in stale:
+            console.print(f"    VMID {p['tags']['vmid']} ({p['tags']['name']}): {p['fields']['age_hours']/24:.1f}d ago")
 
 
 # ── service publish (DNS + NPM combined) ─────────────────────────────────────
