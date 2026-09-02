@@ -149,6 +149,33 @@ def fetch_containers(
     return containers
 
 
+def upload_to_container(
+    cfg: PortainerConfig,
+    env_id: int,
+    container_id: str,
+    tar_bytes: bytes,
+    dest_path: str,
+) -> None:
+    """PUT a tar archive into a running container's filesystem at dest_path.
+
+    Proxies Docker Engine API's PUT /containers/{id}/archive?path=... through
+    Portainer. dest_path must already exist inside the container (e.g. the
+    directory nginx serves from) and tar_bytes must be a valid tar stream
+    (uncompressed or gzip) whose entries land relative to dest_path.
+    """
+    with _client(cfg, timeout=60) as client:
+        r = client.put(
+            f"{cfg.base_url}/api/endpoints/{env_id}/docker/containers/{container_id}/archive",
+            headers={**_headers(cfg), "Content-Type": "application/x-tar"},
+            params={"path": dest_path},
+            content=tar_bytes,
+        )
+        if not r.is_success:
+            raise RuntimeError(
+                f"Container archive upload HTTP {r.status_code} (container {container_id}): {r.text[:300]}"
+            )
+
+
 def fetch_container_logs(
     cfg: PortainerConfig,
     env_id: int,

@@ -4192,7 +4192,12 @@ def docker_compose_up(
     else:
         resolved_env_file = compose_file.resolve().parent / ".env"
 
-    env_vars = _parse_env_file(resolved_env_file) if resolved_env_file.exists() else []
+    # None (not []) when no .env file exists — [] is reserved to mean "explicitly
+    # clear all env vars" per update_stack's safety guard (see portainer.py). A
+    # missing .env means "no local vars to apply", not "wipe whatever's already
+    # deployed" — None tells update_stack to auto-fetch and preserve the stack's
+    # current Env array instead.
+    env_vars = _parse_env_file(resolved_env_file) if resolved_env_file.exists() else None
 
     from lib.portainer import (
         fetch_environments, fetch_containers, fetch_stacks, fetch_stack_file,
@@ -7106,3 +7111,202 @@ def launch_tui() -> None:
     cfg = _load()
     from main import HomelabApp
     HomelabApp(cfg).run()
+
+
+# ── quick (ad hoc file/page hosting) ────────────────────────────────────────
+# One standing nginx stack ("quick") on docker-1 serving quick.local.damyanpetkov.com
+# via NPM + the existing *.local.damyanpetkov.com wildcard cert. `atc quick publish`
+# tars a local file/dir and PUTs it into the running container via the Docker
+# Engine API (proxied through Portainer) — no SSH needed for routine use.
+
+QUICK_STACK_NAME = "quick"
+QUICK_DOMAIN = "quick.local.damyanpetkov.com"
+QUICK_SERVE_ROOT = "/usr/share/nginx/html"
+
+quick_app = typer.Typer(
+    help="Publish quick throwaway files/pages to https://quick.local.damyanpetkov.com",
+    no_args_is_help=True,
+    rich_markup_mode="rich",
+)
+app.add_typer(quick_app, name="quick")
+
+
+def _quick_compose() -> str:
+    return (
+        "services:\n"
+        "  quick:\n"
+        "    image: nginx:alpine\n"
+        "    restart: unless-stopped\n"
+        "    networks:\n"
+        "      - npm_network\n"
+        "    volumes:\n"
+        "      - quick_data:/usr/share/nginx/html\n"
+        "    command: [\"nginx\", \"-g\", \"daemon off;\"]\n"
+        "networks:\n"
+        "  npm_network:\n"
+        "    external: true\n"
+        "volumes:\n"
+        "  quick_data:\n"
+    )
+
+
+@quick_app.command("bootstrap")
+def quick_bootstrap(
+    target: str = typer.Option("docker-1", "--target", help="Portainer environment name/substring"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Show what would be created without doing it"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation"),
+) -> None:
+    """One-time setup: create the 'quick' stack, Pi-hole A record, and NPM proxy host.
+
+    Safe to re-run — each step checks for an existing resource first and skips it.
+    """
+    cfg = _load()
+    pt_cfg = _require_portainer(cfg)
+    npm_cfg = _npm_cfg(cfg)
+    primary_pihole = _pihole_primary(cfg)
+
+    from lib.portainer import fetch_environments, fetch_stacks, create_stack
+
+    with console.status("[bold]Resolving target environment…[/]"):
+        envs = [e for e in fetch_environments(pt_cfg) if e.status == 1]
+        env = _resolve_single_env(envs, target)
+
+    stacks = fetch_stacks(pt_cfg, envs)
+    existing_stack = next((s for s in stacks if s.env_id == env.id and s.name == QUICK_STACK_NAME), None)
+
+    with console.status(f"[bold]Checking DNS on {primary_pihole.name}…[/]"):
+        dns_records = asyncio.run(list_custom_dns(primary_pihole))
+    existing_dns = next((d for d in dns_records if d.get("domain") == QUICK_DOMAIN), None)
+    existing_npm = npm_find_proxy_host(npm_cfg, QUICK_DOMAIN)
+
+    # docker-1's known LAN IP — reuse whatever its other DNS entries already point at,
+    # falling back to the documented 192.168.1.78 if none found.
+    docker1_ip = next(
+        (d["ip"] for d in dns_records if "portainer" in d.get("domain", "") or d.get("ip") == "192.168.1.78"),
+        "192.168.1.78",
+    )
+
+    console.print(f"[bold]Plan for '{QUICK_STACK_NAME}' on {env.name}:[/]")
+    console.print(f"  1. Stack '{QUICK_STACK_NAME}' (nginx:alpine + named volume) — "
+                   f"{'[dim]already exists, skip[/]' if existing_stack else '[green]create[/]'}")
+    console.print(f"  2. Pi-hole A record {QUICK_DOMAIN} → {docker1_ip} — "
+                   f"{'[dim]already exists, skip[/]' if existing_dns else '[green]create[/]'}")
+    console.print(f"  3. NPM proxy host {QUICK_DOMAIN} → quick:80 (cert #12, ssl-forced) — "
+                   f"{'[dim]already exists, skip[/]' if existing_npm else '[green]create[/]'}")
+
+    if dry_run:
+        return
+    if not yes and not Confirm.ask("Proceed?"):
+        raise typer.Exit(0)
+
+    if not existing_stack:
+        with console.status("[bold]Creating 'quick' stack…[/]"):
+            stack_id = create_stack(pt_cfg, env.id, QUICK_STACK_NAME, _quick_compose())
+        console.print(f"[green]✓[/] Created stack #{stack_id}")
+    else:
+        console.print(f"[dim]✓ Stack already exists (#{existing_stack.id})[/]")
+
+    if not existing_dns:
+        with console.status("[bold]Adding Pi-hole record…[/]"):
+            ok, err = asyncio.run(add_custom_dns(primary_pihole, QUICK_DOMAIN, docker1_ip))
+        if ok:
+            console.print(f"[green]✓[/] Added Pi-hole record {QUICK_DOMAIN} → {docker1_ip}")
+        else:
+            console.print(f"[red]✗[/] Failed to add Pi-hole record — {err}")
+            raise typer.Exit(1)
+    else:
+        console.print(f"[dim]✓ Pi-hole record already exists ({existing_dns.get('ip')})[/]")
+
+    if not existing_npm:
+        npm_create_proxy_host(
+            npm_cfg, QUICK_DOMAIN, "quick", 80,
+            forward_scheme="http", block_exploits=True, allow_websocket_upgrade=False,
+            certificate_id=12, ssl_forced=True,
+        )
+        console.print(f"[green]✓[/] Created NPM proxy host for {QUICK_DOMAIN}")
+    else:
+        console.print(f"[dim]✓ NPM proxy host already exists (#{existing_npm.id})[/]")
+
+    console.print(f"\n[bold green]Ready.[/] Publish with: [cyan]atc quick publish <file_or_dir>[/]")
+
+
+@quick_app.command("publish")
+def quick_publish(
+    path: Path = typer.Argument(..., exists=True, help="Local file or directory to publish"),
+    name: Optional[str] = typer.Option(None, "--name", help="Subpath under the site root (default: filename stem)"),
+    target: str = typer.Option("docker-1", "--target", help="Portainer environment name/substring"),
+) -> None:
+    """Upload a file or directory into the 'quick' stack and print its live URL.
+
+    Run 'atc quick bootstrap' once first if the stack doesn't exist yet.
+    """
+    import io
+    import tarfile
+
+    cfg = _load()
+    pt_cfg = _require_portainer(cfg)
+
+    from lib.portainer import fetch_environments, fetch_containers, upload_to_container
+
+    slug = name or path.stem.replace(" ", "-").lower()
+
+    with console.status("[bold]Finding the 'quick' container…[/]"):
+        envs = [e for e in fetch_environments(pt_cfg) if e.status == 1]
+        env = _resolve_single_env(envs, target)
+        containers = fetch_containers(pt_cfg, env.id, env.name, all_containers=False)
+        quick_container = next(
+            (c for c in containers if c.name.startswith(QUICK_STACK_NAME)), None,
+        )
+    if not quick_container:
+        console.print(
+            f"[red]❌  No running '{QUICK_STACK_NAME}' container on {env.name}. "
+            f"Run [cyan]atc quick bootstrap[/] first.[/]"
+        )
+        raise typer.Exit(1)
+
+    # Build a tar stream rooted such that extracting into QUICK_SERVE_ROOT
+    # places files at QUICK_SERVE_ROOT/<slug>/... (single file) or
+    # QUICK_SERVE_ROOT/<slug> (single file at top, named to serve directly).
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tar:
+        if path.is_file():
+            tar.add(path, arcname=f"{slug}/index.html" if path.suffix == ".html" else f"{slug}/{path.name}")
+        else:
+            tar.add(path, arcname=slug)
+
+    with console.status(f"[bold]Uploading {path.name} as '{slug}'…[/]"):
+        upload_to_container(pt_cfg, env.id, quick_container.id, buf.getvalue(), QUICK_SERVE_ROOT)
+
+    if path.is_file() and path.suffix == ".html":
+        url = f"https://{QUICK_DOMAIN}/{slug}/"
+    elif path.is_file():
+        url = f"https://{QUICK_DOMAIN}/{slug}/{path.name}"
+    else:
+        url = f"https://{QUICK_DOMAIN}/{slug}/"
+
+    console.print(f"[green]✓[/] Published. [bold cyan]{url}[/]")
+
+
+@quick_app.command("list")
+def quick_list(
+    target: str = typer.Option("docker-1", "--target", help="Portainer environment name/substring"),
+) -> None:
+    """List what's currently published under the quick site root."""
+    cfg = _load()
+    pt_cfg = _require_portainer(cfg)
+
+    from lib.portainer import fetch_environments, fetch_containers
+
+    envs = [e for e in fetch_environments(pt_cfg) if e.status == 1]
+    env = _resolve_single_env(envs, target)
+    containers = fetch_containers(pt_cfg, env.id, env.name, all_containers=False)
+    quick_container = next((c for c in containers if c.name.startswith(QUICK_STACK_NAME)), None)
+    if not quick_container:
+        console.print(f"[red]❌  No running '{QUICK_STACK_NAME}' container on {env.name}.[/]")
+        raise typer.Exit(1)
+
+    console.print(
+        f"[dim]Listing requires container exec, not yet wired — for now check "
+        f"https://{QUICK_DOMAIN}/ directly (autoindex is on), or `atc docker logs quick --env {target}`.[/]"
+    )
+
