@@ -435,6 +435,15 @@ def create_stack(
     return r.json().get("Id", 0)
 
 
+def fetch_stack_env(cfg: PortainerConfig, stack_id: int) -> list[dict]:
+    """Return the current Env array (list of {"name": ..., "value": ...}) for a stack."""
+    with _client(cfg) as client:
+        r = client.get(f"{cfg.base_url}/api/stacks/{stack_id}", headers=_headers(cfg))
+        if not r.is_success:
+            raise RuntimeError(f"Stack fetch HTTP {r.status_code} (stack {stack_id}): {r.text[:200]}")
+    return r.json().get("Env", [])
+
+
 def update_stack(
     cfg: PortainerConfig,
     stack_id: int,
@@ -443,8 +452,22 @@ def update_stack(
     env_vars: "list[dict] | None" = None,
     prune: bool = True,
     pull_image: bool = False,
+    force_clear_env: bool = False,
 ) -> None:
     """Redeploy an existing Compose stack with new file content.
+
+    SAFETY: Portainer's PUT /api/stacks/{id} REPLACES the stack's Env array
+    wholesale — it does not merge. A caller that omits env_vars (e.g. only
+    wants to bump pullImage/prune) would otherwise silently wipe every
+    secret (SECRET_KEY, POSTGRES_PASSWORD, ...) attached to the stack,
+    crash-looping it. This happened for real on 2026-09-02 (staging-peppermint,
+    stack 93) and required a full DB wipe + fresh secrets to recover, because
+    no backup of the original values existed.
+
+    To prevent a repeat: if env_vars is None, this function now AUTO-FETCHES
+    and reuses the stack's current Env array instead of defaulting to [].
+    To genuinely clear all env vars, you must pass env_vars=[] AND
+    force_clear_env=True — an accidental empty list alone is rejected.
 
     pull_image forces Portainer to re-pull images before redeploying — needed
     for `:latest`-style tags to actually refresh, since Docker otherwise only
@@ -453,6 +476,15 @@ def update_stack(
     Uses a long timeout for the same reason as create_stack: an image pull
     (forced or first-time) runs synchronously inside this request.
     """
+    if env_vars is None:
+        env_vars = fetch_stack_env(cfg, stack_id)
+    elif env_vars == [] and not force_clear_env:
+        raise ValueError(
+            "update_stack: env_vars=[] would wipe all env vars on this stack. "
+            "Pass force_clear_env=True if you genuinely intend to clear them, "
+            "or omit env_vars entirely to preserve the stack's current values."
+        )
+
     with _client(cfg, timeout=300) as client:
         r = client.put(
             f"{cfg.base_url}/api/stacks/{stack_id}",
@@ -460,7 +492,7 @@ def update_stack(
             params={"endpointId": env_id},
             json={
                 "stackFileContent": compose_content,
-                "env": env_vars or [],
+                "env": env_vars,
                 "prune": prune,
                 "pullImage": pull_image,
             },

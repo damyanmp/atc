@@ -2478,6 +2478,53 @@ def npm_list(
     console.print(f"\n[dim]{len(hosts)} proxy host(s)[/]")
 
 
+def _resolve_certificate_id(
+    npm_cfg,
+    certificate_id: Optional[int],
+    certificate_name: Optional[str],
+) -> int:
+    """Resolve a --certificate-id / --certificate-name pair to a concrete NPM
+    certificate id, or 0 (no cert) if neither was given.
+
+    certificate_name matches against each cert's nice_name or any of its
+    domain_names (exact or wildcard, e.g. "local.damyanpetkov.com" matches
+    a "*.local.damyanpetkov.com" cert). Prints the known cert list and exits
+    on no-match or ambiguous-match, so the caller never silently gets 0.
+    """
+    if certificate_id is not None and certificate_name is not None:
+        console.print("[red]✗[/] Pass only one of --certificate-id / --certificate-name, not both.")
+        raise typer.Exit(1)
+    if certificate_id is not None:
+        return certificate_id
+    if certificate_name is None:
+        return 0
+
+    certs = npm_list_certificates(npm_cfg)
+
+    def _matches(c) -> bool:
+        if certificate_name == c.nice_name:
+            return True
+        for d in c.domain_names:
+            if d == certificate_name:
+                return True
+            if d.startswith("*.") and certificate_name.endswith(d[1:]):
+                return True
+        return False
+
+    matches = [c for c in certs if _matches(c)]
+    if not matches:
+        console.print(f"[red]✗[/] No certificate matches '{certificate_name}'. Known certificates:")
+        for c in certs:
+            console.print(f"  #{c.id}  {c.nice_name}  ({', '.join(c.domain_names)})")
+        raise typer.Exit(1)
+    if len(matches) > 1:
+        console.print(f"[red]✗[/] '{certificate_name}' matches multiple certificates — use --certificate-id instead:")
+        for c in matches:
+            console.print(f"  #{c.id}  {c.nice_name}  ({', '.join(c.domain_names)})")
+        raise typer.Exit(1)
+    return matches[0].id
+
+
 @npm_app.command("create")
 def npm_create(
     domain: str = typer.Argument(..., help="Domain name, e.g. myservice.local.damyanpetkov.com"),
@@ -2486,6 +2533,16 @@ def npm_create(
     scheme: str = typer.Option("http", "--scheme", help="http or https"),
     websocket: bool = typer.Option(True, "--websocket/--no-websocket", help="Allow websocket upgrade"),
     block_exploits: bool = typer.Option(True, "--block-exploits/--no-block-exploits"),
+    certificate_id: Optional[int] = typer.Option(
+        None, "--certificate-id", help="Existing NPM certificate id to attach (see 'atc npm certs'). 0/omitted = no cert.",
+    ),
+    certificate_name: Optional[str] = typer.Option(
+        None, "--certificate-name",
+        help="Attach a cert by name/domain instead of id, e.g. '*.local.damyanpetkov.com' (see 'atc npm certs'). Errors out on no/ambiguous match rather than silently leaving the host cert-less.",
+    ),
+    ssl_forced: bool = typer.Option(
+        False, "--ssl-forced/--no-ssl-forced", help="Force SSL (requires a certificate to actually be attached).",
+    ),
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation"),
 ) -> None:
     """Create a new proxy host. Fails loudly if the domain already exists — use 'update' instead."""
@@ -2497,7 +2554,16 @@ def npm_create(
         console.print(f"[red]✗[/] {domain} already exists as proxy host #{existing.id}. Use 'atc npm update' instead.")
         raise typer.Exit(1)
 
+    resolved_cert_id = _resolve_certificate_id(npm_cfg, certificate_id, certificate_name)
+    if ssl_forced and not resolved_cert_id:
+        console.print("[red]✗[/] --ssl-forced requires a certificate — pass --certificate-id or --certificate-name (see 'atc npm certs').")
+        raise typer.Exit(1)
+
     console.print(f"Creating proxy host: [bold]{domain}[/] → [cyan]{scheme}://{forward_host}:{forward_port}[/]")
+    if resolved_cert_id:
+        console.print(f"  SSL: certificate #{resolved_cert_id}{' (forced)' if ssl_forced else ''}")
+    else:
+        console.print("  SSL: [yellow]none — plain HTTP, no cert attached[/]")
     if not yes and not Confirm.ask("Continue?"):
         raise typer.Exit(0)
 
@@ -2505,8 +2571,81 @@ def npm_create(
         host = npm_create_proxy_host(
             npm_cfg, domain, forward_host, forward_port,
             forward_scheme=scheme, block_exploits=block_exploits, allow_websocket_upgrade=websocket,
+            certificate_id=resolved_cert_id, ssl_forced=ssl_forced,
         )
     console.print(f"[green]✓[/] Created proxy host #{host.id}: {domain}")
+
+
+@npm_app.command("update")
+def npm_update(
+    domain: str = typer.Argument(..., help="Domain of the existing proxy host to update"),
+    forward_host: Optional[str] = typer.Option(None, "--forward-host", help="New forward host/IP"),
+    forward_port: Optional[int] = typer.Option(None, "--forward-port", help="New forward port"),
+    scheme: Optional[str] = typer.Option(None, "--scheme", help="New forward scheme (http/https)"),
+    certificate_id: Optional[int] = typer.Option(
+        None, "--certificate-id", help="Attach this existing NPM certificate id (see 'atc npm certs'). Pass 0 to detach.",
+    ),
+    certificate_name: Optional[str] = typer.Option(
+        None, "--certificate-name",
+        help="Attach a cert by name/domain instead of id, e.g. '*.local.damyanpetkov.com' (see 'atc npm certs').",
+    ),
+    ssl_forced: Optional[bool] = typer.Option(None, "--ssl-forced/--no-ssl-forced", help="Force SSL on/off"),
+    websocket: Optional[bool] = typer.Option(None, "--websocket/--no-websocket"),
+    block_exploits: Optional[bool] = typer.Option(None, "--block-exploits/--no-block-exploits"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation"),
+) -> None:
+    """Update an existing proxy host (forward target, cert, SSL enforcement, etc).
+
+    Common fix: a host created without a cert (see 'SSL: —' in 'atc npm list')
+    is silently served over plain HTTP or falls through to the backend's own
+    cert — attach the right one here, e.g.:
+      atc npm update mail.local.damyanpetkov.com --certificate-name '*.local.damyanpetkov.com' --ssl-forced
+    """
+    cfg = _load()
+    npm_cfg = _npm_cfg(cfg)
+
+    host = npm_find_proxy_host(npm_cfg, domain)
+    if not host:
+        console.print(f"[red]✗[/] No proxy host found for {domain}. Use 'atc npm create' instead.")
+        raise typer.Exit(1)
+
+    fields: dict = {}
+    if forward_host is not None:
+        fields["forward_host"] = forward_host
+    if forward_port is not None:
+        fields["forward_port"] = forward_port
+    if scheme is not None:
+        fields["forward_scheme"] = scheme
+    if websocket is not None:
+        fields["allow_websocket_upgrade"] = websocket
+    if block_exploits is not None:
+        fields["block_exploits"] = block_exploits
+
+    if certificate_id is not None or certificate_name is not None:
+        resolved_cert_id = _resolve_certificate_id(npm_cfg, certificate_id, certificate_name)
+        fields["certificate_id"] = resolved_cert_id
+        fields["http2_support"] = bool(resolved_cert_id)
+    if ssl_forced is not None:
+        fields["ssl_forced"] = ssl_forced
+
+    if not fields:
+        console.print("[yellow]Nothing to update — pass at least one option.[/]")
+        raise typer.Exit(0)
+
+    effective_cert_id = fields.get("certificate_id", host.certificate_id)
+    if fields.get("ssl_forced", host.ssl_forced) and not effective_cert_id:
+        console.print("[red]✗[/] --ssl-forced requires a certificate — pass --certificate-id/--certificate-name too.")
+        raise typer.Exit(1)
+
+    console.print(f"Updating proxy host #{host.id}: [bold]{domain}[/]")
+    for k, v in fields.items():
+        console.print(f"  {k}: {v}")
+    if not yes and not Confirm.ask("Continue?"):
+        raise typer.Exit(0)
+
+    with console.status("[bold]Updating…[/]"):
+        updated = npm_update_proxy_host(npm_cfg, host.id, fields)
+    console.print(f"[green]✓[/] Updated proxy host #{updated.id}: {domain}")
 
 
 @npm_app.command("delete")
