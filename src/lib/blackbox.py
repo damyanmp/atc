@@ -329,8 +329,18 @@ def _collect_homeassistant(cfg, window_hours: int) -> BBHomeAssistant:
     return result
 
 
-def _collect_prometheus(prometheus_url: str, verify_ssl: bool = False) -> BBPrometheus:
+_SKIP_ALERTS = {"Watchdog", "NoAlertsFiring", "DeadMansSwitch"}
+
+
+def _collect_prometheus(
+    prometheus_url: str, verify_ssl: bool = False, window_hours: int = 2
+) -> BBPrometheus:
+    """Currently-active alerts (with annotations) plus anything that fired and
+    already resolved within the lookback window — `/api/v1/alerts` alone is a
+    point-in-time snapshot and misses alerts that cleared before this ran."""
     result = BBPrometheus()
+    active_by_key: dict[tuple[str, str], dict] = {}
+
     try:
         with httpx.Client(verify=verify_ssl, timeout=10) as client:
             r = client.get(f"{prometheus_url}/api/v1/alerts")
@@ -338,8 +348,6 @@ def _collect_prometheus(prometheus_url: str, verify_ssl: bool = False) -> BBProm
                 result.error = f"HTTP {r.status_code}"
                 return result
             data = r.json().get("data", {}).get("alerts", [])
-            # Skip Prometheus pipeline health-check sentinels — not real incidents
-            _SKIP_ALERTS = {"Watchdog", "NoAlertsFiring", "DeadMansSwitch"}
             for alert in data:
                 if alert.get("state") not in ("firing", "pending"):
                     continue
@@ -352,10 +360,58 @@ def _collect_prometheus(prometheus_url: str, verify_ssl: bool = False) -> BBProm
                 summary = annotations.get("summary", annotations.get("description", ""))
                 state = alert.get("state", "")
                 active_at = alert.get("activeAt", "")[:19]
+                instance = labels.get("instance", "")
+                active_by_key[(name, instance)] = {
+                    "active_at": active_at,
+                    "severity": severity,
+                    "summary": summary,
+                    "state": state,
+                }
                 result.firing_alerts.append(
                     f"[{active_at}] {name} ({severity}) [{state}]"
                     + (f" — {summary}" if summary else "")
                 )
+
+            # Historical pass: anything that fired at any point in the window,
+            # via a range query over the ALERTS metric (survives resolution).
+            import time as _time
+
+            now = _time.time()
+            start = now - (window_hours * 3600)
+            rr = client.get(
+                f"{prometheus_url}/api/v1/query_range",
+                params={
+                    "query": 'ALERTS{alertstate="firing"}',
+                    "start": str(start),
+                    "end": str(now),
+                    "step": "60",
+                },
+            )
+            if rr.is_success:
+                rdata = rr.json().get("data", {}).get("result", [])
+                for series in rdata:
+                    labels = series.get("metric", {})
+                    name = labels.get("alertname", "?")
+                    if name in _SKIP_ALERTS:
+                        continue
+                    instance = labels.get("instance", "")
+                    key = (name, instance)
+                    if key in active_by_key:
+                        continue  # already reported as currently active above
+                    values = series.get("values", [])
+                    if not values:
+                        continue
+                    first_ts = float(values[0][0])
+                    last_ts = float(values[-1][0])
+                    from datetime import datetime as _dt, timezone as _tz
+
+                    first_iso = _dt.fromtimestamp(first_ts, tz=_tz.utc).isoformat()[:19]
+                    last_iso = _dt.fromtimestamp(last_ts, tz=_tz.utc).isoformat()[:19]
+                    severity = labels.get("severity", "")
+                    result.firing_alerts.append(
+                        f"[{first_iso} → {last_iso}] {name} ({severity}) [resolved — "
+                        f"fired within last {window_hours}h, cleared before this scan]"
+                    )
     except Exception as e:
         result.error = str(e)
     return result
@@ -483,7 +539,7 @@ async def collect_all(
 
     if prometheus_url:
         tasks["prometheus"] = asyncio.create_task(
-            _wrap_sync(_collect_prometheus, prometheus_url, prometheus_verify_ssl)
+            _wrap_sync(_collect_prometheus, prometheus_url, prometheus_verify_ssl, window_hours)
         )
 
     if cfg.loki:
