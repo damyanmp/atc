@@ -6,7 +6,7 @@ import pytest
 
 from config import (
     ArrConfig,
-    DSMConfig,
+    BeszelConfig,
     HAConfig,
     HAStatConfig,
     PiholeInstanceConfig,
@@ -75,14 +75,14 @@ class TestHAConfigBaseUrl:
         assert cfg.base_url == "https://ha.local:443"
 
 
-class TestDSMConfigBaseUrl:
-    def test_http(self):
-        cfg = DSMConfig(name="nas", host="192.168.1.1", port=5000, user="u", password="p")
-        assert cfg.base_url == "http://192.168.1.1:5000"
+class TestBeszelConfigBaseUrl:
+    def test_https_default(self):
+        cfg = BeszelConfig(host="beszel.local", api_key="k")
+        assert cfg.base_url == "https://beszel.local:443"
 
-    def test_https(self):
-        cfg = DSMConfig(name="nas", host="192.168.1.1", port=5001, https=True, user="u", password="p")
-        assert cfg.base_url == "https://192.168.1.1:5001"
+    def test_http_override(self):
+        cfg = BeszelConfig(host="beszel.local", port=8090, https=False, api_key="k")
+        assert cfg.base_url == "http://beszel.local:8090"
 
 
 class TestPiholeConfigBaseUrl:
