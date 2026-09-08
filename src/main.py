@@ -14,12 +14,17 @@ from textual.binding import Binding
 
 from config import Config
 from screens.arr import ArrScreen
+from screens.backup import BackupScreen
 from screens.dashboard import DashboardScreen
+from screens.docker import DockerScreen
+from screens.metrics import MetricsScreen
 from screens.pihole import PiholeScreen
 from screens.plex import PlexScreen
+from screens.quick import QuickScreen
 from screens.scripts import ScriptsScreen
 from screens.seerr import SeerrScreen
 from screens.speedtest import SpeedtestScreen
+from screens.unifi import UnifiScreen
 from screens.update import UpdateScreen
 from screens.uptimekuma import UptimeKumaScreen
 
@@ -46,6 +51,11 @@ class HomelabApp(App):
         Binding("p", "nav_pihole",    "Pi-hole",   priority=True, show=True),
         Binding("t", "nav_speedtest", "Speedtest", priority=True, show=True),
         Binding("a", "nav_arr",       "Pipeline",  priority=True, show=True),
+        Binding("d", "nav_docker",    "Docker",    priority=True, show=True),
+        Binding("n", "nav_unifi",     "UniFi",     priority=True, show=True),
+        Binding("m", "nav_metrics",   "Metrics",   priority=True, show=True),
+        Binding("b", "nav_backup",    "Backup",    priority=True, show=True),
+        Binding("g", "nav_quick",     "Quick",     priority=True, show=True),
         Binding("q", "quit",          "Quit",      priority=True, show=True),
     ]
 
@@ -63,6 +73,11 @@ class HomelabApp(App):
         self.install_screen(PiholeScreen(self.config), name="pihole")
         self.install_screen(SpeedtestScreen(self.config), name="speedtest")
         self.install_screen(ArrScreen(self.config), name="arr")
+        self.install_screen(DockerScreen(self.config), name="docker")
+        self.install_screen(UnifiScreen(self.config), name="unifi")
+        self.install_screen(MetricsScreen(self.config), name="metrics")
+        self.install_screen(BackupScreen(self.config), name="backup")
+        self.install_screen(QuickScreen(self.config), name="quick")
         self.push_screen("dashboard")
 
     # ── Navigation actions ────────────────────────────────────────────────────
@@ -74,6 +89,11 @@ class HomelabApp(App):
     def action_nav_pihole(self)    -> None: self.push_screen("pihole")
     def action_nav_speedtest(self) -> None: self.push_screen("speedtest")
     def action_nav_arr(self)      -> None: self.push_screen("arr")
+    def action_nav_docker(self)   -> None: self.push_screen("docker")
+    def action_nav_unifi(self)    -> None: self.push_screen("unifi")
+    def action_nav_metrics(self)  -> None: self.push_screen("metrics")
+    def action_nav_backup(self)   -> None: self.push_screen("backup")
+    def action_nav_quick(self)    -> None: self.push_screen("quick")
 
     def check_action(self, action: str, parameters: tuple) -> bool | None:
         if action.startswith("nav_") or action == "quit":

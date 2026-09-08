@@ -159,7 +159,7 @@ class DashboardScreen(Screen):
             from datetime import datetime
             ts = datetime.now().strftime("%H:%M:%S")
             self.query_one("#status-bar", Static).update(
-                f"✅ {ts}  |  \[u]Update \[r]Scripts \[k]Kuma \[s]Seerr \[x]Plex \[p]Pi-hole \[t]Speedtest \[a]Pipeline \[c]Refresh \[q]Quit"
+                f"✅ {ts}  |  \[u]Update \[r]Scripts \[k]Kuma \[s]Seerr \[x]Plex \[p]Pi-hole \[t]Speedtest \[a]Pipeline \[d]Docker \[n]UniFi \[m]Metrics \[b]Backup \[g]Quick \[c]Refresh \[q]Quit"
             )
         except Exception as e:
             self.query_one("#status-bar", Static).update(f"❌ Error refreshing: {e}")
