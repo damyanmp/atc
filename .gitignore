@@ -8,3 +8,5 @@ dist/
 nasa
 default.profraw
 blackbox-*.txt
+.coverage
+htmlcov/
