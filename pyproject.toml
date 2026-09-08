@@ -15,6 +15,7 @@ dependencies = [
     "keyring>=25.0",
     "cryptography>=40.0",
     "qrcode>=8.0",
+    "keyrings-alt>=5.0.2",
 ]
 
 [project.scripts]
