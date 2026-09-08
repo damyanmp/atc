@@ -8,6 +8,16 @@ track breaking config/CLI changes.
 ## [Unreleased]
 
 ### Added
+- `atc init` — interactive setup wizard. Lists all 20 supported config
+  sections with a checkmark for what's already configured; pick sections by
+  number, `all`, or quit. Secrets are stored in the OS keychain automatically
+  (never written to config.yaml in plaintext). Safe to re-run — untouched
+  sections are preserved, only selected sections are replaced. Also supports
+  `atc init <section>` for a non-interactive single-section add/update.
+  Backed by a declarative registry (`lib/config_sections.py`) with 23 unit
+  tests, and end-to-end verified against real scratch config files covering
+  scalar sections, secret fields, list sections (multi-instance Pi-hole),
+  the interactive menu, and merge-preserves-existing-sections behavior.
 - `atc upgrade` — self-update command. Repo-agnostic (reads the checkout's
   own git remote, so forks self-update from themselves automatically),
   refuses to run on a dirty working tree, fast-forward-only pulls, and

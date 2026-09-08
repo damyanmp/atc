@@ -59,7 +59,7 @@ from lib.ha import (
 )
 from lib.proxmox import (
     fetch_cluster_status, fetch_guest_ips, fetch_node_loads,
-    ClusterStatus, GuestInfo,
+    ClusterStatus, GuestInfo, NodeStatus,
     fetch_guest_detail, GuestDetail,
     get_node_ip,
     start_guest, stop_guest, restart_guest,
@@ -661,6 +661,166 @@ def _render_guests_table(
         t.add_row(dot, str(g.vmid), name, kind, g.node, ip, tags)
 
     console.print(t)
+
+
+# ── init ──────────────────────────────────────────────────────────────────────
+
+def _prompt_field(f, instance_name: str = "") -> object:
+    """Prompt for one FieldSpec's value, storing secrets in the keychain."""
+    from lib.config_sections import resolve_secret_key
+
+    if f.kind == "bool":
+        return Confirm.ask(f"  {f.label}?", default=bool(f.default))
+
+    default_str = str(f.default) if f.default != "" else None
+    while True:
+        raw = Prompt.ask(f"  {f.label}", default=default_str) if default_str is not None \
+            else Prompt.ask(f"  {f.label}")
+        raw = (raw or "").strip()
+        if not raw and not f.required:
+            return ""
+        if not raw and f.required:
+            console.print("    [red]Required — please enter a value.[/]")
+            continue
+        break
+
+    if f.kind == "int":
+        try:
+            return int(raw)
+        except ValueError:
+            console.print("    [yellow]Not a number, storing as-is.[/]")
+            return raw
+
+    if f.secret:
+        key_name = resolve_secret_key(f, instance_name)
+        secret_set(key_name, raw)
+        console.print(f"    [dim]stored in keychain as '{key_name}'[/]")
+        return f"keychain:{key_name}"
+
+    return raw
+
+
+def _run_section_wizard(spec) -> object:
+    """Prompt through one SectionSpec, returning a dict (scalar) or list[dict] (list section)."""
+    from lib.config_sections import build_list_section, build_scalar_section
+
+    if not spec.is_list:
+        console.print(f"\n[bold cyan]{spec.title}[/]")
+        if spec.help:
+            console.print(f"[dim]{spec.help}[/]")
+        answers = {f.name: _prompt_field(f) for f in spec.fields}
+        return build_scalar_section(spec, answers)
+
+    console.print(f"\n[bold cyan]{spec.title}[/]")
+    if spec.help:
+        console.print(f"[dim]{spec.help}[/]")
+    instances: list[dict] = []
+    while True:
+        console.print(f"\n[bold]Instance #{len(instances) + 1}[/]")
+        answers = {}
+        instance_name = ""
+        for f in spec.fields:
+            val = _prompt_field(f, instance_name)
+            answers[f.name] = val
+            if f.name == "name":
+                instance_name = str(val)
+        instances.append(answers)
+        if not Confirm.ask("Add another instance?", default=False):
+            break
+    return build_list_section(spec, instances)
+
+
+@app.command("init")
+def cmd_init(
+    section: str | None = typer.Argument(
+        None, help="Add/update a single section non-interactively selected upfront "
+                    "(e.g. 'beszel'). Omit to pick from a menu."
+    ),
+    config_path_opt: Path | None = typer.Option(
+        None, "--config", help="Path to config.yaml (default: alongside this install)"
+    ),
+) -> None:
+    """Interactive setup wizard — pick which integrations to configure.
+
+    Safe to re-run: existing config.yaml is preserved, you choose which
+    sections to add or update, and nothing is overwritten without asking.
+    Secrets are stored in the system keychain, never written to config.yaml
+    in plaintext.
+    """
+    import yaml as _yaml
+
+    from lib.config_sections import SECTIONS, merge_config, section_by_key
+
+    cfg_path = (config_path_opt or Path(__file__).parent.parent / "config.yaml").resolve()
+
+    existing: dict = {}
+    if cfg_path.exists():
+        with open(cfg_path) as f:
+            existing = _yaml.safe_load(f) or {}
+        console.print(f"[dim]Found existing config at {cfg_path}[/]")
+    else:
+        console.print(f"[dim]No config found — will create {cfg_path}[/]")
+
+    # Non-interactive single-section mode
+    if section:
+        spec = section_by_key(section)
+        if spec is None:
+            console.print(f"[red]Unknown section '{section}'.[/] Run 'atc init' with no argument to see the menu.")
+            raise typer.Exit(1)
+        result = _run_section_wizard(spec)
+        merged = merge_config(existing, {spec.key: result})
+        with open(cfg_path, "w") as f:
+            _yaml.dump(merged, f, sort_keys=False, default_flow_style=False)
+        console.print(f"\n[green]✓[/] Wrote [cyan]{spec.key}[/] to {cfg_path}")
+        return
+
+    # Interactive menu mode
+    console.print("[bold]atc init[/] — select which integrations to configure.\n")
+    console.print("[dim]Proxmox is required for atc to run at all; everything else is optional.[/]\n")
+
+    choices: list[tuple] = []  # (index, spec, already_configured)
+    for i, spec in enumerate(SECTIONS, start=1):
+        already = spec.key in existing
+        marker = "[green]✓ configured[/]" if already else "[dim]not configured[/]"
+        req = " [red](required)[/]" if spec.required_for_core else ""
+        console.print(f"  {i:2d}. {spec.title}{req}  {marker}")
+        choices.append((i, spec, already))
+
+    console.print(
+        "\n[dim]Enter numbers separated by commas (e.g. 1,3,7), 'all', or 'q' to quit.[/]"
+    )
+    raw = Prompt.ask("Sections to configure")
+    if raw.strip().lower() in ("q", "quit", ""):
+        console.print("[dim]Aborted — no changes made.[/]")
+        raise typer.Exit(0)
+
+    if raw.strip().lower() == "all":
+        selected = [spec for _, spec, _ in choices]
+    else:
+        selected = []
+        for tok in raw.split(","):
+            tok = tok.strip()
+            if not tok.isdigit():
+                continue
+            idx = int(tok)
+            match = next((spec for i, spec, _ in choices if i == idx), None)
+            if match:
+                selected.append(match)
+
+    if not selected:
+        console.print("[yellow]Nothing selected — no changes made.[/]")
+        raise typer.Exit(0)
+
+    updates: dict = {}
+    for spec in selected:
+        updates[spec.key] = _run_section_wizard(spec)
+
+    merged = merge_config(existing, updates)
+    with open(cfg_path, "w") as f:
+        _yaml.dump(merged, f, sort_keys=False, default_flow_style=False)
+
+    console.print(f"\n[green]✓[/] Configured {len(selected)} section(s) → {cfg_path}")
+    console.print("[dim]Run 'atc get hosts' to verify.[/]")
 
 
 # ── get ───────────────────────────────────────────────────────────────────────
@@ -4807,6 +4967,7 @@ from lib.plex import (
     analyze_library as plex_analyze_library,
     empty_trash as plex_empty_trash,
     clean_bundles as plex_clean_bundles,
+    PlexMatch,
     _section_key as plex_section_key,
     get_activities as plex_get_activities,
     get_butler_tasks as plex_get_butler_tasks,

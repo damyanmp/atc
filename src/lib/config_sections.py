@@ -1,0 +1,344 @@
+"""Declarative registry of atc's config.yaml sections, used by `atc init`.
+
+Pure data + pure logic (no I/O, no prompting) so it's fully unit-testable.
+The interactive wizard (prompting, writing files, calling secret_set) lives
+in cli.py's `init` command — this module only knows the *shape* of each
+section: its fields, defaults, which fields are secrets, and how to build
+a config.yaml-ready dict from a set of answers.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+
+@dataclass
+class FieldSpec:
+    name: str                  # dict key within the section
+    label: str                 # human-readable prompt text
+    kind: str = "str"          # "str" | "int" | "bool"
+    default: object = ""
+    required: bool = True
+    secret: bool = False       # if True, value is stored in keychain, not plaintext
+    secret_key: str = ""       # keychain key name template, e.g. "beszel-api-key"
+                                # for list sections, "{name}" is substituted with
+                                # the instance name (e.g. pihole "{name}-password")
+    help: str = ""
+
+
+@dataclass
+class SectionSpec:
+    key: str                    # top-level config.yaml key, e.g. "beszel"
+    title: str                  # display name, e.g. "Beszel (host monitoring)"
+    fields: list[FieldSpec] = field(default_factory=list)
+    is_list: bool = False       # True for sections that are a YAML list (pihole, tls)
+    required_for_core: bool = False  # True only for proxmox — atc doesn't run without it
+    help: str = ""
+
+
+# ── Registry ─────────────────────────────────────────────────────────────────
+# Field lists mirror config.yaml.example exactly — same keys, same defaults,
+# same secret_key naming — so a config built by `atc init` looks identical to
+# one hand-written from the example file.
+
+SECTIONS: list[SectionSpec] = [
+    SectionSpec(
+        key="proxmox",
+        title="Proxmox VE (cluster nodes, VMs, LXCs)",
+        required_for_core=True,
+        help="Required — atc's dashboard and most commands need this.",
+        fields=[
+            FieldSpec("host", "Proxmox host/IP", help="Any single cluster node — the API returns the whole cluster."),
+            FieldSpec("port", "Port", kind="int", default=8006),
+            FieldSpec("user", "API user", default="root@pam"),
+            FieldSpec("token_name", "API token name", default="atc"),
+            FieldSpec("token_value", "API token value", secret=True, secret_key="pve-token"),
+            FieldSpec("verify_ssl", "Verify SSL?", kind="bool", default=False, required=False),
+        ],
+    ),
+    SectionSpec(
+        key="ssh",
+        title="SSH (node/guest access for updates, key injection)",
+        fields=[
+            FieldSpec("default_user", "Default SSH user", default="root"),
+            FieldSpec("key_file", "SSH private key path", default="~/.ssh/id_rsa"),
+            FieldSpec("connect_timeout", "Connect timeout (seconds)", kind="int", default=10, required=False),
+            FieldSpec("node_host_pattern", "Node hostname pattern", default="{name}",
+                       help="{name} is replaced with the Proxmox node name.", required=False),
+            FieldSpec("verify_host_keys", "Verify SSH host keys?", kind="bool", default=False, required=False),
+        ],
+    ),
+    SectionSpec(
+        key="beszel",
+        title="Beszel (lightweight host monitoring)",
+        fields=[
+            FieldSpec("host", "Beszel host/IP"),
+            FieldSpec("port", "Port", kind="int", default=443),
+            FieldSpec("https", "Use HTTPS?", kind="bool", default=True, required=False),
+            FieldSpec("api_key", "API key", secret=True, secret_key="beszel-api-key"),
+            FieldSpec("verify_ssl", "Verify SSL?", kind="bool", default=False, required=False),
+        ],
+    ),
+    SectionSpec(
+        key="unifi",
+        title="UniFi Network (firewall, VLANs, clients)",
+        fields=[
+            FieldSpec("host", "Controller host/IP"),
+            FieldSpec("port", "Port", kind="int", default=443),
+            FieldSpec("https", "Use HTTPS?", kind="bool", default=True, required=False),
+            FieldSpec("udm", "Is this a UDM/UDR (vs standalone controller)?",
+                       kind="bool", default=True, required=False),
+            FieldSpec("site", "Site name", default="default"),
+            FieldSpec("api_key", "API key (Network 8.x+, recommended)", secret=True,
+                       secret_key="unifi-api-key", required=False,
+                       help="Leave blank to use username/password instead."),
+            FieldSpec("verify_ssl", "Verify SSL?", kind="bool", default=False, required=False),
+        ],
+    ),
+    SectionSpec(
+        key="homeassistant",
+        title="Home Assistant",
+        fields=[
+            FieldSpec("host", "HA host/IP"),
+            FieldSpec("port", "Port", kind="int", default=8123),
+            FieldSpec("https", "Use HTTPS?", kind="bool", default=False, required=False),
+            FieldSpec("token", "Long-lived access token", secret=True, secret_key="ha-token"),
+            FieldSpec("verify_ssl", "Verify SSL?", kind="bool", default=False, required=False),
+        ],
+    ),
+    SectionSpec(
+        key="plex",
+        title="Plex Media Server",
+        fields=[
+            FieldSpec("host", "Plex host/IP"),
+            FieldSpec("port", "Port", kind="int", default=32400),
+            FieldSpec("https", "Use HTTPS?", kind="bool", default=False, required=False),
+            FieldSpec("token", "Plex token", secret=True, secret_key="plex-token"),
+            FieldSpec("verify_ssl", "Verify SSL?", kind="bool", default=False, required=False),
+        ],
+    ),
+    SectionSpec(
+        key="radarr",
+        title="Radarr (movie collection manager)",
+        fields=[
+            FieldSpec("host", "Radarr host/IP"),
+            FieldSpec("port", "Port", kind="int", default=7878),
+            FieldSpec("https", "Use HTTPS?", kind="bool", default=False, required=False),
+            FieldSpec("api_key", "API key", secret=True, secret_key="radarr-api-key"),
+            FieldSpec("verify_ssl", "Verify SSL?", kind="bool", default=False, required=False),
+            FieldSpec("base_path", "Reverse-proxy base path (optional)", default="", required=False),
+        ],
+    ),
+    SectionSpec(
+        key="sonarr",
+        title="Sonarr (TV collection manager)",
+        fields=[
+            FieldSpec("host", "Sonarr host/IP"),
+            FieldSpec("port", "Port", kind="int", default=8989),
+            FieldSpec("https", "Use HTTPS?", kind="bool", default=False, required=False),
+            FieldSpec("api_key", "API key", secret=True, secret_key="sonarr-api-key"),
+            FieldSpec("verify_ssl", "Verify SSL?", kind="bool", default=False, required=False),
+            FieldSpec("base_path", "Reverse-proxy base path (optional)", default="", required=False),
+        ],
+    ),
+    SectionSpec(
+        key="tautulli",
+        title="Tautulli (Plex monitoring)",
+        fields=[
+            FieldSpec("host", "Tautulli host/IP"),
+            FieldSpec("port", "Port", kind="int", default=8181),
+            FieldSpec("https", "Use HTTPS?", kind="bool", default=False, required=False),
+            FieldSpec("api_key", "API key", secret=True, secret_key="tautulli-api-key"),
+            FieldSpec("verify_ssl", "Verify SSL?", kind="bool", default=False, required=False),
+        ],
+    ),
+    SectionSpec(
+        key="seerr",
+        title="Overseerr / Jellyseerr (media requests)",
+        fields=[
+            FieldSpec("host", "Seerr host/IP"),
+            FieldSpec("port", "Port", kind="int", default=443),
+            FieldSpec("https", "Use HTTPS?", kind="bool", default=True, required=False),
+            FieldSpec("api_key", "API key", secret=True, secret_key="seerr-api-key"),
+            FieldSpec("verify_ssl", "Verify SSL?", kind="bool", default=False, required=False),
+        ],
+    ),
+    SectionSpec(
+        key="prometheus",
+        title="Prometheus (metrics queries, alert rules in blackbox)",
+        fields=[
+            FieldSpec("host", "Prometheus host/IP"),
+            FieldSpec("port", "Port", kind="int", default=9090),
+            FieldSpec("https", "Use HTTPS?", kind="bool", default=False, required=False),
+            FieldSpec("verify_ssl", "Verify SSL?", kind="bool", default=False, required=False),
+        ],
+    ),
+    SectionSpec(
+        key="loki",
+        title="Loki (log queries in blackbox)",
+        fields=[
+            FieldSpec("host", "Loki host/IP"),
+            FieldSpec("port", "Port", kind="int", default=3100),
+            FieldSpec("https", "Use HTTPS?", kind="bool", default=False, required=False),
+            FieldSpec("verify_ssl", "Verify SSL?", kind="bool", default=False, required=False),
+        ],
+    ),
+    SectionSpec(
+        key="influxdb",
+        title="InfluxDB 2.x (push-based metrics, e.g. Proxmox's built-in export)",
+        fields=[
+            FieldSpec("host", "InfluxDB host/IP"),
+            FieldSpec("org", "Organization ID or name"),
+            FieldSpec("token", "API token", secret=True, secret_key="influxdb-api-key"),
+            FieldSpec("port", "Port", kind="int", default=8086),
+            FieldSpec("https", "Use HTTPS?", kind="bool", default=True, required=False),
+            FieldSpec("verify_ssl", "Verify SSL?", kind="bool", default=True, required=False),
+        ],
+    ),
+    SectionSpec(
+        key="openspeedtest",
+        title="OpenSpeedTest (self-hosted speed test server)",
+        fields=[
+            FieldSpec("host", "OpenSpeedTest host/IP"),
+            FieldSpec("port", "Port", kind="int", default=3000),
+            FieldSpec("https", "Use HTTPS?", kind="bool", default=False, required=False),
+            FieldSpec("verify_ssl", "Verify SSL?", kind="bool", default=False, required=False),
+        ],
+    ),
+    SectionSpec(
+        key="uptimekuma",
+        title="Uptime Kuma (service uptime monitoring)",
+        fields=[
+            FieldSpec("host", "Uptime Kuma host/IP"),
+            FieldSpec("port", "Port", kind="int", default=3001),
+            FieldSpec("https", "Use HTTPS?", kind="bool", default=False, required=False),
+            FieldSpec("api_key", "API key (optional — omit to use public status page)",
+                       secret=True, secret_key="uptimekuma-api-key", required=False),
+            FieldSpec("slug", "Status page slug (used for outage history)", default="default", required=False),
+            FieldSpec("verify_ssl", "Verify SSL?", kind="bool", default=False, required=False),
+        ],
+    ),
+    SectionSpec(
+        key="portainer",
+        title="Portainer (unified Docker management)",
+        fields=[
+            FieldSpec("host", "Portainer host/IP"),
+            FieldSpec("port", "Port", kind="int", default=9000),
+            FieldSpec("https", "Use HTTPS?", kind="bool", default=False, required=False),
+            FieldSpec("api_key", "API access token", secret=True, secret_key="portainer-api-key"),
+            FieldSpec("verify_ssl", "Verify SSL?", kind="bool", default=False, required=False),
+        ],
+    ),
+    SectionSpec(
+        key="nginx_proxy_manager",
+        title="Nginx Proxy Manager",
+        help="Needs either a token, or both email+password.",
+        fields=[
+            FieldSpec("host", "NPM host/IP"),
+            FieldSpec("port", "Port", kind="int", default=81),
+            FieldSpec("https", "Use HTTPS?", kind="bool", default=False, required=False),
+            FieldSpec("email", "Admin email (fallback auth)", secret=True,
+                       secret_key="nginx_proxy_manager-email", required=False),
+            FieldSpec("password", "Admin password (fallback auth)", secret=True,
+                       secret_key="nginx_proxy_manager-password", required=False),
+            FieldSpec("verify_ssl", "Verify SSL?", kind="bool", default=False, required=False),
+        ],
+    ),
+    SectionSpec(
+        key="docker_hub",
+        title="Docker Hub (authenticated tag lookups for `atc versions`)",
+        fields=[
+            FieldSpec("username", "Docker Hub username"),
+            FieldSpec("token", "Personal access token", secret=True, secret_key="dockerhub-token"),
+        ],
+    ),
+    SectionSpec(
+        key="pihole",
+        title="Pi-hole (DNS blocking — one or more instances)",
+        is_list=True,
+        help="Pi-hole v6+ only — the v5 API is not supported.",
+        fields=[
+            FieldSpec("name", "Instance name", default="Primary"),
+            FieldSpec("host", "Pi-hole host/IP"),
+            FieldSpec("port", "Port", kind="int", default=80),
+            FieldSpec("https", "Use HTTPS?", kind="bool", default=False, required=False),
+            FieldSpec("password", "Web interface password", secret=True, secret_key="pihole-{name}-password"),
+            FieldSpec("primary", "Is this the primary instance?", kind="bool", default=True, required=False),
+            FieldSpec("verify_ssl", "Verify SSL?", kind="bool", default=False, required=False),
+        ],
+    ),
+    SectionSpec(
+        key="tls",
+        title="TLS certificate expiry checks",
+        is_list=True,
+        fields=[
+            FieldSpec("name", "Display name"),
+            FieldSpec("host", "Host/IP"),
+            FieldSpec("port", "Port", kind="int", default=443),
+            FieldSpec("sni", "SNI override (optional, for wildcard certs)", default="", required=False),
+            FieldSpec("verify_ssl", "Verify SSL?", kind="bool", default=True, required=False),
+        ],
+    ),
+]
+
+
+def section_by_key(key: str) -> SectionSpec | None:
+    return next((s for s in SECTIONS if s.key == key), None)
+
+
+def resolve_secret_key(field_spec: FieldSpec, instance_name: str = "") -> str:
+    """Fill in the {name} placeholder in a field's secret_key template."""
+    if "{name}" in field_spec.secret_key and instance_name:
+        safe_name = instance_name.lower().replace(" ", "-")
+        return field_spec.secret_key.format(name=safe_name)
+    return field_spec.secret_key
+
+
+def build_scalar_section(spec: SectionSpec, answers: dict) -> dict:
+    """Build a config.yaml-ready dict for a scalar (non-list) section.
+
+    `answers` maps field name -> the plain value the user entered. For
+    secret fields, the caller is expected to have already stored the real
+    value in the keychain and pass the `keychain:<key>` sentinel string here.
+    """
+    out: dict = {}
+    for f in spec.fields:
+        if f.name not in answers:
+            continue
+        val = answers[f.name]
+        if val == "" and not f.required:
+            continue
+        out[f.name] = val
+    return out
+
+
+def build_list_section(spec: SectionSpec, instances: list[dict]) -> list[dict]:
+    """Build a config.yaml-ready list for a list section (pihole, tls).
+
+    `instances` is a list of per-instance answer dicts, same convention as
+    build_scalar_section (secrets already replaced with keychain: sentinels).
+    """
+    out = []
+    for answers in instances:
+        entry: dict = {}
+        for f in spec.fields:
+            if f.name not in answers:
+                continue
+            val = answers[f.name]
+            if val == "" and not f.required:
+                continue
+            entry[f.name] = val
+        out.append(entry)
+    return out
+
+
+def merge_config(existing: dict, updates: dict) -> dict:
+    """Merge new section values into an existing parsed config.yaml dict.
+
+    Top-level keys in `updates` fully replace the corresponding key in
+    `existing` (sections aren't deep-merged field-by-field — re-running
+    `atc init` for a section means "replace this section's config").
+    Keys not present in `updates` are left untouched.
+    """
+    merged = dict(existing)
+    merged.update(updates)
+    return merged

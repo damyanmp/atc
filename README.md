@@ -30,18 +30,11 @@ had become the load-bearing tool for day-to-day homelab operations.
    #   export PATH="$HOME/bin:$PATH"
    ```
 
-4. **Create your config**:
-   ```bash
-   cd ~/repos/atc
-   cp config.yaml.example config.yaml
-   $EDITOR config.yaml   # fill in hosts/users for the services you run
-   ```
-
-5. **Keyring backend** — `atc secrets set <key>` stores secrets in the OS
-   keychain via the `keyring` package. On a desktop with GNOME
-   Keyring/KWallet/macOS Keychain this works out of the box. On a headless
-   Linux box (no secret service running), install the plaintext-file fallback
-   backend and point `keyring` at it:
+4. **Keyring backend** — secrets (step 5, and `atc secrets set <key>` later)
+   are stored in the OS keychain via the `keyring` package. On a desktop with
+   GNOME Keyring/KWallet/macOS Keychain this works out of the box. On a
+   headless Linux box (no secret service running), install the
+   plaintext-file fallback backend and point `keyring` at it:
    ```bash
    uv run --project ~/repos/atc python -c "import keyrings.alt"  # already a dependency
    mkdir -p ~/.config/python_keyring
@@ -54,6 +47,22 @@ had become the load-bearing tool for day-to-day homelab operations.
    fails with `ModuleNotFoundError: No module named 'keyrings'` or a keyring
    backend error — this step (plus the `keyrings.alt` dependency already
    declared in `pyproject.toml`) is what fixes it.
+
+5. **Create your config**:
+   ```bash
+   cd ~/repos/atc
+   atc init
+   ```
+   This launches an interactive wizard listing every supported integration —
+   pick which ones to configure (comma-separated numbers, `all`, or `q` to
+   skip). Secrets you enter are stored in the OS keychain automatically,
+   never written to `config.yaml` in plaintext. Safe to re-run any time to
+   add or update a section — existing sections are left untouched unless you
+   select them again.
+
+   Prefer to hand-edit instead? `cp config.yaml.example config.yaml` and fill
+   in values manually — `atc init` and the example file produce identical
+   config shapes.
 
 6. **First run** — `atc` builds its `uv` venv automatically on first
    invocation (a few seconds), then runs:
