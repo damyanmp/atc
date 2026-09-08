@@ -4699,6 +4699,89 @@ def show_tree() -> None:
     console.print(root)
 
 
+# ── upgrade ───────────────────────────────────────────────────────────────────
+
+@app.command("upgrade")
+def cmd_upgrade(
+    check: bool = typer.Option(False, "--check", help="Only check for updates, don't pull"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation prompt"),
+    remote_url: str | None = typer.Option(
+        None, "--remote-url",
+        help="Override the git remote to check against (default: this checkout's own "
+             "configured remote — works automatically for forks)",
+    ),
+) -> None:
+    """Self-update atc by pulling the latest commits from git.
+
+    Repo-agnostic: uses this checkout's own git remote, so forks self-update
+    from their own fork with no configuration. Refuses to run if the working
+    tree has uncommitted changes, and only fast-forwards (never merges).
+    """
+    from lib.selfupdate import (
+        DirtyWorkingTreeError,
+        NotAGitRepoError,
+        check_for_updates,
+        run_upgrade,
+    )
+
+    try:
+        with console.status("[bold]Checking for updates…[/]"):
+            status = check_for_updates(remote_url_override=remote_url)
+    except NotAGitRepoError as e:
+        console.print(f"[red]❌  {e}[/]")
+        raise typer.Exit(1)
+    except Exception as e:
+        console.print(f"[red]❌  Failed to check for updates: {e}[/]")
+        raise typer.Exit(1)
+
+    console.print(f"[dim]Remote:[/]  {status.remote_name}  {status.remote_url}")
+    console.print(f"[dim]Branch:[/]  {status.branch}")
+    console.print(f"[dim]Current:[/] {status.current_commit}")
+
+    if status.up_to_date:
+        console.print("[green]✓[/] Already up to date.")
+        return
+
+    console.print(
+        f"[yellow]{status.commits_behind}[/] commit(s) behind "
+        f"[cyan]{status.remote_name}/{status.branch}[/] ({status.latest_commit})"
+    )
+
+    if status.dirty:
+        console.print(
+            "\n[red]❌  Uncommitted local changes would be overwritten:[/]\n  "
+            + "\n  ".join(status.dirty_files)
+        )
+        console.print("[dim]Commit, stash, or discard them first, then retry.[/]")
+        raise typer.Exit(1)
+
+    if check:
+        console.print("[dim](--check: not pulling)[/]")
+        return
+
+    if not yes and not Confirm.ask(f"Pull {status.commits_behind} commit(s) and sync dependencies?"):
+        console.print("[dim]Aborted.[/]")
+        raise typer.Exit(0)
+
+    try:
+        with console.status("[bold]Pulling and syncing dependencies…[/]"):
+            new_status, log = run_upgrade()
+    except DirtyWorkingTreeError as e:
+        console.print(f"[red]❌  {e}[/]")
+        raise typer.Exit(1)
+    except Exception as e:
+        console.print(f"[red]❌  Upgrade failed: {e}[/]")
+        raise typer.Exit(1)
+
+    if log:
+        console.print("\n[bold]Changes:[/]")
+        for line in log:
+            console.print(f"  [dim]{line}[/]")
+
+    console.print(f"\n[green]✓[/] Updated to [cyan]{new_status.current_commit}[/].")
+    console.print("[dim]Dependencies synced via uv.[/]")
+
+
 # ── media ─────────────────────────────────────────────────────────────────────
 
 media_app = typer.Typer(

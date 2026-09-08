@@ -8,6 +8,12 @@ track breaking config/CLI changes.
 ## [Unreleased]
 
 ### Added
+- `atc upgrade` — self-update command. Repo-agnostic (reads the checkout's
+  own git remote, so forks self-update from themselves automatically),
+  refuses to run on a dirty working tree, fast-forward-only pulls, and
+  re-syncs dependencies via `uv sync` afterward. `--check`/`--yes`/
+  `--remote-url` flags. Verified end-to-end against real scratch git repos
+  (check/pull/dirty-refusal/fork-remote scenarios), not just unit-mocked.
 - TUI screens for Docker/Portainer, UniFi, Prometheus metrics, Proxmox
   backups, and Quick sites — closes most of the CLI/TUI parity gap
   (`versions`, and the admin-only `unifi`/`npm`/`ha`/`certs`/`acars`/

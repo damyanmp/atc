@@ -80,7 +80,28 @@ atc secrets             # manage keychain secrets
 atc run [script]        # browse and run repo scripts
 ```
 
-See `config.yaml.example` for all available integrations.
+## Updating
+
+```bash
+atc upgrade           # check for updates and pull if behind (prompts to confirm)
+atc upgrade --check   # only check, don't pull
+atc upgrade --yes     # pull without confirmation prompt
+```
+
+`atc upgrade` is repo-agnostic: it reads the local checkout's own configured
+git remote, so if you've forked this repo it self-updates from *your* fork
+automatically — no hardcoded URL, no config needed. Pass `--remote-url` to
+check against a different remote than the one currently configured (e.g.
+syncing a fork against upstream without changing `origin`).
+
+It refuses to run if the working tree has uncommitted local changes (won't
+silently discard edits), and only fast-forwards — if history has diverged
+(e.g. you've made local commits), it stops and asks you to resolve that
+manually rather than merging or rebasing on your behalf. Dependencies are
+re-synced via `uv sync` automatically after a successful pull.
+
+Equivalent to running `git pull && uv sync` by hand in the repo directory —
+`atc upgrade` just wraps that with a status check and safety guards.
 
 ## Supported integration versions
 
