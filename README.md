@@ -81,3 +81,24 @@ atc run [script]        # browse and run repo scripts
 ```
 
 See `config.yaml.example` for all available integrations.
+
+## Supported integration versions
+
+Each integration targets a specific API generation of that service — see
+[`COMPATIBILITY.md`](COMPATIBILITY.md) for the full matrix (e.g. Pi-hole
+**v6+ only**, InfluxDB **2.x only**, Radarr/Sonarr **v3 API only**). Running
+against an older instance than listed will generally fail outright rather
+than degrade gracefully.
+
+## Testing
+
+```bash
+uv run pytest                                    # run the test suite
+uv run pytest --cov=src --cov-report=term-missing  # with coverage
+```
+
+Coverage is currently concentrated in `src/lib/*.py` data models and pure
+logic (config parsing, formatters, search-throttle state); the Typer command
+tree (`src/cli.py`) and TUI screens (`src/screens/*.py`) are mostly
+integration-tested manually against the live homelab rather than unit
+tested.
