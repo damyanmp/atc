@@ -17,7 +17,7 @@ from __future__ import annotations
 import asyncio
 import re
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 import httpx
@@ -143,7 +143,7 @@ def _collect_uptimekuma(cfg) -> BBUptimeKuma:
 
 def _collect_proxmox(cfg, window_hours: int) -> BBProxmox:
     from proxmoxer import ProxmoxAPI
-    from config import ProxmoxClusterConfig
+
 
     result = BBProxmox()
     try:
@@ -175,7 +175,7 @@ def _collect_proxmox(cfg, window_hours: int) -> BBProxmox:
                     continue
                 status = t.get("status", "")
                 if status not in ("OK", ""):
-                    ts = datetime.fromtimestamp(starttime, tz=timezone.utc).isoformat()
+                    ts = datetime.fromtimestamp(starttime, tz=UTC).isoformat()
                     result.failed_tasks.append(
                         f"[{ts[:19]}] {t.get('node','?')} {t.get('type','?')}"
                         f" {t.get('id','?')} — {status}"
@@ -206,7 +206,6 @@ async def _collect_host_journal(name: str, host: str, user: str | None, ssh_cfg,
 
 
 async def _collect_all_ssh(cfg, window_hours: int) -> list[BBHostLog]:
-    from lib.proxmox import get_status as _px_status
     from proxmoxer import ProxmoxAPI
 
     targets: list[tuple[str, str, str | None]] = []  # (name, host, user)
@@ -257,8 +256,11 @@ def _log_has_errors(text: str) -> bool:
 
 async def _collect_portainer(cfg, window_hours: int, all_containers: bool) -> list[BBDockerEnv]:
     from lib.portainer import (
-        fetch_environments, fetch_containers, fetch_container_logs,
-        fetch_container_events, outages_from_events,
+        fetch_container_events,
+        fetch_container_logs,
+        fetch_containers,
+        fetch_environments,
+        outages_from_events,
     )
 
     since_seconds = window_hours * 3600
@@ -317,12 +319,13 @@ async def _collect_portainer(cfg, window_hours: int, all_containers: bool) -> li
 
 
 def _collect_homeassistant(cfg, window_hours: int) -> BBHomeAssistant:
+    from datetime import datetime, timedelta
+
     from lib.ha import get_diagnostics
-    from datetime import datetime, timezone, timedelta
 
     result = BBHomeAssistant()
     try:
-        since = (datetime.now(timezone.utc) - timedelta(hours=window_hours)).isoformat()
+        since = (datetime.now(UTC) - timedelta(hours=window_hours)).isoformat()
         result.error_log = get_diagnostics(cfg.ha, since_iso=since)
     except Exception as e:
         result.error = str(e)
@@ -403,10 +406,10 @@ def _collect_prometheus(
                         continue
                     first_ts = float(values[0][0])
                     last_ts = float(values[-1][0])
-                    from datetime import datetime as _dt, timezone as _tz
+                    from datetime import datetime as _dt
 
-                    first_iso = _dt.fromtimestamp(first_ts, tz=_tz.utc).isoformat()[:19]
-                    last_iso = _dt.fromtimestamp(last_ts, tz=_tz.utc).isoformat()[:19]
+                    first_iso = _dt.fromtimestamp(first_ts, tz=UTC).isoformat()[:19]
+                    last_iso = _dt.fromtimestamp(last_ts, tz=UTC).isoformat()[:19]
                     severity = labels.get("severity", "")
                     result.firing_alerts.append(
                         f"[{first_iso} → {last_iso}] {name} ({severity}) [resolved — "
@@ -418,7 +421,7 @@ def _collect_prometheus(
 
 
 def _collect_loki(cfg, window_hours: int) -> BBLoki:
-    from lib.loki import fetch_network_events, fetch_pihole_events, count_over_window
+    from lib.loki import count_over_window, fetch_network_events, fetch_pihole_events
 
     result = BBLoki()
     window_minutes = window_hours * 60
@@ -464,8 +467,9 @@ def _fmt_duration(seconds: int) -> str:
 
 
 def _collect_unifi(cfg, window_hours: int) -> BBUniFi:
-    from lib.unifi import fetch_devices
     import time
+
+    from lib.unifi import fetch_devices
 
     result = BBUniFi()
     try:
@@ -490,13 +494,13 @@ def _collect_unifi(cfg, window_hours: int) -> BBUniFi:
 
         boot_time = now - d.uptime if d.uptime else d.startup_timestamp
         if boot_time and boot_time >= since:
-            boot_iso = datetime.fromtimestamp(boot_time, tz=timezone.utc).isoformat()[:19]
+            boot_iso = datetime.fromtimestamp(boot_time, tz=UTC).isoformat()[:19]
             result.recent_reboots.append(
                 f"[{boot_iso}] {d.name} ({d.model}) rebooted — up {_fmt_duration(d.uptime)}{uplink}"
             )
 
         if d.previous_firmware_version and d.previous_firmware_version != d.version and boot_time >= since:
-            boot_iso = datetime.fromtimestamp(boot_time, tz=timezone.utc).isoformat()[:19]
+            boot_iso = datetime.fromtimestamp(boot_time, tz=UTC).isoformat()[:19]
             dur = f" ({d.upgrade_duration}s)" if d.upgrade_duration else ""
             result.firmware_updates.append(
                 f"[{boot_iso}] {d.name} ({d.model}): {d.previous_firmware_version} → {d.version}{dur}"
@@ -508,14 +512,14 @@ def _collect_unifi(cfg, window_hours: int) -> BBUniFi:
 # ── Orchestration ─────────────────────────────────────────────────────────────
 
 async def collect_all(
-    cfg: "Config",
+    cfg: Config,
     window_hours: int = 2,
     all_containers: bool = False,
     prometheus_url: str = "",
     prometheus_verify_ssl: bool = False,
 ) -> BlackboxDump:
     """Collect diagnostics from all configured sources in parallel."""
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    now = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
     dump = BlackboxDump(collected_at=now, window_hours=window_hours)
 
     async def _wrap_sync(fn, *args):
@@ -671,7 +675,7 @@ def render_dump(dump: BlackboxDump) -> str:
         else:
             lines.append("  All monitors UP.")
         lines.append("")
-        lines.append(f"Recent outages (last 10):")
+        lines.append("Recent outages (last 10):")
         if dump.uptime_kuma.outages:
             for o in dump.uptime_kuma.outages:
                 lines.append(f"  {o}")

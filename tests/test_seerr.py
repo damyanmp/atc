@@ -7,14 +7,13 @@ the Jellyseerr auto-approve display fix (media_status_code > 1 means acted on).
 import pytest
 
 from lib.seerr import (
-    _media_status,
-    _request_status,
-    SeerrSearchResult,
-    SeerrListRequest,
     MEDIA_TYPE_MOVIE,
     MEDIA_TYPE_TV,
+    SeerrListRequest,
+    SeerrSearchResult,
+    _media_status,
+    _request_status,
 )
-
 
 # ── _media_status ─────────────────────────────────────────────────────────────
 

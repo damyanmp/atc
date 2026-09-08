@@ -8,7 +8,7 @@ from __future__ import annotations
 import re
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import httpx
 
@@ -403,7 +403,7 @@ class PortainerStack:
 
 def fetch_stacks(
     cfg: PortainerConfig,
-    envs: "list[PortainerEnvironment] | None" = None,
+    envs: list[PortainerEnvironment] | None = None,
 ) -> list[PortainerStack]:
     """Return all stacks registered in Portainer."""
     with _client(cfg) as client:
@@ -439,7 +439,7 @@ def create_stack(
     env_id: int,
     name: str,
     compose_content: str,
-    env_vars: "list[dict] | None" = None,
+    env_vars: list[dict] | None = None,
 ) -> int:
     """Create a new standalone Compose stack on the given environment. Returns the new stack id.
 
@@ -476,7 +476,7 @@ def update_stack(
     stack_id: int,
     env_id: int,
     compose_content: str,
-    env_vars: "list[dict] | None" = None,
+    env_vars: list[dict] | None = None,
     prune: bool = True,
     pull_image: bool = False,
     force_clear_env: bool = False,
@@ -569,7 +569,7 @@ class InferredStack:
     project: str          # com.docker.compose.project value
     env_id: int
     env_name: str
-    containers: "list[PortainerContainer]"
+    containers: list[PortainerContainer]
 
     @property
     def name(self) -> str:
@@ -585,9 +585,9 @@ class InferredStack:
 
 
 def infer_compose_stacks(
-    containers: "list[PortainerContainer]",
-    portainer_stack_names: "set[str] | None" = None,
-) -> "list[InferredStack]":
+    containers: list[PortainerContainer],
+    portainer_stack_names: set[str] | None = None,
+) -> list[InferredStack]:
     """Group containers by their docker-compose project label.
 
     Containers without a compose project label are ignored.
@@ -673,7 +673,7 @@ def outages_from_events(
         for e in evts:
             action = e.get("Action", "")
             ts_unix = e.get("time", 0)
-            ts_iso = datetime.fromtimestamp(ts_unix, tz=timezone.utc).isoformat()
+            ts_iso = datetime.fromtimestamp(ts_unix, tz=UTC).isoformat()
 
             if action in _DOWN_ACTIONS and down_event is None:
                 down_event = e
@@ -696,7 +696,7 @@ def outages_from_events(
         # Still down at end of event window → ongoing
         if down_event is not None:
             started = down_event["_iso"]
-            now = datetime.now(timezone.utc)
+            now = datetime.now(UTC)
             dur = int((now.timestamp() - down_event.get("time", now.timestamp())) / 60)
             exit_code = down_event.get("Actor", {}).get("Attributes", {}).get("exitCode", "")
             outages.append(ContainerOutage(

@@ -10,9 +10,7 @@ from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.screen import Screen
-from textual.widgets import (
-    Footer, Header, Log, Static, SelectionList
-)
+from textual.widgets import Footer, Header, Log, SelectionList, Static
 from textual.widgets.selection_list import Selection
 
 sys.path.insert(0, str(Path(__file__).parent.parent))

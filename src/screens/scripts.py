@@ -9,9 +9,7 @@ from textual import work
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.screen import Screen
-from textual.widgets import (
-    Footer, Header, Label, ListItem, ListView, Log, Static
-)
+from textual.widgets import Footer, Header, Label, ListItem, ListView, Log, Static
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from config import Config

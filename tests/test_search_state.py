@@ -5,18 +5,14 @@ cooldown windows that escalate with each repeated search.
 """
 import json
 from datetime import datetime, timedelta
-from pathlib import Path
-
-import pytest
 
 from lib.search_state import (
-    SearchState,
-    _ITEM_BACKOFF_MINUTES,
     _BROAD_BACKOFF_MINUTES,
+    _ITEM_BACKOFF_MINUTES,
     _RESET_AFTER_HOURS,
+    SearchState,
     _fmt,
 )
-
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 

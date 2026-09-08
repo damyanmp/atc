@@ -5,7 +5,7 @@ import asyncio
 import socket
 import ssl
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 
 @dataclass
@@ -38,7 +38,7 @@ def _check_cert_sync(host: str, port: int, sni: str, verify: bool) -> tuple[str,
     try:
         expiry = cert.not_valid_after_utc  # cryptography >= 42
     except AttributeError:
-        expiry = cert.not_valid_after.replace(tzinfo=timezone.utc)
+        expiry = cert.not_valid_after.replace(tzinfo=UTC)
 
     try:
         cn = cert.subject.get_attributes_for_oid(x509.NameOID.COMMON_NAME)[0].value
@@ -61,7 +61,7 @@ async def check_cert(
         subject, expiry = await loop.run_in_executor(
             None, _check_cert_sync, host, port, effective_sni, verify
         )
-        days_left = (expiry - datetime.now(timezone.utc)).days
+        days_left = (expiry - datetime.now(UTC)).days
         return CertStatus(
             name=name, host=host, port=port, ok=True,
             subject=subject, expiry=expiry, days_left=days_left,

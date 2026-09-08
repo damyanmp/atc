@@ -11,8 +11,8 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-from proxmox import ClusterStatus
 from beszel import BeszelSystem
+from proxmox import ClusterStatus
 
 
 def normalize_name(name: str) -> str:

@@ -12,9 +12,9 @@ import hashlib
 import os
 import random
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from statistics import median
-from typing import Callable, Optional
 
 import httpx
 
@@ -76,7 +76,7 @@ def _nc() -> str:
 async def ping_test(
     cfg: OpenSpeedTestConfig,
     samples: int = 10,
-    on_sample: Optional[Callable[[int, float], None]] = None,
+    on_sample: Callable[[int, float], None] | None = None,
 ) -> PingResult:
     """Measure round-trip latency with HEAD requests.
 
@@ -121,7 +121,7 @@ async def download_test(
     cfg: OpenSpeedTestConfig,
     duration_s: float = 10.0,
     parallel: int = 4,
-    counter: Optional[list[int]] = None,
+    counter: list[int] | None = None,
 ) -> tuple[float, int]:
     """Return (mbps, total_bytes) for a timed download test."""
     if counter is None:
@@ -166,7 +166,7 @@ async def upload_test(
     cfg: OpenSpeedTestConfig,
     duration_s: float = 10.0,
     parallel: int = 2,
-    counter: Optional[list[int]] = None,
+    counter: list[int] | None = None,
 ) -> tuple[float, int]:
     """Return (mbps, total_bytes) for a timed upload test."""
     if counter is None:

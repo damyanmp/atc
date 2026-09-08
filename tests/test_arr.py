@@ -7,16 +7,12 @@ No HTTP calls are made — all tests exercise in-memory dataclass behaviour.
 import pytest
 
 from lib.arr import (
-    ArrCommand,
     ArrImportRecord,
-    ArrMovieRecord,
     ArrQueueItem,
-    ArrSeriesRecord,
     ArrStatus,
     CalendarEpisode,
     CalendarMovie,
 )
-
 
 # ── ArrQueueItem.progress_pct ────────────────────────────────────────────────
 

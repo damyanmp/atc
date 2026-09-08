@@ -27,7 +27,6 @@ import httpx
 
 from config import UniFiConfig
 
-
 # ── Internal helpers ──────────────────────────────────────────────────────────
 
 def _api_prefix(cfg: UniFiConfig) -> str:

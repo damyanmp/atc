@@ -3,7 +3,6 @@ from __future__ import annotations
 
 from lib.tautulli import TautulliHistoryRecord, TautulliStatus, TautulliStream
 
-
 # ── TautulliStatus ────────────────────────────────────────────────────────────
 
 class TestTautulliStatus:

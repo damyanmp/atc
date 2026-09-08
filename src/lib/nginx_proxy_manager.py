@@ -28,7 +28,6 @@ import httpx
 
 from config import NginxProxyManagerConfig
 
-
 # ── Auth ──────────────────────────────────────────────────────────────────────
 
 _token_cache: dict[str, str] = {}  # keyed by base_url, process-lifetime only

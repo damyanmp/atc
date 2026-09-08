@@ -13,8 +13,8 @@ from __future__ import annotations
 
 import base64
 import re
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from dataclasses import dataclass
+from datetime import UTC, datetime
 
 import httpx
 
@@ -217,7 +217,7 @@ def _outages_from_heartbeats(
 
     # Still in outage at end of list → mark ongoing
     if in_outage and outage_start:
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         dur = int((now - outage_start).total_seconds() / 60)
         outages.append(UptimeKumaOutage(
             monitor_name=monitor_name,

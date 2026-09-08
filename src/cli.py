@@ -8,10 +8,9 @@ import json as _json
 import subprocess
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 from enum import Enum
 from pathlib import Path
-from typing import Optional
 
 import click
 import typer
@@ -49,8 +48,6 @@ from lib.nginx_proxy_manager import (
     create_proxy_host as npm_create_proxy_host,
     update_proxy_host as npm_update_proxy_host,
     delete_proxy_host as npm_delete_proxy_host,
-    enable_proxy_host as npm_enable_proxy_host,
-    disable_proxy_host as npm_disable_proxy_host,
     list_certificates as npm_list_certificates,
 )
 from lib.ha import (
@@ -67,15 +64,14 @@ from lib.proxmox import (
     get_node_ip,
     start_guest, stop_guest, restart_guest,
     list_backups, BackupFile,
-    list_backup_jobs, BackupJob,
-    run_backup_job, backup_guest, find_backup_storage,
+    list_backup_jobs, run_backup_job, backup_guest, find_backup_storage,
     push_ssh_key_qemu, ssh_key_inject_script,
     fetch_storage_status_async, StorageStatus,
 )
-from lib.beszel import fetch_systems as fetch_beszel, BeszelSystem
+from lib.beszel import fetch_systems as fetch_beszel
 from lib.hosts import NormalizedHost, merge_hosts
 from lib.tls import check_all_certs, CertStatus
-from lib.ssh import UpdateTarget, run_update, run_command, stream_command
+from lib.ssh import UpdateTarget, run_command, stream_command
 from lib.prometheus import query as prom_query, query_range as prom_query_range, list_metric_names as prom_list_names
 from screens.scripts import _find_scripts, _get_script_description
 
@@ -145,7 +141,7 @@ app = typer.Typer(
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _load(cfg_path: Optional[Path] = None) -> Config:
+def _load(cfg_path: Path | None = None) -> Config:
     try:
         return load_config(cfg_path)
     except FileNotFoundError as e:
@@ -202,8 +198,8 @@ def _shell_quote(s: str) -> str:
 def _resolve_guests(
     cluster: ClusterStatus,
     selector: str,
-    label: Optional[str] = None,
-    require_status: Optional[str] = None,
+    label: str | None = None,
+    require_status: str | None = None,
 ) -> list[GuestInfo]:
     """Resolve guests matching selector (name substring, tag, VMID, or '*').
 
@@ -676,7 +672,7 @@ app.add_typer(get_app, name="get")
 @get_app.callback(invoke_without_command=True)
 def get_all(
     ctx: typer.Context,
-    tag: Optional[str] = typer.Option(None, "-t", "--tag", help="Show detail for all hosts with this tag"),
+    tag: str | None = typer.Option(None, "-t", "--tag", help="Show detail for all hosts with this tag"),
     output: _Out = typer.Option(_Out.table, "-o", help="Output format: table | wide | json"),
     json_flag: bool = typer.Option(False, "-j", is_flag=True, hidden=True, help="JSON output (shorthand for -o json)"),
 ) -> None:
@@ -743,7 +739,7 @@ def get_nodes(
 
 @get_app.command("vms")
 def get_vms(
-    label: Optional[str] = typer.Option(None, "-l", "--label", help="Filter by tag"),
+    label: str | None = typer.Option(None, "-l", "--label", help="Filter by tag"),
     output: _Out = typer.Option(_Out.table, "-o", help="Output format: table | wide | json"),
     json_flag: bool = typer.Option(False, "-j", is_flag=True, hidden=True, help="JSON output (shorthand for -o json)"),
 ) -> None:
@@ -769,7 +765,7 @@ def get_vms(
 
 @get_app.command("lxcs")
 def get_lxcs(
-    label: Optional[str] = typer.Option(None, "-l", "--label", help="Filter by tag"),
+    label: str | None = typer.Option(None, "-l", "--label", help="Filter by tag"),
     output: _Out = typer.Option(_Out.table, "-o", help="Output format: table | wide | json"),
     json_flag: bool = typer.Option(False, "-j", is_flag=True, hidden=True, help="JSON output (shorthand for -o json)"),
 ) -> None:
@@ -821,7 +817,7 @@ def get_storage(
         _render_storage_table(storages, wide=False)
 
 
-def _do_get_hosts(label: Optional[str], output: _Out) -> None:
+def _do_get_hosts(label: str | None, output: _Out) -> None:
     """Shared logic for 'get hosts', 'get ls', and 'ps' — avoids Typer OptionInfo default issue."""
     cfg = _load()
     with console.status("[bold]Fetching cluster state…[/]"):
@@ -853,7 +849,7 @@ def _do_get_hosts(label: Optional[str], output: _Out) -> None:
 
 @get_app.command("hosts")
 def get_hosts(
-    label: Optional[str] = typer.Option(None, "-l", "--label", help="Filter by tag"),
+    label: str | None = typer.Option(None, "-l", "--label", help="Filter by tag"),
     output: _Out = typer.Option(_Out.table, "-o", help="Output format: table | wide | json"),
     json_flag: bool = typer.Option(False, "-j", is_flag=True, hidden=True, help="JSON output (shorthand for -o json)"),
 ) -> None:
@@ -865,7 +861,7 @@ def get_hosts(
 
 @get_app.command("ls", hidden=True)
 def get_ls(
-    label: Optional[str] = typer.Option(None, "-l", "--label", help="Filter by tag"),
+    label: str | None = typer.Option(None, "-l", "--label", help="Filter by tag"),
     output: _Out = typer.Option(_Out.table, "-o", help="Output format: table | wide | json"),
     json_flag: bool = typer.Option(False, "-j", is_flag=True, hidden=True, help="JSON output (shorthand for -o json)"),
 ) -> None:
@@ -877,7 +873,7 @@ def get_ls(
 
 # ── get <selector> — detail view (guests and nodes) ──────────────────────────
 
-def _render_node_detail(node: "NodeStatus") -> None:
+def _render_node_detail(node: NodeStatus) -> None:
     BAR_W = 24
     console.print()
     console.rule(f"[bold]⬡  {node.name}  ·  node[/]")
@@ -1010,7 +1006,7 @@ def _guest_detail_to_json(detail: GuestDetail) -> dict:
     }
 
 
-def run_get_detail(selector: str, tag: Optional[str], output: str = "table") -> None:
+def run_get_detail(selector: str, tag: str | None, output: str = "table") -> None:
     """Resolve selector → node or guest(s) and render detail panel(s).
 
     Called from main.py's patched 'get' group for unknown subcommand names,
@@ -1057,7 +1053,7 @@ def run_get_detail(selector: str, tag: Optional[str], output: str = "table") -> 
 
 def run_update_hosts(
     selector: str,
-    tag: Optional[str],
+    tag: str | None,
     yes: bool = False,
     verbose: bool = False,
 ) -> None:
@@ -1119,8 +1115,8 @@ def run_update_hosts(
 
 def run_backup_run(
     selector: str,
-    tag: Optional[str],
-    storage: Optional[str] = None,
+    tag: str | None,
+    storage: str | None = None,
     yes: bool = False,
 ) -> None:
     """Resolve selector → running guest(s) and trigger vzdump backups.
@@ -1166,7 +1162,7 @@ def run_backup_run(
 
 @app.command("ps", hidden=False)
 def ps_cmd(
-    label: Optional[str] = typer.Option(None, "-l", "--label", help="Filter by tag"),
+    label: str | None = typer.Option(None, "-l", "--label", help="Filter by tag"),
     output: _Out = typer.Option(_Out.table, "-o", help="Output format: table | wide | json"),
     json_flag: bool = typer.Option(False, "-j", is_flag=True, hidden=True, help="JSON output (shorthand for -o json)"),
 ) -> None:
@@ -1180,9 +1176,9 @@ def ps_cmd(
 
 def _power_action(
     selector: str,
-    label: Optional[str],
+    label: str | None,
     yes: bool,
-    require_status: Optional[str],
+    require_status: str | None,
     verb: str,
     action_fn,
 ) -> None:
@@ -1228,7 +1224,7 @@ def _power_action(
 @app.command("start")
 def cmd_start(
     selector: str = typer.Argument(..., help="Name, tag, VMID, or '*'"),
-    label: Optional[str] = typer.Option(None, "-l", "--label", help="Filter by tag"),
+    label: str | None = typer.Option(None, "-l", "--label", help="Filter by tag"),
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation"),
 ) -> None:
     """Start stopped guest(s)."""
@@ -1238,7 +1234,7 @@ def cmd_start(
 @app.command("stop")
 def cmd_stop(
     selector: str = typer.Argument(..., help="Name, tag, VMID, or '*'"),
-    label: Optional[str] = typer.Option(None, "-l", "--label", help="Filter by tag"),
+    label: str | None = typer.Option(None, "-l", "--label", help="Filter by tag"),
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation"),
 ) -> None:
     """Gracefully shut down guest(s)."""
@@ -1248,7 +1244,7 @@ def cmd_stop(
 @app.command("restart")
 def cmd_restart(
     selector: str = typer.Argument(..., help="Name, tag, VMID, or '*'"),
-    label: Optional[str] = typer.Option(None, "-l", "--label", help="Filter by tag"),
+    label: str | None = typer.Option(None, "-l", "--label", help="Filter by tag"),
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation"),
 ) -> None:
     """Restart running guest(s)."""
@@ -1303,7 +1299,7 @@ def update_nodes(
 @update_app.command("hosts")
 def update_hosts(
     selector: str = typer.Argument("*", help="Name (substring), tag, VMID, or '*' for all"),
-    label: Optional[str] = typer.Option(None, "-l", "--label", help="Filter by tag (alternative to selector)"),
+    label: str | None = typer.Option(None, "-l", "--label", help="Filter by tag (alternative to selector)"),
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Show full apt output"),
 ) -> None:
@@ -1658,7 +1654,7 @@ _UPDATE_CMD_VERBOSE = (
 @app.command("push-key")
 def push_key(
     selector: str = typer.Argument("*", help="Name (substring), tag, VMID, or '*' for all"),
-    key_file: Optional[str] = typer.Option(None, "--key-file", "-k", help="Public key file (default: auto-detect)"),
+    key_file: str | None = typer.Option(None, "--key-file", "-k", help="Public key file (default: auto-detect)"),
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation"),
 ) -> None:
     """Push your SSH public key to guests without needing existing SSH access.
@@ -1755,7 +1751,7 @@ app.add_typer(backup_app, name="backup")
 
 @backup_app.command("list")
 def backup_list(
-    label: Optional[str] = typer.Option(None, "-l", "--label", help="Filter by guest tag"),
+    label: str | None = typer.Option(None, "-l", "--label", help="Filter by guest tag"),
     output: _Out = typer.Option(_Out.table, "-o", help="Output format: table | wide | json"),
     json_flag: bool = typer.Option(False, "-j", is_flag=True, hidden=True, help="JSON output (shorthand for -o json)"),
 ) -> None:
@@ -1835,7 +1831,7 @@ def backup_list(
 
 @backup_app.command("ls", hidden=True)
 def backup_ls(
-    label: Optional[str] = typer.Option(None, "-l", "--label", help="Filter by guest tag"),
+    label: str | None = typer.Option(None, "-l", "--label", help="Filter by guest tag"),
     output: _Out = typer.Option(_Out.table, "-o", help="Output format: table | wide | json"),
     json_flag: bool = typer.Option(False, "-j", is_flag=True, hidden=True, help="JSON output (shorthand for -o json)"),
 ) -> None:
@@ -1870,7 +1866,7 @@ def backup_jobs() -> None:
         node_str = j.node or "[dim]all[/]"
         t.add_row(dot, j.id, j.schedule, j.storage, j.vmids, node_str, j.comment or "—")
     console.print(t)
-    console.print(f"\n[dim]Run a job now: [bold]atc backup trigger <id>[/][/]")
+    console.print("\n[dim]Run a job now: [bold]atc backup trigger <id>[/][/]")
 
 
 @backup_app.command("trigger")
@@ -1891,8 +1887,8 @@ def backup_trigger(
 @backup_app.command("run")
 def backup_run(
     selector: str = typer.Argument(..., help="Name, tag, VMID, or '*'"),
-    label: Optional[str] = typer.Option(None, "-l", "--label", help="Filter by tag"),
-    storage: Optional[str] = typer.Option(None, "--storage", "-s", help="Backup storage (auto-detected if omitted)"),
+    label: str | None = typer.Option(None, "-l", "--label", help="Filter by tag"),
+    storage: str | None = typer.Option(None, "--storage", "-s", help="Backup storage (auto-detected if omitted)"),
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation"),
 ) -> None:
     """Create an immediate backup of guest(s)."""
@@ -1903,7 +1899,7 @@ def backup_run(
 
 @app.command("run")
 def run_script(
-    name: Optional[str] = typer.Argument(None, help="Script name or partial path. Omit to list all."),
+    name: str | None = typer.Argument(None, help="Script name or partial path. Omit to list all."),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Run with bash -v (echo each command)"),
 ) -> None:
     """Run a script from the repo. Omit NAME to list available scripts."""
@@ -1989,7 +1985,7 @@ def _secrets_list() -> None:
 @secrets_app.command("set")
 def secrets_set(
     key: str = typer.Argument(..., help="Secret key name"),
-    value: Optional[str] = typer.Argument(None, help="Value (prompted securely if omitted)"),
+    value: str | None = typer.Argument(None, help="Value (prompted securely if omitted)"),
 ) -> None:
     """Set or update a secret in the keychain."""
     if value is None:
@@ -2246,7 +2242,7 @@ def pihole_status() -> None:
             ver = s.version or "—"
         else:
             dot = "[red]●[/]"
-            blocking = f"[red]offline[/]"
+            blocking = "[red]offline[/]"
             queries = blocked = pct = ver = "[dim]—[/]"
         primary_mark = " [dim](primary)[/]" if getattr(next(
             (i for i in instances if i.name == s.name), None), "primary", False
@@ -2480,8 +2476,8 @@ def npm_list(
 
 def _resolve_certificate_id(
     npm_cfg,
-    certificate_id: Optional[int],
-    certificate_name: Optional[str],
+    certificate_id: int | None,
+    certificate_name: str | None,
 ) -> int:
     """Resolve a --certificate-id / --certificate-name pair to a concrete NPM
     certificate id, or 0 (no cert) if neither was given.
@@ -2533,10 +2529,10 @@ def npm_create(
     scheme: str = typer.Option("http", "--scheme", help="http or https"),
     websocket: bool = typer.Option(True, "--websocket/--no-websocket", help="Allow websocket upgrade"),
     block_exploits: bool = typer.Option(True, "--block-exploits/--no-block-exploits"),
-    certificate_id: Optional[int] = typer.Option(
+    certificate_id: int | None = typer.Option(
         None, "--certificate-id", help="Existing NPM certificate id to attach (see 'atc npm certs'). 0/omitted = no cert.",
     ),
-    certificate_name: Optional[str] = typer.Option(
+    certificate_name: str | None = typer.Option(
         None, "--certificate-name",
         help="Attach a cert by name/domain instead of id, e.g. '*.local.damyanpetkov.com' (see 'atc npm certs'). Errors out on no/ambiguous match rather than silently leaving the host cert-less.",
     ),
@@ -2579,19 +2575,19 @@ def npm_create(
 @npm_app.command("update")
 def npm_update(
     domain: str = typer.Argument(..., help="Domain of the existing proxy host to update"),
-    forward_host: Optional[str] = typer.Option(None, "--forward-host", help="New forward host/IP"),
-    forward_port: Optional[int] = typer.Option(None, "--forward-port", help="New forward port"),
-    scheme: Optional[str] = typer.Option(None, "--scheme", help="New forward scheme (http/https)"),
-    certificate_id: Optional[int] = typer.Option(
+    forward_host: str | None = typer.Option(None, "--forward-host", help="New forward host/IP"),
+    forward_port: int | None = typer.Option(None, "--forward-port", help="New forward port"),
+    scheme: str | None = typer.Option(None, "--scheme", help="New forward scheme (http/https)"),
+    certificate_id: int | None = typer.Option(
         None, "--certificate-id", help="Attach this existing NPM certificate id (see 'atc npm certs'). Pass 0 to detach.",
     ),
-    certificate_name: Optional[str] = typer.Option(
+    certificate_name: str | None = typer.Option(
         None, "--certificate-name",
         help="Attach a cert by name/domain instead of id, e.g. '*.local.damyanpetkov.com' (see 'atc npm certs').",
     ),
-    ssl_forced: Optional[bool] = typer.Option(None, "--ssl-forced/--no-ssl-forced", help="Force SSL on/off"),
-    websocket: Optional[bool] = typer.Option(None, "--websocket/--no-websocket"),
-    block_exploits: Optional[bool] = typer.Option(None, "--block-exploits/--no-block-exploits"),
+    ssl_forced: bool | None = typer.Option(None, "--ssl-forced/--no-ssl-forced", help="Force SSL on/off"),
+    websocket: bool | None = typer.Option(None, "--websocket/--no-websocket"),
+    block_exploits: bool | None = typer.Option(None, "--block-exploits/--no-block-exploits"),
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation"),
 ) -> None:
     """Update an existing proxy host (forward target, cert, SSL enforcement, etc).
@@ -2667,7 +2663,7 @@ def npm_delete(
         raise typer.Exit(0)
 
     npm_delete_proxy_host(npm_cfg, host.id)
-    console.print(f"[green]✓[/] Deleted.")
+    console.print("[green]✓[/] Deleted.")
 
 
 @npm_app.command("certs")
@@ -2724,7 +2720,7 @@ def backup_snapshot() -> None:
             latest[b.vmid] = b
 
     guest_names = {g.vmid: g.name for g in cluster.guests}
-    now = datetime.now(timezone.utc).timestamp()
+    now = datetime.now(UTC).timestamp()
 
     points = []
     for vmid, b in latest.items():
@@ -2773,7 +2769,7 @@ def service_publish(
     domain: str = typer.Argument(..., help="Local domain, e.g. myservice.local.damyanpetkov.com"),
     forward_host: str = typer.Argument(..., help="IP the service actually runs on, e.g. 192.168.1.78"),
     forward_port: int = typer.Argument(..., help="Port the service listens on"),
-    dns_ip: Optional[str] = typer.Option(
+    dns_ip: str | None = typer.Option(
         None, "--dns-ip",
         help="IP to point the DNS record at. Defaults to forward_host — pass explicitly if NPM and the DNS target differ (e.g. NPM host IP vs. a Docker-internal service IP).",
     ),
@@ -2810,7 +2806,7 @@ def service_publish(
     if not dns_ok:
         console.print(f"[red]✗[/] DNS record failed — {dns_err}")
         raise typer.Exit(1)
-    console.print(f"[green]✓[/] DNS record added.")
+    console.print("[green]✓[/] DNS record added.")
 
     with console.status("[bold]Creating NPM proxy host…[/]"):
         try:
@@ -2904,7 +2900,7 @@ def ha_status() -> None:
             console.print(f"  Location: {s.location}")
         console.print(f"  URL:      [dim]{ha_cfg.base_url}[/]")
     else:
-        console.print(f"[red]●[/] Home Assistant — offline")
+        console.print("[red]●[/] Home Assistant — offline")
         console.print(f"  [dim]{s.error}[/]")
         raise typer.Exit(1)
 
@@ -2973,8 +2969,8 @@ def ha_turn_off(
 @ha_app.command("call")
 def ha_call(
     service: str = typer.Argument(..., help="domain.service, e.g. light.turn_on"),
-    entity_id: Optional[str] = typer.Argument(None, help="Entity ID (optional)"),
-    data: Optional[str] = typer.Option(None, "--data", "-d", help='Extra JSON data, e.g. \'{"brightness": 128}\''),
+    entity_id: str | None = typer.Argument(None, help="Entity ID (optional)"),
+    data: str | None = typer.Option(None, "--data", "-d", help='Extra JSON data, e.g. \'{"brightness": 128}\''),
 ) -> None:
     """Call a Home Assistant service."""
     cfg = _load()
@@ -3007,7 +3003,7 @@ def ha_call(
 
 @ha_app.command("reload")
 def ha_reload(
-    domain: Optional[str] = typer.Argument(
+    domain: str | None = typer.Argument(
         None,
         help="Domain to reload (automation, script, template, …). Omit for all.",
     ),
@@ -3107,7 +3103,7 @@ def ha_updates() -> None:
 
 @ha_app.command("update")
 def ha_update(
-    entity_id: Optional[str] = typer.Argument(None, help="Specific update entity ID (e.g. update.home_assistant_core_update)"),
+    entity_id: str | None = typer.Argument(None, help="Specific update entity ID (e.g. update.home_assistant_core_update)"),
     all_: bool = typer.Option(False, "--all", help="Install all pending updates"),
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation"),
 ) -> None:
@@ -3225,7 +3221,7 @@ def certs_check() -> None:
 
 @certs_app.command("deploy")
 def certs_deploy(
-    target: Optional[str] = typer.Argument(
+    target: str | None = typer.Argument(
         None, help="Target name (substring, e.g. 'globemaster', 'viggen'). Omit for all targets."
     ),
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation"),
@@ -3800,7 +3796,7 @@ def cmd_blackbox(
         "--all-containers",
         help="Capture logs for ALL containers, not just unhealthy/exited ones.",
     ),
-    out: Optional[Path] = typer.Option(
+    out: Path | None = typer.Option(
         None,
         "--out",
         help="Output file path. Default: ./blackbox-YYYYMMDD-HHMMSS.txt in cwd.",
@@ -5115,7 +5111,7 @@ def _display_pipeline_from_calendar(cfg, item) -> tuple:
     Seerr is queried silently (exact title match) only for request status.
     Returns (arr_record, plex_match, is_movie).
     """
-    from lib.arr import CalendarMovie as _CM, CalendarEpisode as _CE
+    from lib.arr import CalendarMovie as _CM
     is_movie   = isinstance(item, _CM)
     arr_cfg    = cfg.radarr if is_movie else cfg.sonarr
     arr_label  = "Radarr" if is_movie else "Sonarr"
@@ -5235,7 +5231,6 @@ from lib.arr import (
     get_status as arr_get_status,
     radarr_scan, radarr_search_missing, radarr_search_movies,
     sonarr_scan, sonarr_search_missing, sonarr_search_episodes, sonarr_search_series,
-    get_episode_id,
     get_today_imports as arr_get_today_imports,
 )
 
@@ -5473,7 +5468,7 @@ def seerr_request_cmd(
 ) -> None:
     """Request a movie or TV show by TMDB ID."""
     if media_type not in (MEDIA_TYPE_MOVIE, MEDIA_TYPE_TV):
-        console.print(f"[red]--type must be 'movie' or 'tv'[/]")
+        console.print("[red]--type must be 'movie' or 'tv'[/]")
         raise typer.Exit(1)
 
     cfg = _load()
@@ -5921,7 +5916,7 @@ def media_today_cmd() -> None:
     dl_tv     = [imp for imp in all_imports if imp.media_type == "episode"]
 
     # Plex — batch unique titles to avoid N+1
-    plex_cache: dict[str, "PlexMatch"] = {}
+    plex_cache: dict[str, PlexMatch] = {}
     if cfg.plex and (dl_movies or dl_tv):
         seen: set[str] = set()
         to_check: list[tuple[str, str, int]] = []
@@ -6242,7 +6237,7 @@ def plex_clients_cmd(
 
 @plex_app.command("scan")
 def plex_scan_cmd(
-    library: Optional[str] = typer.Argument(
+    library: str | None = typer.Argument(
         None, help="Library name or ID to scan (omit for all libraries)"
     ),
 ) -> None:
@@ -6278,7 +6273,7 @@ def plex_scan_cmd(
 
 @plex_app.command("analyze")
 def plex_analyze_cmd(
-    library: Optional[str] = typer.Argument(
+    library: str | None = typer.Argument(
         None, help="Library name or ID to analyze (omit for all libraries)"
     ),
 ) -> None:
@@ -6314,7 +6309,7 @@ def plex_analyze_cmd(
 
 @plex_app.command("empty-trash")
 def plex_empty_trash_cmd(
-    library: Optional[str] = typer.Argument(
+    library: str | None = typer.Argument(
         None, help="Library name or ID (omit for all libraries)"
     ),
 ) -> None:
@@ -6409,7 +6404,7 @@ def plex_sessions_cmd() -> None:
 
     console.print(t)
     console.print()
-    console.rule(f"[dim]terminate: atc plex terminate <session_key>  ·  history: atc plex history[/]")
+    console.rule("[dim]terminate: atc plex terminate <session_key>  ·  history: atc plex history[/]")
     console.print()
 
 
@@ -6956,7 +6951,7 @@ def versions_check(
         t.add_row(
             f"[green]n-{n}[/green]",
             f"[green bold]{rec}[/green bold]",
-            f"[green]← recommended pin[/green]",
+            "[green]← recommended pin[/green]",
         )
     else:
         console.print(f"[yellow]Not enough release history to identify n-{n}.[/yellow]")
@@ -6967,7 +6962,7 @@ def versions_check(
         pinned = f"{ref.full_name}:{rec}"
         console.print(f"  Compose image pin:  [bold green]{pinned}[/bold green]")
         console.print(
-            f"  Add Watchtower label: [dim]com.centurylinklabs.watchtower.enable=false[/dim]\n"
+            "  Add Watchtower label: [dim]com.centurylinklabs.watchtower.enable=false[/dim]\n"
         )
 
 
@@ -7437,7 +7432,7 @@ def quick_bootstrap(
         upload_to_container(
             pt_cfg, env.id, quick_container.id, buf.getvalue(), QUICK_SERVE_ROOT,
         )
-    console.print(f"[green]✓[/] Directory UI installed.")
+    console.print("[green]✓[/] Directory UI installed.")
 
     console.print(
         f"\n[bold green]Ready.[/] Publish with: [cyan]atc quick publish <file_or_dir>[/]\n"
@@ -7451,7 +7446,7 @@ _QUICK_RESERVED_SLUGS = {"directory", QUICK_CONTROL_DIR.lstrip(".")}
 @quick_app.command("publish")
 def quick_publish(
     path: Path = typer.Argument(..., exists=True, help="Local file or directory to publish"),
-    name: Optional[str] = typer.Option(None, "--name", help="Subpath under the site root (default: filename stem)"),
+    name: str | None = typer.Option(None, "--name", help="Subpath under the site root (default: filename stem)"),
     target: str = typer.Option("docker-1", "--target", help="Portainer environment name/substring"),
 ) -> None:
     """Upload a file or directory into the 'quick' stack and print its live URL.
