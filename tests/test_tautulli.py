@@ -30,7 +30,7 @@ class TestTautulliStatus:
 class TestTautulliStream:
     def _movie_stream(self, **kwargs) -> TautulliStream:
         defaults = dict(
-            session_key="s1", user="alice", title="Inception",
+            session_key="s1", session_id="sess-1", user="alice", title="Inception",
             media_type="movie", year=2010, grandparent_title="",
             season=0, episode=0, player="Web", transcode_decision="transcode",
             bandwidth=5000, progress_pct=45.5, state="playing",
@@ -40,7 +40,7 @@ class TestTautulliStream:
 
     def _episode_stream(self, **kwargs) -> TautulliStream:
         defaults = dict(
-            session_key="s2", user="bob", title="Pilot",
+            session_key="s2", session_id="sess-2", user="bob", title="Pilot",
             media_type="episode", year=2008, grandparent_title="Breaking Bad",
             season=1, episode=1, player="AppleTV", transcode_decision="direct play",
             bandwidth=20000, progress_pct=12.3, state="paused",
