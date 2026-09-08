@@ -34,10 +34,10 @@ def _resolve_secret(raw_value: str, key_hint: str) -> str:
 
     # Not stored yet — prompt once and save
     print(f"\n🔑  Secret needed: {key_hint!r} (key: {key_name!r})")
-    print(f"    This will be stored securely in your system keychain.")
+    print("    This will be stored securely in your system keychain.")
     try:
         import getpass
-        value = getpass.getpass(f"    Enter value: ").strip()
+        value = getpass.getpass("    Enter value: ").strip()
     except (KeyboardInterrupt, EOFError):
         print("\nAborted.")
         sys.exit(1)
@@ -89,7 +89,7 @@ class SSHConfig:
     def guest_user(self, guest_name: str) -> str | None:
         return self.guest_users.get(guest_name)
 
-    def guest_update_cmd(self, guest_name: str) -> "GuestUpdateCmd | None":
+    def guest_update_cmd(self, guest_name: str) -> GuestUpdateCmd | None:
         return self.guest_update_cmds.get(guest_name)
 
 

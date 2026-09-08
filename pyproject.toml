@@ -35,6 +35,8 @@ dev = [
     "textual-dev>=1.0",
     "pyinstaller>=6.0",
     "pytest-cov>=7.1.0",
+    "ruff>=0.16.6",
+    "mypy>=2.3.1",
 ]
 
 [tool.pytest.ini_options]
@@ -42,3 +44,29 @@ dev = [
 pythonpath = ["src"]
 testpaths  = ["tests"]
 asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+# Minimal, high-signal ruleset for a codebase that was never linted before —
+# real bugs (F) and import hygiene (I), not full opinionated style (see
+# `ruff check --select ALL` for the long tail deliberately left off: BLE001
+# blind-except, S110/S112 bare try/except, DTZ00x naive datetimes, etc. —
+# those are real but numerous pre-existing patterns, not regressions, and
+# fixing them is a separate deliberate pass, not part of CI gating).
+select = ["E", "F", "UP", "B"]
+ignore = [
+    "B008",  # function-call-in-default-argument — Typer's idiom (typer.Option(...) as a default)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E501"]
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
+# Advisory only (see CI: mypy step is continue-on-error) until the codebase
+# has type annotations added deliberately — not enforced as a merge gate yet.
+check_untyped_defs = false

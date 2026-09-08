@@ -9,7 +9,6 @@ from lib.registry import (
     parse_image_ref,
 )
 
-
 # ── parse_image_ref ─────────────────────────────────────────────────────────
 
 class TestParseImageRef:

@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import re
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import httpx
 
@@ -72,7 +72,7 @@ def query_range(
     for stream in data.get("data", {}).get("result", []):
         host = stream.get("stream", {}).get("host", "")
         for ts_ns, line in stream.get("values", []):
-            iso = datetime.fromtimestamp(int(ts_ns) / 1e9, tz=timezone.utc).isoformat()[:19]
+            iso = datetime.fromtimestamp(int(ts_ns) / 1e9, tz=UTC).isoformat()[:19]
             rows.append((iso, host, line))
 
     rows.sort(key=lambda row: row[0])

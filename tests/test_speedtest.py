@@ -3,7 +3,6 @@ from __future__ import annotations
 
 from lib.speedtest import PingResult, SpeedResult
 
-
 # ── PingResult ────────────────────────────────────────────────────────────────
 
 class TestPingResult:

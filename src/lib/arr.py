@@ -6,7 +6,7 @@ Authentication uses X-Api-Key header.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime
 
 import httpx
 
@@ -214,7 +214,7 @@ def get_movie_by_tmdb(cfg: ArrConfig, tmdb_id: int) -> ArrMovieRecord | None:
     if not movies:
         return None
     m = movies[0]
-    quality = size_bytes = 0
+    size_bytes = 0
     date_added = quality_str = ""
     if m.get("movieFile"):
         mf = m["movieFile"]

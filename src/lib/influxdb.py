@@ -9,7 +9,8 @@ independent of the docker-1/docker-2-only Prometheus/cadvisor pipeline).
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field as _dc_field
+from dataclasses import dataclass
+from dataclasses import field as _dc_field
 
 import httpx
 

@@ -36,7 +36,7 @@ class HAStatResult:
     @property
     def display(self) -> str:
         if self.error:
-            return f"[red]error[/]"
+            return "[red]error[/]"
         unit = self.unit or self.cfg.unit
         return f"{self.state}{(' ' + unit) if unit else ''}"
 

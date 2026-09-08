@@ -17,7 +17,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "lib"))
 
 from config import Config
 
-
 # ── Formatting helpers ────────────────────────────────────────────────────────
 
 def _bar(pct: float, width: int = 16) -> str:
@@ -122,8 +121,10 @@ class ArrScreen(Screen):
     @work(exclusive=True, thread=True)
     def _load(self) -> None:
         from lib.arr import (
-            get_radarr_calendar, get_sonarr_calendar,
-            get_queue, get_today_imports,
+            get_queue,
+            get_radarr_calendar,
+            get_sonarr_calendar,
+            get_today_imports,
         )
 
         today = date.today()

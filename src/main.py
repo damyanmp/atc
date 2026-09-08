@@ -11,16 +11,17 @@ sys.path.insert(0, str(_SRC / "lib"))
 
 from textual.app import App
 from textual.binding import Binding
-from config import load_config, Config
-from screens.dashboard import DashboardScreen
-from screens.update import UpdateScreen
-from screens.scripts import ScriptsScreen
-from screens.uptimekuma import UptimeKumaScreen
-from screens.seerr import SeerrScreen
-from screens.plex import PlexScreen
-from screens.pihole import PiholeScreen
-from screens.speedtest import SpeedtestScreen
+
+from config import Config
 from screens.arr import ArrScreen
+from screens.dashboard import DashboardScreen
+from screens.pihole import PiholeScreen
+from screens.plex import PlexScreen
+from screens.scripts import ScriptsScreen
+from screens.seerr import SeerrScreen
+from screens.speedtest import SpeedtestScreen
+from screens.update import UpdateScreen
+from screens.uptimekuma import UptimeKumaScreen
 
 
 class HomelabApp(App):
@@ -83,7 +84,9 @@ class HomelabApp(App):
 def main() -> None:
     import click
     import typer.main as _tm
-    from cli import app as cli_app, run_get_detail, run_update_hosts, run_backup_run
+
+    from cli import app as cli_app
+    from cli import run_backup_run, run_get_detail, run_update_hosts
 
     # Build the Click app once so we can patch subgroups before invocation.
     click_app = _tm.get_command(cli_app)

@@ -13,7 +13,7 @@ from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.screen import Screen
-from textual.widgets import DataTable, Footer, Header, Log, Static, SelectionList
+from textual.widgets import DataTable, Footer, Header, Log, SelectionList, Static
 from textual.widgets.selection_list import Selection
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -183,7 +183,7 @@ class TLSDeployScreen(Screen):
 
     @work(exclusive=True)
     async def _run_deploy(self) -> None:
-        from lib.tls_deploy import ALL_TARGETS, fetch_combined_pem, deploy_target
+        from lib.tls_deploy import ALL_TARGETS, deploy_target, fetch_combined_pem
 
         sel = self.query_one("#target-list", SelectionList)
         selected_names = {str(v) for v in sel.selected}

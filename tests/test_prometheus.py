@@ -9,7 +9,7 @@ import httpx
 import pytest
 
 from config import PrometheusConfig
-from lib.prometheus import query, query_range, list_metric_names
+from lib.prometheus import list_metric_names, query, query_range
 
 
 def _cfg() -> PrometheusConfig:

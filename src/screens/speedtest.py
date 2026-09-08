@@ -231,7 +231,7 @@ class SpeedtestScreen(Screen):
         ulp.update(_speed_panel("⬆", "UPLOAD",   0, 0, "idle"))
 
         try:
-            from lib.speedtest import ping_test, download_test, upload_test
+            from lib.speedtest import download_test, ping_test, upload_test
 
             # ── Ping ──────────────────────────────────────────────────────────
             samples: list[float] = []

@@ -4,21 +4,20 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from textual.app import ComposeResult
-from textual.containers import Horizontal, Vertical, ScrollableContainer
-from textual.screen import Screen
-from textual.widgets import (
-    DataTable, Footer, Header, Label, Static, LoadingIndicator
-)
 from textual import work
+from textual.app import ComposeResult
+from textual.containers import Horizontal, ScrollableContainer, Vertical
+from textual.screen import Screen
+from textual.widgets import DataTable, Footer, Header, Static
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 sys.path.insert(0, str(Path(__file__).parent.parent / "lib"))
 
 from config import Config
-from lib.proxmox import ClusterStatus, fetch_cluster_status
-from lib.beszel import BeszelSystem, fetch_systems as fetch_beszel
+from lib.beszel import BeszelSystem
+from lib.beszel import fetch_systems as fetch_beszel
 from lib.hosts import normalize_name
+from lib.proxmox import ClusterStatus, fetch_cluster_status
 from lib.tls import CertStatus, check_all_certs
 
 
@@ -187,7 +186,7 @@ class DashboardScreen(Screen):
                 guest_counts[g.node] = (vm_c, lxc_c + 1)
 
         for node in self._cluster.nodes:
-            status = "🟢 Online" if node.online else f"🔴 Offline"
+            status = "🟢 Online" if node.online else "🔴 Offline"
             cpu = _fmt_pct(node.cpu) if node.online else "—"
             mem = (
                 f"{_fmt_pct(node.mem_used / node.mem_total if node.mem_total else 0)} "
