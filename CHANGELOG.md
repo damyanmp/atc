@@ -7,6 +7,12 @@ track breaking config/CLI changes.
 
 ## [Unreleased]
 
+### Added
+- TUI screens for Docker/Portainer, UniFi, Prometheus metrics, Proxmox
+  backups, and Quick sites — closes most of the CLI/TUI parity gap
+  (`versions`, and the admin-only `unifi`/`npm`/`ha`/`certs`/`acars`/
+  `secrets`/`auth` commands, remain CLI-only by design).
+
 ## [0.1.0] - 2026-09-08
 
 Initial standalone release — extracted from `pentagon-management`
