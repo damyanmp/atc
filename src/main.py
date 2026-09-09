@@ -97,6 +97,14 @@ class HomelabApp(App):
 
     def check_action(self, action: str, parameters: tuple) -> bool | None:
         if action.startswith("nav_") or action == "quit":
+            # Priority bindings are checked App-down and would otherwise fire
+            # even while a modal (e.g. Docker's per-row ActionMenu) is on
+            # top and expects to capture every keystroke itself — including
+            # single letters like "s" that collide with a nav shortcut here.
+            # Suppress all nav/quit shortcuts whenever a modal screen is active.
+            from textual.screen import ModalScreen
+            if isinstance(self.screen, ModalScreen):
+                return False
             return True
         return super().check_action(action, parameters)
 
