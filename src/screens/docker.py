@@ -1,7 +1,7 @@
 """Docker/Portainer screen — container list across all environments.
 
-Select a row and press [s]/[x]/[r] to start/stop/restart, [l] to view logs,
-[i] to inspect (image/env/labels), [S] to browse Compose stacks.
+Select a row (arrow keys / j,k) and press Enter to see available actions
+for that container. Press S to browse Compose stacks instead.
 """
 from __future__ import annotations
 
@@ -12,8 +12,9 @@ from textual import work
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical
-from textual.screen import Screen
-from textual.widgets import DataTable, Footer, Header, Log, Static
+from textual.screen import ModalScreen, Screen
+from textual.widgets import DataTable, Footer, Header, Log, OptionList, Static
+from textual.widgets.option_list import Option
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 sys.path.insert(0, str(Path(__file__).parent.parent / "lib"))
@@ -26,14 +27,52 @@ _STATE_ICON = {
 }
 
 
+class ActionMenu(ModalScreen[str | None]):
+    """A small popup listing actions for the currently selected row.
+
+    Dismisses with the chosen action id, or None if cancelled (Escape).
+    """
+
+    BINDINGS = [("escape", "dismiss(None)", "Cancel")]
+
+    DEFAULT_CSS = """
+    ActionMenu {
+        align: center middle;
+    }
+    ActionMenu > OptionList {
+        width: auto;
+        min-width: 30;
+        height: auto;
+        border: round $accent;
+        background: $panel;
+    }
+    """
+
+    def __init__(self, title: str, options: list[tuple[str, str]]) -> None:
+        """options: list of (action_id, display_label)."""
+        super().__init__()
+        self.title_text = title
+        self.options = options
+
+    def compose(self) -> ComposeResult:
+        opt_list = OptionList(
+            *[Option(label, id=action_id) for action_id, label in self.options],
+            id="action-options",
+        )
+        opt_list.border_title = self.title_text
+        yield opt_list
+
+    def on_mount(self) -> None:
+        self.query_one(OptionList).focus()
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        self.dismiss(event.option.id)
+
+
 class DockerScreen(Screen):
     BINDINGS = [
         ("escape", "app.pop_screen", "Back"),
-        Binding("l", "view_logs", "Logs", priority=True),
-        Binding("i", "view_inspect", "Inspect", priority=True),
-        Binding("s", "start_container", "Start", priority=True),
-        Binding("x", "stop_container", "Stop", priority=True),
-        Binding("r", "restart_container", "Restart", priority=True),
+        Binding("enter", "open_menu", "Actions", priority=True),
         Binding("S", "nav_stacks", "Stacks", priority=True),
         Binding("R", "refresh_data", "Refresh", priority=True),
     ]
@@ -59,6 +98,7 @@ class DockerScreen(Screen):
     def on_mount(self) -> None:
         t = self.query_one("#containers-table", DataTable)
         t.add_columns("Env", "Container", "State", "Health", "Status")
+        t.focus()
         self.call_after_refresh(self._load)
 
     def action_refresh_data(self) -> None:
@@ -105,7 +145,7 @@ class DockerScreen(Screen):
             summary = (
                 f"{len(rows)} containers  |  "
                 + (f"⚠️  {unhealthy} need attention  |  " if unhealthy else "")
-                + "l Logs  i Inspect  s Start  x Stop  r Restart  S Stacks  R Refresh  |  Esc back"
+                + "↑↓ select  Enter actions  S Stacks  R Refresh  |  Esc back"
             )
             self.app.call_from_thread(self.query_one("#status-bar", Static).update, summary)
         except Exception as e:
@@ -122,30 +162,31 @@ class DockerScreen(Screen):
         except IndexError:
             return None
 
-    def action_view_logs(self) -> None:
-        c = self._selected_container()
-        if c:
-            self.app.push_screen(DockerLogsScreen(self.config, c.env_id, c.env_name, c.id, c.name))
-
-    def action_view_inspect(self) -> None:
-        c = self._selected_container()
-        if c:
-            self.app.push_screen(DockerInspectScreen(self.config, c))
-
-    def action_start_container(self) -> None:
-        self._do_action("start")
-
-    def action_stop_container(self) -> None:
-        self._do_action("stop")
-
-    def action_restart_container(self) -> None:
-        self._do_action("restart")
-
-    def _do_action(self, action: str) -> None:
+    def action_open_menu(self) -> None:
         c = self._selected_container()
         if not c:
             return
-        self._run_action(c.env_id, c.id, c.name, action)
+        options = [
+            ("logs", "📜 View Logs"),
+            ("inspect", "🔍 Inspect (image, labels, health)"),
+            ("start", "▶  Start"),
+            ("stop", "⏹  Stop"),
+            ("restart", "🔁 Restart"),
+        ]
+        self.app.push_screen(
+            ActionMenu(f"{c.name} ({c.env_name})", options),
+            callback=lambda action_id: self._handle_menu_choice(c, action_id),
+        )
+
+    def _handle_menu_choice(self, c, action_id: str | None) -> None:
+        if action_id is None:
+            return
+        if action_id == "logs":
+            self.app.push_screen(DockerLogsScreen(self.config, c.env_id, c.env_name, c.id, c.name))
+        elif action_id == "inspect":
+            self.app.push_screen(DockerInspectScreen(self.config, c))
+        elif action_id in ("start", "stop", "restart"):
+            self._run_action(c.env_id, c.id, c.name, action_id)
 
     @work(exclusive=True, thread=True)
     def _run_action(self, env_id: int, container_id: str, name: str, action: str) -> None:
@@ -285,16 +326,16 @@ class DockerInspectScreen(Screen):
 
 
 class DockerStacksScreen(Screen):
-    """Compose stacks across all Portainer environments (read-only).
+    """Compose stacks across all Portainer environments.
 
     Lists both Portainer-managed stacks and stacks inferred from Compose
     labels on containers (e.g. deployed outside atc/Portainer). Select a
-    stack and press Enter to drill into its containers.
+    stack and press Enter to see available actions.
     """
 
     BINDINGS = [
         ("escape", "app.pop_screen", "Back"),
-        Binding("enter", "view_stack", "Open", priority=True),
+        Binding("enter", "open_menu", "Actions", priority=True),
         Binding("R", "refresh_data", "Refresh", priority=True),
     ]
 
@@ -319,6 +360,7 @@ class DockerStacksScreen(Screen):
     def on_mount(self) -> None:
         t = self.query_one("#stacks-table", DataTable)
         t.add_columns("Environment", "Stack", "Status", "Source")
+        t.focus()
         self.call_after_refresh(self._load)
 
     def action_refresh_data(self) -> None:
@@ -367,7 +409,7 @@ class DockerStacksScreen(Screen):
 
             self.app.call_from_thread(
                 self.query_one("#status-bar", Static).update,
-                f"{len(rows)} stack(s)  |  Enter to open  |  R Refresh  |  Esc back",
+                f"{len(rows)} stack(s)  |  ↑↓ select  Enter actions  R Refresh  |  Esc back",
             )
         except Exception as e:
             self.app.call_from_thread(
@@ -383,16 +425,26 @@ class DockerStacksScreen(Screen):
         except IndexError:
             return None
 
-    def action_view_stack(self) -> None:
+    def action_open_menu(self) -> None:
         sel = self._selected()
         if not sel:
             return
         kind, s = sel
         if kind == "portainer":
+            options = [("view", "🔍 View compose file & env vars")]
+        else:
+            options = [("view", "🔍 View member containers")]
+        self.app.push_screen(
+            ActionMenu(f"{s.name} ({s.env_name})", options),
+            callback=lambda action_id: self._handle_menu_choice(kind, s, action_id),
+        )
+
+    def _handle_menu_choice(self, kind: str, s, action_id: str | None) -> None:
+        if action_id is None:
+            return
+        if kind == "portainer":
             self.app.push_screen(DockerStackDetailScreen(self.config, s))
         else:
-            # Inferred stacks have no Portainer stack id / compose file to fetch —
-            # show what we already know (its member containers) instead.
             self.app.push_screen(DockerInferredStackScreen(self.config, s))
 
 
