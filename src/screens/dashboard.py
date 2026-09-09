@@ -104,7 +104,7 @@ class DashboardScreen(Screen):
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
-        yield Static("Loading…", id="status-bar")
+        yield Static("Loading…", id="status-bar", markup=False)
         with Horizontal(id="main-columns"):
             with Vertical(id="left-col"):
                 yield Static("⬛ Proxmox Nodes", classes="panel-title")

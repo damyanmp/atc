@@ -143,6 +143,7 @@ class PlexScreen(Screen):
         yield Static(
             "↑↓ navigate  Enter open  Bksp up  / filter  ^R reload  Esc back",
             id="status-bar",
+            markup=False,
         )
         yield Footer()
 

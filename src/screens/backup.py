@@ -51,7 +51,7 @@ class BackupScreen(Screen):
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
-        yield Static("Loading…", id="status-bar")
+        yield Static("Loading…", id="status-bar", markup=False)
         with Vertical(id="jobs-section"):
             yield Static("Scheduled Jobs  (Enter to trigger)", classes="section-label")
             yield DataTable(id="jobs-table", show_cursor=True, cursor_type="row")

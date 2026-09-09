@@ -97,7 +97,7 @@ class ArrScreen(Screen):
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
-        yield Static("⏳ Loading…", id="status-bar")
+        yield Static("⏳ Loading…", id="status-bar", markup=False)
         with Horizontal(id="main"):
             with Vertical(id="left-col"):
                 yield Static("📅  Release Calendar  (past 5d + next 14d)", classes="pane-title")

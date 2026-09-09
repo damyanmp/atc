@@ -10,6 +10,7 @@ from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.screen import Screen
 from textual.widgets import Footer, Header, Label, ListItem, ListView, Log, Static
+from rich.markup import escape
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from config import Config
@@ -153,7 +154,7 @@ class ScriptsScreen(Screen):
             try:
                 lv = self.query_one("#script-list", ScriptListView)
                 lv.clear()
-                lv.append(ListItem(Label(f"  [red]Error loading scripts:[/]\n  {e}", markup=True)))
+                lv.append(ListItem(Label(f"  [red]Error loading scripts:[/]\n  {escape(str(e))}", markup=True)))
             except Exception:
                 pass
 

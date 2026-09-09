@@ -42,7 +42,7 @@ class QuickScreen(Screen):
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
-        yield Static("Loading…", id="status-bar")
+        yield Static("Loading…", id="status-bar", markup=False)
         with Vertical(id="table-container"):
             yield DataTable(id="sites-table", show_cursor=False)
         yield Footer()

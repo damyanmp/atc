@@ -43,7 +43,7 @@ class PiholeScreen(Screen):
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
-        yield Static("Loading…", id="status-bar")
+        yield Static("Loading…", id="status-bar", markup=False)
         with Vertical(id="top-section"):
             yield Static("Instances", classes="section-label")
             yield DataTable(id="instances-table", show_cursor=False)

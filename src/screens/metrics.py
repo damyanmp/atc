@@ -36,7 +36,7 @@ class MetricsScreen(Screen):
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
-        yield Static("Enter a PromQL expression below and press Enter", id="status-bar")
+        yield Static("Enter a PromQL expression below and press Enter", id="status-bar", markup=False)
         yield Input(placeholder="e.g. up, node_load1, rate(node_cpu_seconds_total[5m])", id="query-input")
         with Vertical(id="table-container"):
             yield DataTable(id="results-table", show_cursor=False)

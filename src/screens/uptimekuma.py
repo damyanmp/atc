@@ -43,7 +43,7 @@ class UptimeKumaScreen(Screen):
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
-        yield Static("Loading…", id="status-bar")
+        yield Static("Loading…", id="status-bar", markup=False)
         yield DataTable(id="monitors-table", show_cursor=False)
         yield Footer()
 

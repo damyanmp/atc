@@ -196,7 +196,7 @@ class SpeedtestScreen(Screen):
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
-        yield Static("Starting…", id="status-bar")
+        yield Static("Starting…", id="status-bar", markup=False)
         with Vertical(id="main"):
             yield Static(_ping_panel([], False), id="ping-panel", markup=True)
             with Horizontal(id="speed-row"):
