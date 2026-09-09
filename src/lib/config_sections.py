@@ -184,7 +184,7 @@ SECTIONS: list[SectionSpec] = [
     ),
     SectionSpec(
         key="influxdb",
-        title="InfluxDB 2.x (push-based metrics, e.g. Proxmox's built-in export)",
+        title="InfluxDB 2.x (general read/write client — e.g. Proxmox's built-in export)",
         fields=[
             FieldSpec("host", "InfluxDB host/IP"),
             FieldSpec("org", "Organization ID or name"),
