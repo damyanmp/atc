@@ -1,7 +1,7 @@
 """Docker/Portainer screen — container list across all environments.
 
 Select a row (arrow keys / j,k) and press Enter to see available actions
-for that container. Press S to browse Compose stacks instead.
+for that container. Press V to browse Compose stacks instead.
 """
 from __future__ import annotations
 
@@ -73,7 +73,7 @@ class DockerScreen(Screen):
     BINDINGS = [
         ("escape", "app.pop_screen", "Back"),
         Binding("enter", "open_menu", "Actions", priority=True),
-        Binding("S", "nav_stacks", "Stacks", priority=True),
+        Binding("v", "nav_stacks", "Stacks", priority=True),
         Binding("R", "refresh_data", "Refresh", priority=True),
     ]
 
@@ -152,7 +152,7 @@ class DockerScreen(Screen):
             summary = (
                 f"{len(rows)} containers  |  "
                 + (f"⚠️  {unhealthy} need attention  |  " if unhealthy else "")
-                + "↑↓ select  Enter actions  S Stacks  R Refresh  |  Esc back"
+                + "↑↓ select  Enter actions  V Stacks  R Refresh  |  Esc back"
             )
             if failed_envs:
                 names = ", ".join(
