@@ -125,10 +125,17 @@ class DockerScreen(Screen):
 
             envs = fetch_environments(pt_cfg)
             rows = []
+            failed_envs = []
             for e in envs:
                 if e.status != 1:
                     continue
-                rows.extend(fetch_containers(pt_cfg, e.id, e.name, all_containers=True))
+                try:
+                    rows.extend(fetch_containers(pt_cfg, e.id, e.name, all_containers=True))
+                except Exception as env_exc:
+                    # One slow/unreachable environment (e.g. a remote node
+                    # having a bad moment) shouldn't blank out every other
+                    # environment that answered fine.
+                    failed_envs.append((e.name, env_exc))
             rows.sort(key=lambda c: (c.env_name, c.name))
             self._containers = rows
 
@@ -147,6 +154,11 @@ class DockerScreen(Screen):
                 + (f"⚠️  {unhealthy} need attention  |  " if unhealthy else "")
                 + "↑↓ select  Enter actions  S Stacks  R Refresh  |  Esc back"
             )
+            if failed_envs:
+                names = ", ".join(
+                    f"{name} ({type(exc).__name__})" for name, exc in failed_envs
+                )
+                summary += f"  |  ⚠️  unreachable: {names}"
             self.app.call_from_thread(self.query_one("#status-bar", Static).update, summary)
         except Exception as e:
             self.app.call_from_thread(
@@ -384,12 +396,21 @@ class DockerStacksScreen(Screen):
                 return
 
             envs = fetch_environments(pt_cfg)
-            portainer_stacks = fetch_stacks(pt_cfg, envs)
+            failed_envs = []
+            try:
+                portainer_stacks = fetch_stacks(pt_cfg, envs)
+            except Exception as exc:
+                portainer_stacks = []
+                failed_envs.append(("stacks API", exc))
+
             all_containers = []
             for e in envs:
                 if e.status != 1:
                     continue
-                all_containers.extend(fetch_containers(pt_cfg, e.id, e.name, all_containers=True))
+                try:
+                    all_containers.extend(fetch_containers(pt_cfg, e.id, e.name, all_containers=True))
+                except Exception as env_exc:
+                    failed_envs.append((e.name, env_exc))
             known_names = {s.name for s in portainer_stacks}
             inferred = infer_compose_stacks(all_containers, portainer_stack_names=known_names)
 
@@ -409,7 +430,12 @@ class DockerStacksScreen(Screen):
 
             self.app.call_from_thread(
                 self.query_one("#status-bar", Static).update,
-                f"{len(rows)} stack(s)  |  ↑↓ select  Enter actions  R Refresh  |  Esc back",
+                f"{len(rows)} stack(s)  |  ↑↓ select  Enter actions  R Refresh  |  Esc back"
+                + (
+                    "  |  ⚠️  unreachable: "
+                    + ", ".join(f"{name} ({type(exc).__name__})" for name, exc in failed_envs)
+                    if failed_envs else ""
+                ),
             )
         except Exception as e:
             self.app.call_from_thread(
