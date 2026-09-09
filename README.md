@@ -141,16 +141,11 @@ A few standalone utilities live at the repo root, separate from the main
 - **`mobile_qr.py`** — generates a QR code for importing `atc`'s config into
   the companion Android app. Resolves secrets from the keychain
   automatically. Run with `uv run python mobile_qr.py`.
-- **`sync_vault.py`** — pulls the Obsidian vault from CouchDB LiveSync,
-  decrypts it, and mirrors it to a local directory. Requires the
-  `couchdb-obsidian-password` and `couchdb-obsidian-passphrase` secrets.
-  Run with `.venv/bin/python3 sync_vault.py [--dest DIR]`.
-- **`obsidian_decrypt.py`** — the decryption primitives `sync_vault.py`
-  builds on (HKDF v2 chunk decryption, ported from
-  `vrtmrz/octagonal-wheels`). Not meant to be run directly.
-- **`atc-sync-secrets.sh`** — run on your workstation (not the homelab host):
-  SSHes to the target host and reconciles which secret keys `config.yaml`
-  references against what's actually in that host's keychain.
 - **`guest_update_cmds.yaml`** — per-service override commands for
   `atc update`, keyed by guest hostname (e.g. `pihole: pihole updatePihole
   --unattended`). Edit directly; not templated from `config.yaml.example`.
+
+Obsidian vault sync (`sync_vault.py`, `obsidian_decrypt.py`) and the
+Mac Keychain→host secret sync helper (`atc-sync-secrets.sh`) live in
+`pentagon-management/infrastructure/cli/` — they're homelab-specific
+automation, not part of the `atc` CLI itself.
