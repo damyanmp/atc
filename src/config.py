@@ -925,6 +925,49 @@ def secret_verify(key: str, candidate: str) -> bool:
     return _hmac.compare_digest(stored_hash, candidate_hash)
 
 
+def keyring_backend_status() -> dict:
+    """Report which keyring backend is actually active right now, and
+    whether an upgrade path is available/recommended. Used by `atc init`'s
+    keyring-hardening step and `atc secrets` diagnostics.
+
+    Returns a dict:
+      backend      — class name of the currently active keyring backend
+      encrypted    — True if it's a real encrypted backend (OS keychain,
+                     Secret Service, or our AES-256 cryptfile backend)
+      upgrade_available — True if the plaintext fallback is active AND an
+                          upgrade to the encrypted backend hasn't been done
+                          yet (i.e. `atc secrets migrate-encryption` would
+                          have something useful to do)
+      plaintext_has_secrets — True if the old plaintext file exists and has
+                              at least one real secret in it
+    """
+    active = keyring.get_keyring()
+    backend_name = type(active).__module__ + "." + type(active).__name__
+
+    is_plaintext_fallback = backend_name == "keyrings.alt.file.PlaintextKeyring"
+    is_our_encrypted_backend = _ENCRYPTED_KEYRING_FILE.exists() and _ENCRYPTED_KEYRING_PASSWORD_FILE.exists()
+
+    old_path = Path.home() / ".local/share/python_keyring/keyring_pass.cfg"
+    plaintext_has_secrets = False
+    if old_path.exists():
+        try:
+            from keyrings.alt.file import PlaintextKeyring
+
+            old_backend = PlaintextKeyring()
+            old_backend.file_path = str(old_path)
+            index_raw = old_backend.get_password(KEYCHAIN_SERVICE, "__index__") or ""
+            plaintext_has_secrets = bool(index_raw.strip())
+        except Exception:
+            plaintext_has_secrets = old_path.stat().st_size > 0
+
+    return {
+        "backend": backend_name,
+        "encrypted": is_our_encrypted_backend or not is_plaintext_fallback,
+        "upgrade_available": is_plaintext_fallback and not is_our_encrypted_backend and plaintext_has_secrets,
+        "plaintext_has_secrets": plaintext_has_secrets,
+    }
+
+
 def secrets_migrate_encryption() -> tuple[int, list[str]]:
     """Migrate all secrets from the plaintext keyring backend into a new
     AES-256 encrypted (keyrings.cryptfile) backend.

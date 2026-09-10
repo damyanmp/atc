@@ -28,7 +28,7 @@ sys.path.insert(0, str(Path(__file__).parent / "lib"))
 from config import (
     Config, load_config,
     secret_set, secret_delete, secret_verify, secret_repair, secrets_scan_config, secrets_list,
-    secrets_migrate_encryption,
+    secrets_migrate_encryption, keyring_backend_status,
     save_guest_user, save_guest_update_cmd, remove_guest_update_cmd,
     KEYCHAIN_SERVICE,
 )
@@ -666,6 +666,73 @@ def _render_guests_table(
 
 # ── init ──────────────────────────────────────────────────────────────────────
 
+def _run_keyring_hardening_step() -> None:
+    """p10k-'configure'-style interactive step: explain what's happening,
+    show the current state plainly, ask one clear yes/no question, act on
+    the answer, confirm the result. Runs once at the top of `atc init`'s
+    interactive menu mode (skipped in non-interactive single-section mode).
+
+    Safe to run every time `atc init` is invoked — a no-op with a short
+    confirmation line once the encrypted backend is already active, so
+    re-running `atc init` doesn't nag.
+    """
+    status = keyring_backend_status()
+
+    if status["encrypted"]:
+        console.print(f"[dim]Keyring: {status['backend']} (encrypted) — good.[/]\n")
+        return
+
+    if not status["upgrade_available"]:
+        # Plaintext fallback with nothing stored yet — nothing to migrate,
+        # nothing to warn about (there's no secret in danger).
+        console.print(
+            "[dim]Keyring: keyrings.alt.file.PlaintextKeyring (base64, not encrypted). "
+            "No secrets stored yet, so nothing to migrate.[/]\n"
+        )
+        return
+
+    console.print("[bold]── Secrets storage ──[/]\n")
+    console.print(
+        "  atc is currently storing secrets via a [yellow]plaintext, base64-encoded[/]\n"
+        "  file — not real encryption. Anyone who can read that file (or a stolen\n"
+        "  backup/disk copy of it) can decode every stored secret trivially.\n"
+    )
+    console.print(
+        "  This usually happens on headless Linux boxes with no OS Secret Service\n"
+        "  daemon (GNOME Keyring / KWallet) for 'keyring' to use instead.\n"
+    )
+    console.print(
+        "  atc can migrate everything to a real [cyan]AES-256-GCM encrypted[/] backend:\n"
+        "    • Reads the old plaintext file [bold]read-only[/] — never modifies or deletes it\n"
+        "    • Writes to a brand-new file, protected by a freshly generated,\n"
+        "      machine-random master password (saved 0600, only your user can read it)\n"
+        "    • Verifies every value byte-for-byte before switching over\n"
+        "    • The old plaintext file is left in place afterward as a fallback\n"
+        "      (safe to delete by hand once you've confirmed everything still works)\n"
+    )
+    console.print(
+        "  [dim]Honest caveat: this protects against cold/offline theft of the secrets\n"
+        "  file alone (a stolen backup, a copied disk). It does NOT add protection\n"
+        "  against a live process already running as your own user on this box —\n"
+        "  that process can read the same master-password file you can. For that\n"
+        "  threat model, restrict who/what can get shell access to this box, rather\n"
+        "  than swap the keyring backend.[/]\n"
+    )
+
+    if not Confirm.ask("  Migrate to the encrypted backend now?", default=True):
+        console.print("  [dim]Skipped — still using the plaintext fallback. Run "
+                       "'atc secrets migrate-encryption' any time to upgrade.[/]\n")
+        return
+
+    count, mismatches = secrets_migrate_encryption()
+    if mismatches:
+        console.print(f"  [red]✗ Verification failed for {len(mismatches)} key(s):[/] {mismatches}")
+        console.print("  [dim]Old plaintext backend was not touched. Continuing init without the upgrade.[/]\n")
+        return
+
+    console.print(f"  [green]✓[/] Migrated and verified {count} entries to an AES-256 encrypted keyring.\n")
+
+
 def _prompt_field(f, instance_name: str = "") -> object:
     """Prompt for one FieldSpec's value, storing secrets in the keychain."""
     from lib.config_sections import resolve_secret_key
@@ -776,6 +843,8 @@ def cmd_init(
         return
 
     # Interactive menu mode
+    _run_keyring_hardening_step()
+
     console.print("[bold]atc init[/] — select which integrations to configure.\n")
     console.print("[dim]Proxmox is required for atc to run at all; everything else is optional.[/]\n")
 

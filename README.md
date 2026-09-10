@@ -86,12 +86,20 @@ had become the load-bearing tool for day-to-day homelab operations.
    cd ~/repos/atc
    atc init
    ```
-   This launches an interactive wizard listing every supported integration —
-   pick which ones to configure (comma-separated numbers, `all`, or `q` to
-   skip). Secrets you enter are stored in the OS keychain automatically,
-   never written to `config.yaml` in plaintext. Safe to re-run any time to
-   add or update a section — existing sections are left untouched unless you
-   select them again.
+   This launches an interactive wizard. First, if you're on a headless
+   Linux box still using the plaintext keyring fallback, it walks you
+   through the same encrypted-backend upgrade described in step 4 above —
+   explains what's happening and why, then asks a single yes/no question.
+   Skip it once and it's still one `atc secrets migrate-encryption` away
+   any time later. Already encrypted (or on macOS/GNOME-Keyring/KWallet)?
+   It's a silent one-line confirmation and moves straight on.
+
+   Then it lists every supported integration — pick which ones to
+   configure (comma-separated numbers, `all`, or `q` to skip). Secrets you
+   enter are stored in the OS keychain automatically, never written to
+   `config.yaml` in plaintext. Safe to re-run any time to add or update a
+   section — existing sections are left untouched unless you select them
+   again.
 
    Prefer to hand-edit instead? `cp config.yaml.example config.yaml` and fill
    in values manually — `atc init` and the example file produce identical

@@ -8,6 +8,13 @@ track breaking config/CLI changes.
 ## [Unreleased]
 
 ### Added
+- `atc init` now opens with a p10k-`configure`-style keyring-hardening step:
+  if the plaintext (base64) keyring fallback is active and has real secrets
+  in it, it explains the risk and the upgrade path in plain language, asks
+  one yes/no question, and runs `secrets migrate-encryption` on confirm.
+  Already encrypted or nothing to migrate? A single confirmation line, no
+  interruption. `config.keyring_backend_status()` is the reusable detection
+  helper behind it (used standalone too, e.g. future `atc secrets status`).
 - `atc secrets migrate-encryption` — upgrades the headless-Linux plaintext
   (base64, not encrypted) keyring fallback to a real AES-256-GCM encrypted
   backend (`keyrings.cryptfile`), protected by a freshly generated

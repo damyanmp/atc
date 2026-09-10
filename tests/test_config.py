@@ -393,3 +393,99 @@ class TestSecretsMigrateEncryption:
         assert count1 == count2
         # Re-run must not regenerate the master password.
         assert password_after_first_run == password_after_second_run
+
+
+class TestKeyringBackendStatus:
+    """Real end-to-end checks of keyring_backend_status() against actual
+    plaintext-keyring files in tmp_path, no mocks of the status function
+    itself (only Path.home()/module path constants are monkeypatched so
+    tests never touch the real machine's keyring).
+    """
+
+    def _seed_old_plaintext_backend(self, old_path, entries: dict[str, str]):
+        from keyrings.alt.file import PlaintextKeyring
+
+        old_path.parent.mkdir(parents=True, exist_ok=True)
+        backend = PlaintextKeyring()
+        backend.file_path = str(old_path)
+        for k, v in entries.items():
+            backend.set_password("atc", k, v)
+        index = ",".join(sorted(entries.keys()))
+        backend.set_password("atc", "__index__", index)
+
+    def test_upgrade_available_when_plaintext_has_secrets_and_no_encrypted_backend(
+        self, tmp_path, monkeypatch
+    ):
+        import config as config_module
+        import keyring as keyring_module
+        from keyrings.alt.file import PlaintextKeyring
+
+        old_path = tmp_path / ".local/share/python_keyring/keyring_pass.cfg"
+        self._seed_old_plaintext_backend(old_path, {"secret-a": "value-a"})
+
+        active_plaintext = PlaintextKeyring()
+        active_plaintext.file_path = str(old_path)
+        monkeypatch.setattr(keyring_module, "get_keyring", lambda: active_plaintext)
+        monkeypatch.setattr(config_module.Path, "home", lambda: tmp_path)
+        monkeypatch.setattr(
+            config_module, "_ENCRYPTED_KEYRING_FILE", tmp_path / "does-not-exist" / "x.cfg"
+        )
+        monkeypatch.setattr(
+            config_module, "_ENCRYPTED_KEYRING_PASSWORD_FILE", tmp_path / "does-not-exist" / "y.key"
+        )
+
+        status = config_module.keyring_backend_status()
+
+        assert status["backend"] == "keyrings.alt.file.PlaintextKeyring"
+        assert status["encrypted"] is False
+        assert status["upgrade_available"] is True
+        assert status["plaintext_has_secrets"] is True
+
+    def test_no_upgrade_needed_when_encrypted_backend_already_active(self, tmp_path, monkeypatch):
+        import config as config_module
+        import keyring as keyring_module
+
+        new_path = tmp_path / "new_keyring" / "keyring_crypt.cfg"
+        pw_path = tmp_path / "pw" / "keyring.key"
+        new_path.parent.mkdir(parents=True)
+        pw_path.parent.mkdir(parents=True)
+        new_path.write_text("dummy")
+        pw_path.write_text("dummy-password")
+
+        FastCryptFileKeyring = config_module._fast_cryptfile_keyring_class()
+        active_encrypted = FastCryptFileKeyring()
+
+        monkeypatch.setattr(keyring_module, "get_keyring", lambda: active_encrypted)
+        monkeypatch.setattr(config_module.Path, "home", lambda: tmp_path)
+        monkeypatch.setattr(config_module, "_ENCRYPTED_KEYRING_FILE", new_path)
+        monkeypatch.setattr(config_module, "_ENCRYPTED_KEYRING_PASSWORD_FILE", pw_path)
+
+        status = config_module.keyring_backend_status()
+
+        assert status["encrypted"] is True
+        assert status["upgrade_available"] is False
+
+    def test_no_upgrade_needed_when_plaintext_is_empty(self, tmp_path, monkeypatch):
+        import config as config_module
+        import keyring as keyring_module
+        from keyrings.alt.file import PlaintextKeyring
+
+        old_path = tmp_path / ".local/share/python_keyring/keyring_pass.cfg"
+        old_path.parent.mkdir(parents=True, exist_ok=True)
+        # No secrets set — file may not even exist yet.
+
+        active_plaintext = PlaintextKeyring()
+        active_plaintext.file_path = str(old_path)
+        monkeypatch.setattr(keyring_module, "get_keyring", lambda: active_plaintext)
+        monkeypatch.setattr(config_module.Path, "home", lambda: tmp_path)
+        monkeypatch.setattr(
+            config_module, "_ENCRYPTED_KEYRING_FILE", tmp_path / "does-not-exist" / "x.cfg"
+        )
+        monkeypatch.setattr(
+            config_module, "_ENCRYPTED_KEYRING_PASSWORD_FILE", tmp_path / "does-not-exist" / "y.key"
+        )
+
+        status = config_module.keyring_backend_status()
+
+        assert status["upgrade_available"] is False
+        assert status["plaintext_has_secrets"] is False
