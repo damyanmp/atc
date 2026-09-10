@@ -72,6 +72,15 @@ had become the load-bearing tool for day-to-day homelab operations.
    For that threat model you need to restrict who/what can get shell access
    to the box in the first place, not swap the keyring backend.
 
+   Performance note: `keyrings.cryptfile`'s stock Argon2 KDF params
+   (time_cost=15, 64MB memory) are tuned for hardening a human-memorable
+   password against brute force, and re-derive the encryption key on
+   *every individual secret lookup* — a command resolving several config
+   secrets could take 8-10s. Since our master password is a 384-bit
+   machine-generated random token (not human-chosen), that hardening buys
+   nothing, so `atc` uses much cheaper KDF params (~40ms/lookup) instead.
+   Commands touching multiple secrets run in ~1-2s, not ~9s.
+
 5. **Create your config**:
    ```bash
    cd ~/repos/atc

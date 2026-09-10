@@ -336,7 +336,9 @@ class TestSecretsMigrateEncryption:
         assert expected_old_path.exists()
 
         # New encrypted backend must actually resolve the real values.
-        from keyrings.cryptfile.cryptfile import CryptFileKeyring
+        # Use the same fast-KDF subclass the migration itself writes with
+        # (default CryptFileKeyring params would derive a different key).
+        CryptFileKeyring = config_module._fast_cryptfile_keyring_class()
 
         password = pw_path.read_text().strip()
         assert password  # a real password was generated

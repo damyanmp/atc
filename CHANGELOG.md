@@ -16,7 +16,12 @@ track breaking config/CLI changes.
   byte-for-byte, safe to re-run. `atc` auto-detects and switches to the
   encrypted backend on every subsequent run once it exists, with no config
   changes needed and no impact on macOS/GNOME-Keyring/KWallet setups where
-  a real OS keychain is already in use.
+  a real OS keychain is already in use. Uses Argon2 KDF params tuned for a
+  machine-generated random master password rather than the library's
+  human-password-oriented defaults (time_cost=2, 19MB memory vs the
+  library's time_cost=15, 64MB) — the stock defaults re-derive the key on
+  every individual secret lookup and made multi-secret commands (`atc
+  pihole status`, `atc acars`) take 8-10s; tuned params keep them at ~1-2s.
 - `atc init` — interactive setup wizard. Lists all 20 supported config
   sections with a checkmark for what's already configured; pick sections by
   number, `all`, or quit. Secrets are stored in the OS keychain automatically

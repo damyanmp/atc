@@ -38,14 +38,14 @@ def _try_use_encrypted_keyring() -> None:
     if not (_ENCRYPTED_KEYRING_PASSWORD_FILE.exists() and _ENCRYPTED_KEYRING_FILE.exists()):
         return
     try:
-        from keyrings.cryptfile.cryptfile import CryptFileKeyring
+        backend_cls = _fast_cryptfile_keyring_class()
     except ImportError:
         return
     try:
         password = _ENCRYPTED_KEYRING_PASSWORD_FILE.read_text().strip()
         if not password:
             return
-        backend = CryptFileKeyring()
+        backend = backend_cls()
         backend.file_path = str(_ENCRYPTED_KEYRING_FILE)
         backend.keyring_key = password
         keyring.set_keyring(backend)
@@ -53,6 +53,39 @@ def _try_use_encrypted_keyring() -> None:
         # Never hard-fail config loading over a keyring backend issue —
         # fall through to whatever `keyring` auto-detected.
         pass
+
+
+def _fast_cryptfile_keyring_class():
+    """CryptFileKeyring subclass with Argon2 cost params tuned for a
+    cryptographically-random master password rather than a human-memorable
+    one.
+
+    keyrings.cryptfile's defaults (time_cost=15, memory_cost=64MB) are
+    calibrated to make brute-forcing a *weak, guessable* password
+    computationally expensive — the classic password-hashing threat model.
+    Our master password (see secrets_migrate_encryption) is a
+    secrets.token_urlsafe(48) value with ~384 bits of entropy: brute force
+    is already astronomically infeasible regardless of KDF cost, so the
+    extra hardening buys nothing here while costing ~400ms of Argon2 work
+    on EVERY individual secret lookup (each stored secret has its own
+    random salt, so the KDF reruns per-secret, not once per process — a
+    command resolving 5+ config secrets was taking 8-10s as a result).
+
+    OWASP's own "second recommended option" for interactive, low-value KDF
+    use (2 iterations, 19MB memory, 1 thread) is dramatically cheaper
+    (~35-40ms) while still not being "free" against a hypothetical offline
+    attacker — and the actual security here rests on the master password's
+    entropy, not the KDF's cost, since that password is machine-generated
+    and never human-chosen.
+    """
+    from keyrings.cryptfile.cryptfile import CryptFileKeyring
+
+    class FastCryptFileKeyring(CryptFileKeyring):
+        time_cost = 2
+        memory_cost = 19 * 1024  # 19 MB, in KiB per argon2-cffi's units
+        parallelism = 1
+
+    return FastCryptFileKeyring
 
 
 _try_use_encrypted_keyring()
@@ -942,7 +975,7 @@ def secrets_migrate_encryption() -> tuple[int, list[str]]:
         _ENCRYPTED_KEYRING_PASSWORD_FILE.write_text(master_password + "\n")
         os.chmod(_ENCRYPTED_KEYRING_PASSWORD_FILE, stat.S_IRUSR | stat.S_IWUSR)
 
-    from keyrings.cryptfile.cryptfile import CryptFileKeyring
+    CryptFileKeyring = _fast_cryptfile_keyring_class()
 
     new_backend = CryptFileKeyring()
     new_backend.file_path = str(_ENCRYPTED_KEYRING_FILE)
