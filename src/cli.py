@@ -3999,6 +3999,86 @@ def cmd_uptimekuma_not(
 
 # ── acars ────────────────────────────────────────────────────────────────────
 
+def _jwt_exp_days_remaining(token: str) -> float | None:
+    """Decode a JWT's `exp` claim (no signature verification — we don't hold
+    the secret) and return days remaining until expiry, or None if the token
+    isn't a 3-part JWT or has no `exp` claim. Never touches the rest of the
+    payload (e.g. subject/user id) beyond what's needed here.
+    """
+    import base64
+    import json as _json
+    import time
+
+    parts = token.split(".")
+    if len(parts) != 3:
+        return None
+    try:
+        payload_b64 = parts[1] + "=" * (-len(parts[1]) % 4)
+        payload = _json.loads(base64.urlsafe_b64decode(payload_b64))
+    except Exception:
+        return None
+    exp = payload.get("exp")
+    if exp is None:
+        return None
+    return (exp - time.time()) / 86400
+
+
+def _acars_fetch_beszel(
+    cfg,
+    cpu_warn: float, cpu_crit: float,
+    mem_warn: float, mem_crit: float,
+    disk_warn: float, disk_crit: float,
+    token_warn_days: int,
+) -> list[dict]:
+    """Beszel system health: down systems, resource thresholds, and API
+    token expiry. Returns [{text, severity}], raises on real fetch errors.
+
+    Note: an expired/invalid Beszel token doesn't raise or 401 — PocketBase
+    silently returns zero systems for it — so we proactively check the
+    token's own JWT `exp` claim here rather than relying on the systems
+    list coming back empty (which would otherwise report false-clean).
+    """
+    import asyncio as _asyncio
+
+    result: list[dict] = []
+
+    days_left = _jwt_exp_days_remaining(cfg.api_key)
+    if days_left is not None:
+        if days_left < 0:
+            result.append({
+                "text": f"beszel-api-key — EXPIRED {abs(days_left):.1f}d ago (systems silently show empty, not an error)",
+                "severity": "CRIT",
+            })
+        elif days_left <= token_warn_days:
+            result.append({
+                "text": f"beszel-api-key — expires in {days_left:.1f}d, regenerate via PocketBase _superusers Impersonate",
+                "severity": "WARN",
+            })
+
+    systems = _asyncio.run(fetch_beszel(cfg))
+    for s in systems:
+        if s.error:
+            # fetch-level failure (network/auth), not a per-system status
+            raise RuntimeError(s.error)
+        if not s.online:
+            result.append({"text": f"{s.name} — {s.status}", "severity": "CRIT"})
+            continue
+        if s.cpu_percent >= cpu_crit:
+            result.append({"text": f"{s.name} — CPU {s.cpu_percent:.0f}%", "severity": "CRIT"})
+        elif s.cpu_percent >= cpu_warn:
+            result.append({"text": f"{s.name} — CPU {s.cpu_percent:.0f}%", "severity": "WARN"})
+        if s.mem_percent >= mem_crit:
+            result.append({"text": f"{s.name} — Mem {s.mem_percent:.0f}%", "severity": "CRIT"})
+        elif s.mem_percent >= mem_warn:
+            result.append({"text": f"{s.name} — Mem {s.mem_percent:.0f}%", "severity": "WARN"})
+        if s.disk_percent >= disk_crit:
+            result.append({"text": f"{s.name} — Disk {s.disk_percent:.0f}%", "severity": "CRIT"})
+        elif s.disk_percent >= disk_warn:
+            result.append({"text": f"{s.name} — Disk {s.disk_percent:.0f}%", "severity": "WARN"})
+
+    return result
+
+
 def _acars_fetch_prometheus(cfg) -> list[dict]:
     """Fetch firing/pending Prometheus alerts. Returns [{text, severity}], raises on error."""
     import httpx
@@ -4081,11 +4161,19 @@ def _acars_fetch_loki(cfg) -> list[dict]:
 def cmd_acars(
     certs_warn: int = typer.Option(30, "--certs-warn", help="Warn when cert expires within N days"),
     certs_crit: int = typer.Option(14, "--certs-crit", help="Critical when cert expires within N days"),
+    beszel_cpu_warn: float = typer.Option(85.0, "--beszel-cpu-warn", help="Warn when Beszel host CPU % ≥ this"),
+    beszel_cpu_crit: float = typer.Option(95.0, "--beszel-cpu-crit", help="Critical when Beszel host CPU % ≥ this"),
+    beszel_mem_warn: float = typer.Option(85.0, "--beszel-mem-warn", help="Warn when Beszel host Mem % ≥ this"),
+    beszel_mem_crit: float = typer.Option(95.0, "--beszel-mem-crit", help="Critical when Beszel host Mem % ≥ this"),
+    beszel_disk_warn: float = typer.Option(85.0, "--beszel-disk-warn", help="Warn when Beszel host Disk % ≥ this"),
+    beszel_disk_crit: float = typer.Option(95.0, "--beszel-disk-crit", help="Critical when Beszel host Disk % ≥ this"),
+    beszel_token_warn_days: int = typer.Option(14, "--beszel-token-warn-days", help="Warn when beszel-api-key expires within N days"),
 ) -> None:
     """Active alerts across all configured infrastructure.
 
     Checks: Uptime Kuma monitors · TLS cert expiry · Proxmox nodes
             · Prometheus · Pi-hole instances · UniFi device state/firmware
+            · Beszel host resources (CPU/Mem/Disk) + API token expiry
             · Loki syslog/pihole log events (last 15 min — live, not historical;
             see `atc blackbox` for a deep historical dump).
 
@@ -4112,6 +4200,14 @@ def cmd_acars(
             coros["pihole"] = pihole_fetch_all(cfg.pihole_instances)
         if cfg.unifi:
             coros["unifi"] = _sync(_acars_fetch_unifi, cfg.unifi)
+        if cfg.beszel:
+            coros["beszel"] = _sync(
+                _acars_fetch_beszel, cfg.beszel,
+                beszel_cpu_warn, beszel_cpu_crit,
+                beszel_mem_warn, beszel_mem_crit,
+                beszel_disk_warn, beszel_disk_crit,
+                beszel_token_warn_days,
+            )
         if cfg.loki:
             coros["loki"] = _sync(_acars_fetch_loki, cfg.loki)
 
@@ -4185,6 +4281,15 @@ def cmd_acars(
         else:
             for e in v:
                 alerts.append((e["severity"], "UniFi", e["text"]))
+
+    # ── Beszel ───────────────────────────────────────────────────────────────
+    if "beszel" in result_map:
+        v = result_map["beszel"]
+        if isinstance(v, Exception):
+            source_errors.append(f"Beszel: {v}")
+        else:
+            for e in v:
+                alerts.append((e["severity"], "Beszel", e["text"]))
 
     # ── Loki (syslog/pihole, live) ───────────────────────────────────────────
     if "loki" in result_map:
