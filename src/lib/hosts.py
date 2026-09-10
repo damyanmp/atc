@@ -64,13 +64,20 @@ def merge_hosts(
     """Merge Proxmox guests with Beszel systems into a unified host list.
 
     For each Proxmox guest, attempt to find a matching Beszel system by
-    normalized name. If found and online, Beszel metrics (cpu/mem/disk)
-    replace the Proxmox metrics. Unmatched Beszel systems are appended as
-    standalone hosts (type="host").
+    normalized name, falling back to IP match if the names don't line up
+    (Beszel agents often report a different hostname than the Proxmox guest
+    name, e.g. "Docker-1 (local)" / "Plex LXC" / "Hermes" vs. the Proxmox
+    names "docker-1" / "plex" / "hermes-host" — but both report the same
+    IP). If found and online, Beszel metrics (cpu/mem/disk) replace the
+    Proxmox metrics. Unmatched Beszel systems are appended as standalone
+    hosts (type="host").
     """
     ip_map = ip_map or {}
     beszel_index: dict[str, BeszelSystem] = {
         normalize_name(s.name): s for s in beszel_systems
+    }
+    beszel_by_ip: dict[str, str] = {
+        s.host: normalize_name(s.name) for s in beszel_systems if s.host
     }
     unmatched: set[str] = set(beszel_index)
 
@@ -79,6 +86,11 @@ def merge_hosts(
     for g in cluster.guests:
         key = normalize_name(g.name)
         bz = beszel_index.get(key)
+        if bz is None:
+            guest_ip = ip_map.get(g.vmid, "")
+            if guest_ip and guest_ip in beszel_by_ip:
+                key = beszel_by_ip[guest_ip]
+                bz = beszel_index.get(key)
         if bz is not None:
             unmatched.discard(key)
 

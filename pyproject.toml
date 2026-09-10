@@ -41,8 +41,9 @@ dev = [
 ]
 
 [tool.pytest.ini_options]
-# Add src/ to sys.path so bare imports (e.g. "from config import …") work in tests
-pythonpath = ["src"]
+# Add src/ and src/lib/ to sys.path so bare imports (e.g. "from config import …",
+# and lib/hosts.py's "from beszel import …") work in tests same as at runtime.
+pythonpath = ["src", "src/lib"]
 testpaths  = ["tests"]
 asyncio_mode = "auto"
 
