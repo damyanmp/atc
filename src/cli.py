@@ -29,6 +29,7 @@ from config import (
     Config, load_config,
     secret_set, secret_delete, secret_verify, secret_repair, secrets_scan_config, secrets_list,
     secrets_migrate_encryption, keyring_backend_status,
+    secret_is_local_only, secret_set_local_only,
     save_guest_user, save_guest_update_cmd, remove_guest_update_cmd,
     KEYCHAIN_SERVICE,
 )
@@ -2207,15 +2208,26 @@ def _secrets_list() -> None:
 
     t = Table(title=f"Keychain secrets (service: '{KEYCHAIN_SERVICE}')", box=box.ROUNDED)
     t.add_column("Key", style="cyan bold")
+    t.add_column("Local Only", justify="center")
     for key in keys:
-        t.add_row(key)
+        flag = "[red]🔒 yes[/]" if secret_is_local_only(key) else "[dim]no[/]"
+        t.add_row(key, flag)
     console.print(t)
+    console.print(
+        "[dim]🔒 local_only secrets must never be printed, decoded, or passed into an AI model/agent turn — "
+        "run commands against them directly instead.[/]"
+    )
 
 
 @secrets_app.command("set")
 def secrets_set(
     key: str = typer.Argument(..., help="Secret key name"),
     value: str | None = typer.Argument(None, help="Value (prompted securely if omitted)"),
+    local_only: bool = typer.Option(
+        False,
+        "--local-only/--no-local-only",
+        help="Mark this secret as never to be surfaced to an AI model/agent (advisory flag, checked by atc's own tooling).",
+    ),
 ) -> None:
     """Set or update a secret in the keychain."""
     if value is None:
@@ -2223,8 +2235,28 @@ def secrets_set(
         if not value:
             console.print("[red]Empty value — aborted.[/]")
             raise typer.Exit(1)
-    secret_set(key, value)
+    secret_set(key, value, local_only=local_only)
     console.print(f"[green]✓[/] Stored [cyan]{key!r}[/] in keychain.")
+    if local_only:
+        console.print("[dim]🔒 Flagged local_only — will never be surfaced to an AI model/agent.[/]")
+
+
+@secrets_app.command("flag")
+def secrets_flag_cmd(
+    key: str = typer.Argument(..., help="Secret key to flag"),
+    local_only: bool = typer.Option(
+        ...,
+        "--local-only/--no-local-only",
+        help="Set or clear the local_only flag without re-entering the secret value.",
+    ),
+) -> None:
+    """Set or clear the local_only flag on an existing secret, without touching its value."""
+    if key not in secrets_list():
+        console.print(f"[red]Key '{key}' not found.[/]")
+        raise typer.Exit(1)
+    secret_set_local_only(key, local_only)
+    state = "[red]🔒 local_only[/]" if local_only else "[dim]not local_only[/]"
+    console.print(f"[green]✓[/] [cyan]{key!r}[/] is now {state}.")
 
 
 @secrets_app.command("delete")

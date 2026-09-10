@@ -895,18 +895,64 @@ def _index_remove(key: str) -> None:
     keyring.set_password(KEYCHAIN_SERVICE, index_key, ",".join(sorted(keys)))
 
 
-def secret_set(key: str, value: str) -> None:
+def secret_set(key: str, value: str, local_only: bool | None = None) -> None:
+    """Store a secret. If local_only is given, sets/updates the local-only
+    flag for this key; if None, leaves any existing flag untouched (defaults
+    to not-local-only for brand-new keys).
+    """
     keyring.set_password(KEYCHAIN_SERVICE, key, value)
     _index_add(key)
+    if local_only is not None:
+        secret_set_local_only(key, local_only)
 
 
 def secret_delete(key: str) -> bool:
     try:
         keyring.delete_password(KEYCHAIN_SERVICE, key)
         _index_remove(key)
+        _local_only_remove(key)
         return True
     except keyring.errors.PasswordDeleteError:
         return False
+
+
+# ── local_only flag: marks a secret as never to be surfaced to an AI model ──
+# (never printed/decoded in a chat/agent context, never passed into a model
+# turn). This is an advisory/audit marker enforced by callers (CLI commands,
+# any future MCP/agent-facing secret accessor) — it does not change how the
+# keyring itself stores or encrypts the value.
+
+_LOCAL_ONLY_INDEX_KEY = "__local_only__"
+
+
+def _local_only_set_raw(keys: set[str]) -> None:
+    keyring.set_password(KEYCHAIN_SERVICE, _LOCAL_ONLY_INDEX_KEY, ",".join(sorted(keys)))
+
+
+def _local_only_get_raw() -> set[str]:
+    raw = keyring.get_password(KEYCHAIN_SERVICE, _LOCAL_ONLY_INDEX_KEY) or ""
+    return set(k for k in raw.split(",") if k)
+
+
+def secret_set_local_only(key: str, flag: bool) -> None:
+    """Mark (or unmark) a stored secret as local_only."""
+    keys = _local_only_get_raw()
+    if flag:
+        keys.add(key)
+    else:
+        keys.discard(key)
+    _local_only_set_raw(keys)
+
+
+def secret_is_local_only(key: str) -> bool:
+    return key in _local_only_get_raw()
+
+
+def _local_only_remove(key: str) -> None:
+    keys = _local_only_get_raw()
+    if key in keys:
+        keys.discard(key)
+        _local_only_set_raw(keys)
 
 
 def secret_verify(key: str, candidate: str) -> bool:
