@@ -282,3 +282,112 @@ class TestLoadConfig:
         assert cfg.tautulli.port == 8181
         assert cfg.tautulli.api_key == "testtautullikey"
         assert cfg.tautulli.base_url == "http://192.168.1.10:8181"
+
+
+# ── Encrypted keyring migration ─────────────────────────────────────────────
+
+class TestSecretsMigrateEncryption:
+    """End-to-end: real plaintext keyring -> real AES-256 encrypted keyring,
+    no mocks. Monkeypatches config.py's path constants to tmp_path so this
+    never touches the real keyring files on the machine running the tests.
+    """
+
+    def _seed_old_plaintext_backend(self, old_path, entries: dict[str, str]):
+        from keyrings.alt.file import PlaintextKeyring
+
+        old_path.parent.mkdir(parents=True, exist_ok=True)
+        backend = PlaintextKeyring()
+        backend.file_path = str(old_path)
+        for k, v in entries.items():
+            backend.set_password("atc", k, v)
+        index = ",".join(sorted(entries.keys()))
+        backend.set_password("atc", "__index__", index)
+
+    def test_migrates_and_verifies_all_entries(self, tmp_path, monkeypatch):
+        import config as config_module
+
+        old_path = tmp_path / "old_keyring" / "keyring_pass.cfg"
+        new_path = tmp_path / "new_keyring" / "keyring_crypt.cfg"
+        pw_path = tmp_path / "pw" / "keyring.key"
+
+        entries = {"secret-a": "value-a", "secret-b": "value-b-with-symbols!@#"}
+        self._seed_old_plaintext_backend(old_path, entries)
+
+        monkeypatch.setattr(config_module.Path, "home", lambda: tmp_path)
+        monkeypatch.setattr(
+            config_module, "_ENCRYPTED_KEYRING_FILE", new_path
+        )
+        monkeypatch.setattr(
+            config_module, "_ENCRYPTED_KEYRING_PASSWORD_FILE", pw_path
+        )
+        # secrets_migrate_encryption() hardcodes the old path relative to
+        # Path.home(), which we've patched above to tmp_path — so re-point
+        # the seeded old backend to match exactly what the function expects.
+        expected_old_path = tmp_path / ".local/share/python_keyring/keyring_pass.cfg"
+        expected_old_path.parent.mkdir(parents=True, exist_ok=True)
+        self._seed_old_plaintext_backend(expected_old_path, entries)
+
+        count, mismatches = config_module.secrets_migrate_encryption()
+
+        assert mismatches == []
+        assert count == len(entries) + 1  # +1 for __index__
+
+        # Old plaintext file must be completely untouched.
+        assert expected_old_path.exists()
+
+        # New encrypted backend must actually resolve the real values.
+        from keyrings.cryptfile.cryptfile import CryptFileKeyring
+
+        password = pw_path.read_text().strip()
+        assert password  # a real password was generated
+        verify_backend = CryptFileKeyring()
+        verify_backend.file_path = str(new_path)
+        verify_backend.keyring_key = password
+        for k, v in entries.items():
+            assert verify_backend.get_password("atc", k) == v
+
+    def test_new_file_is_not_plaintext(self, tmp_path, monkeypatch):
+        import config as config_module
+
+        entries = {"secret-a": "super-secret-plaintext-value"}
+        expected_old_path = tmp_path / ".local/share/python_keyring/keyring_pass.cfg"
+        expected_old_path.parent.mkdir(parents=True, exist_ok=True)
+        self._seed_old_plaintext_backend(expected_old_path, entries)
+
+        new_path = tmp_path / "new_keyring" / "keyring_crypt.cfg"
+        pw_path = tmp_path / "pw" / "keyring.key"
+        monkeypatch.setattr(config_module.Path, "home", lambda: tmp_path)
+        monkeypatch.setattr(config_module, "_ENCRYPTED_KEYRING_FILE", new_path)
+        monkeypatch.setattr(config_module, "_ENCRYPTED_KEYRING_PASSWORD_FILE", pw_path)
+
+        count, mismatches = config_module.secrets_migrate_encryption()
+        assert mismatches == []
+        assert count > 0
+
+        raw_new_content = new_path.read_text()
+        assert "super-secret-plaintext-value" not in raw_new_content
+
+    def test_rerun_is_idempotent(self, tmp_path, monkeypatch):
+        import config as config_module
+
+        entries = {"secret-a": "value-a"}
+        expected_old_path = tmp_path / ".local/share/python_keyring/keyring_pass.cfg"
+        expected_old_path.parent.mkdir(parents=True, exist_ok=True)
+        self._seed_old_plaintext_backend(expected_old_path, entries)
+
+        new_path = tmp_path / "new_keyring" / "keyring_crypt.cfg"
+        pw_path = tmp_path / "pw" / "keyring.key"
+        monkeypatch.setattr(config_module.Path, "home", lambda: tmp_path)
+        monkeypatch.setattr(config_module, "_ENCRYPTED_KEYRING_FILE", new_path)
+        monkeypatch.setattr(config_module, "_ENCRYPTED_KEYRING_PASSWORD_FILE", pw_path)
+
+        count1, mismatches1 = config_module.secrets_migrate_encryption()
+        password_after_first_run = pw_path.read_text()
+
+        count2, mismatches2 = config_module.secrets_migrate_encryption()
+        password_after_second_run = pw_path.read_text()
+
+        assert mismatches1 == [] and mismatches2 == []
+        assert count1 == count2
+        # Re-run must not regenerate the master password.
+        assert password_after_first_run == password_after_second_run

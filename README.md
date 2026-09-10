@@ -48,6 +48,30 @@ had become the load-bearing tool for day-to-day homelab operations.
    backend error — this step (plus the `keyrings.alt` dependency already
    declared in `pyproject.toml`) is what fixes it.
 
+   **This plaintext fallback is base64-encoded, not encrypted** — anyone who
+   can read the file (or a stolen backup/disk copy of it) can decode every
+   secret trivially. If that headless box has no OS Secret Service daemon
+   available (the common case), upgrade to a real AES-256-GCM encrypted
+   backend instead:
+   ```bash
+   atc secrets migrate-encryption
+   ```
+   This reads your existing plaintext-keyring secrets (read-only, never
+   modifies that file), writes them into a new `keyrings.cryptfile` backend
+   protected by a freshly generated master password (`~/.config/atc/keyring.key`,
+   `0600`), and verifies every value byte-for-byte before reporting success.
+   `atc` auto-detects and switches to the encrypted backend on every run once
+   it exists — no further config needed. Safe to re-run. The old plaintext
+   file is left in place untouched as a fallback (delete it manually once
+   you've confirmed the new backend works, if you want it gone).
+
+   Note: this master-password-in-a-file approach protects against **cold /
+   offline theft** of the secrets file alone (stolen backup, copied disk).
+   It does **not** add protection against a live process running as your own
+   user on that box — that process can read the same password file you can.
+   For that threat model you need to restrict who/what can get shell access
+   to the box in the first place, not swap the keyring backend.
+
 5. **Create your config**:
    ```bash
    cd ~/repos/atc

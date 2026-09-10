@@ -21,6 +21,42 @@ import yaml
 KEYCHAIN_SERVICE = "atc"
 KEYCHAIN_PREFIX = "keychain:"
 
+# ── Encrypted keyring backend (optional, opt-in) ─────────────────────────────
+# On headless Linux boxes with no OS Secret Service daemon (GNOME
+# Keyring/KWallet), the `keyring` package silently falls back to
+# keyrings.alt.file.PlaintextKeyring — a base64-encoded, NOT encrypted, file.
+# If a migrated AES-256 encrypted backend + master-password file are present
+# (see migrate_atc_keyring.py), switch to that instead. This never touches
+# or requires the old plaintext file; if the encrypted backend/password
+# aren't present, `keyring` uses its normal auto-detected backend unchanged
+# (macOS Keychain, Secret Service, or the plaintext fallback).
+_ENCRYPTED_KEYRING_PASSWORD_FILE = Path.home() / ".config/atc/keyring.key"
+_ENCRYPTED_KEYRING_FILE = Path.home() / ".local/share/atc-keyring/keyring_crypt.cfg"
+
+
+def _try_use_encrypted_keyring() -> None:
+    if not (_ENCRYPTED_KEYRING_PASSWORD_FILE.exists() and _ENCRYPTED_KEYRING_FILE.exists()):
+        return
+    try:
+        from keyrings.cryptfile.cryptfile import CryptFileKeyring
+    except ImportError:
+        return
+    try:
+        password = _ENCRYPTED_KEYRING_PASSWORD_FILE.read_text().strip()
+        if not password:
+            return
+        backend = CryptFileKeyring()
+        backend.file_path = str(_ENCRYPTED_KEYRING_FILE)
+        backend.keyring_key = password
+        keyring.set_keyring(backend)
+    except Exception:
+        # Never hard-fail config loading over a keyring backend issue —
+        # fall through to whatever `keyring` auto-detected.
+        pass
+
+
+_try_use_encrypted_keyring()
+
 
 def _resolve_secret(raw_value: str, key_hint: str) -> str:
     """If raw_value is a keychain sentinel, look up (or prompt+store) the real value."""
@@ -854,6 +890,77 @@ def secret_verify(key: str, candidate: str) -> bool:
     stored_hash = hashlib.sha256(stored.encode()).digest()
     candidate_hash = hashlib.sha256(candidate.encode()).digest()
     return _hmac.compare_digest(stored_hash, candidate_hash)
+
+
+def secrets_migrate_encryption() -> tuple[int, list[str]]:
+    """Migrate all secrets from the plaintext keyring backend into a new
+    AES-256 encrypted (keyrings.cryptfile) backend.
+
+    Read-only against the old plaintext backend — never modifies or deletes
+    it. Writes to a brand-new encrypted file + a locked-down (0600) master
+    password file. Verifies every copied value byte-for-byte before
+    reporting success. Safe to re-run (skips password regeneration if the
+    password file already exists; overwrites individual keys in the new
+    backend if already migrated).
+
+    Returns (count_migrated, mismatched_keys). mismatched_keys is empty on
+    full success.
+    """
+    import os
+    import secrets as _secrets
+    import stat
+
+    old_path = Path.home() / ".local/share/python_keyring/keyring_pass.cfg"
+    if not old_path.exists():
+        return 0, []
+
+    from keyrings.alt.file import PlaintextKeyring
+
+    old_backend = PlaintextKeyring()
+    old_backend.file_path = str(old_path)
+
+    index_raw = old_backend.get_password(KEYCHAIN_SERVICE, "__index__") or ""
+    keys = sorted(k for k in index_raw.split(",") if k)
+    old_data: dict[str, str] = {}
+    for k in keys:
+        val = old_backend.get_password(KEYCHAIN_SERVICE, k)
+        if val is not None:
+            old_data[k] = val
+    if index_raw:
+        old_data["__index__"] = index_raw
+
+    if not old_data:
+        return 0, []
+
+    _ENCRYPTED_KEYRING_FILE.parent.mkdir(parents=True, exist_ok=True)
+    _ENCRYPTED_KEYRING_PASSWORD_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+    if _ENCRYPTED_KEYRING_PASSWORD_FILE.exists():
+        master_password = _ENCRYPTED_KEYRING_PASSWORD_FILE.read_text().strip()
+    else:
+        master_password = _secrets.token_urlsafe(48)
+        _ENCRYPTED_KEYRING_PASSWORD_FILE.write_text(master_password + "\n")
+        os.chmod(_ENCRYPTED_KEYRING_PASSWORD_FILE, stat.S_IRUSR | stat.S_IWUSR)
+
+    from keyrings.cryptfile.cryptfile import CryptFileKeyring
+
+    new_backend = CryptFileKeyring()
+    new_backend.file_path = str(_ENCRYPTED_KEYRING_FILE)
+    new_backend.keyring_key = master_password
+
+    for k, v in old_data.items():
+        new_backend.set_password(KEYCHAIN_SERVICE, k, v)
+
+    verify_backend = CryptFileKeyring()
+    verify_backend.file_path = str(_ENCRYPTED_KEYRING_FILE)
+    verify_backend.keyring_key = master_password
+
+    mismatches = [k for k, v in old_data.items() if verify_backend.get_password(KEYCHAIN_SERVICE, k) != v]
+    if mismatches:
+        return 0, mismatches
+
+    os.chmod(_ENCRYPTED_KEYRING_FILE, stat.S_IRUSR | stat.S_IWUSR)
+    return len(old_data), []
 
 
 def _find_keychain_refs(obj: object) -> set[str]:

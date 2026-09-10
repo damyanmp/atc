@@ -28,6 +28,7 @@ sys.path.insert(0, str(Path(__file__).parent / "lib"))
 from config import (
     Config, load_config,
     secret_set, secret_delete, secret_verify, secret_repair, secrets_scan_config, secrets_list,
+    secrets_migrate_encryption,
     save_guest_user, save_guest_update_cmd, remove_guest_update_cmd,
     KEYCHAIN_SERVICE,
 )
@@ -2231,6 +2232,30 @@ def secrets_repair_cmd(
     else:
         console.print(f"[red]✗[/] Hash did not match for [cyan]{key!r}[/] — index not updated.")
         raise typer.Exit(1)
+
+
+@secrets_app.command("migrate-encryption")
+def secrets_migrate_encryption_cmd() -> None:
+    """Migrate secrets from the plaintext keyring to an AES-256 encrypted one.
+
+    On headless Linux boxes with no OS Secret Service daemon, `keyring`
+    silently falls back to a base64-encoded (NOT encrypted) file. This
+    migrates all stored secrets into a real AES-256-GCM encrypted backend
+    (keyrings.cryptfile), protected by a locked-down (0600) master password
+    file. Read-only against the old plaintext file — never modifies or
+    deletes it. Verifies every value byte-for-byte before reporting success.
+    Safe to re-run.
+    """
+    count, mismatches = secrets_migrate_encryption()
+    if mismatches:
+        console.print(f"[red]✗ Verification failed for {len(mismatches)} key(s):[/] {mismatches}")
+        console.print("[dim]Old plaintext backend was not touched. Investigate before retrying.[/]")
+        raise typer.Exit(1)
+    if count == 0:
+        console.print("[dim]Nothing to migrate (no old plaintext keyring found, or it's empty).[/]")
+        return
+    console.print(f"[green]✓[/] Migrated and verified {count} entries to an AES-256 encrypted keyring.")
+    console.print("[dim]Old plaintext file left untouched as a fallback.[/]")
 
 
 @secrets_app.command("ls", hidden=True)

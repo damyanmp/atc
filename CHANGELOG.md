@@ -8,6 +8,15 @@ track breaking config/CLI changes.
 ## [Unreleased]
 
 ### Added
+- `atc secrets migrate-encryption` — upgrades the headless-Linux plaintext
+  (base64, not encrypted) keyring fallback to a real AES-256-GCM encrypted
+  backend (`keyrings.cryptfile`), protected by a freshly generated
+  0600-permissioned master password file. Read-only against the old
+  plaintext backend (never modified/deleted), verifies every migrated value
+  byte-for-byte, safe to re-run. `atc` auto-detects and switches to the
+  encrypted backend on every subsequent run once it exists, with no config
+  changes needed and no impact on macOS/GNOME-Keyring/KWallet setups where
+  a real OS keychain is already in use.
 - `atc init` — interactive setup wizard. Lists all 20 supported config
   sections with a checkmark for what's already configured; pick sections by
   number, `all`, or quit. Secrets are stored in the OS keychain automatically
