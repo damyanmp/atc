@@ -4060,6 +4060,9 @@ def _acars_fetch_beszel(
         if s.error:
             # fetch-level failure (network/auth), not a per-system status
             raise RuntimeError(s.error)
+        if s.status == "paused":
+            # deliberately paused monitoring in Beszel — not an incident
+            continue
         if not s.online:
             result.append({"text": f"{s.name} — {s.status}", "severity": "CRIT"})
             continue
