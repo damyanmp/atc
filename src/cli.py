@@ -43,6 +43,8 @@ from lib.pihole import (
     fetch_seen_ips_all,
 )
 from lib.unifi import fetch_clients as unifi_fetch_clients
+from lib.unifi import fetch_client_stats as unifi_fetch_client_stats
+from lib.unifi import fetch_switch_ports as unifi_fetch_switch_ports
 from lib.influxdb import write_points as influx_write_points
 from lib.nginx_proxy_manager import (
     list_proxy_hosts as npm_list_proxy_hosts,
@@ -2459,6 +2461,116 @@ def unifi_clients(
 
     _print_clients_table(clients)
     console.print(f"\n[dim]{len(clients)} connected client(s)[/]")
+
+
+@unifi_app.command("stats")
+def unifi_stats(
+    output: _Out = typer.Option(_Out.table, "-o", help="Output format: table | json"),
+    min_mbps: float = typer.Option(0.0, "--min-mbps", help="Only show clients above this combined tx+rx rate (Mbps)"),
+) -> None:
+    """Live per-client throughput (current tx/rx Mbps + link speed) from the UniFi controller.
+
+    Useful for answering "what's actually using the network right now" without SSHing
+    anywhere — the controller already tracks this per client, wired or wifi.
+    """
+    cfg = _load()
+    unifi_cfg = _unifi_cfg(cfg)
+
+    with console.status("[bold]Fetching UniFi client stats…[/]"):
+        stats = unifi_fetch_client_stats(unifi_cfg, site=unifi_cfg.site)
+
+    if min_mbps:
+        stats = [s for s in stats if (s.tx_mbps + s.rx_mbps) >= min_mbps]
+    stats = sorted(stats, key=lambda s: s.tx_mbps + s.rx_mbps, reverse=True)
+
+    if output == _Out.json:
+        console.print_json(_json.dumps([
+            {
+                "name": s.name, "ip": s.ip, "mac": s.mac, "wired": s.is_wired,
+                "link_mbps": s.link_mbps, "tx_mbps": round(s.tx_mbps, 2), "rx_mbps": round(s.rx_mbps, 2),
+                "tx_bytes_total": s.tx_bytes_total, "rx_bytes_total": s.rx_bytes_total,
+            }
+            for s in stats
+        ]))
+        return
+
+    t = Table(box=box.SIMPLE, show_header=True, pad_edge=False)
+    t.add_column("Name", style="bold", min_width=18)
+    t.add_column("IP", min_width=14)
+    t.add_column("Link", min_width=6)
+    t.add_column("Link Mbps", justify="right")
+    t.add_column("TX Mbps", justify="right")
+    t.add_column("RX Mbps", justify="right")
+
+    for s in stats:
+        link = "wired" if s.is_wired else "wifi"
+        t.add_row(
+            s.name, s.ip or "—", link,
+            str(s.link_mbps) if s.link_mbps else "—",
+            f"{s.tx_mbps:.2f}", f"{s.rx_mbps:.2f}",
+        )
+
+    console.print(t)
+    console.print(f"\n[dim]{len(stats)} client(s) shown — rates are the controller's live smoothed bytes/sec[/]")
+
+
+@unifi_app.command("ports")
+def unifi_ports(
+    output: _Out = typer.Option(_Out.table, "-o", help="Output format: table | json"),
+    device: str = typer.Option(None, "--device", help="Only show ports on this switch (name substring match)"),
+    up_only: bool = typer.Option(True, "--up-only/--all", help="Only show ports that are currently up"),
+) -> None:
+    """Live per-switch-port throughput + LAG membership.
+
+    Shows, per physical port: current tx/rx Mbps, negotiated link speed, and utilization %.
+    LAG member ports carry lag_idx/aggregate info — compare tx/rx-r between members sharing
+    the same lag_idx to see whether LACP hashing is actually spreading traffic across both
+    physical links, or dumping it all on one.
+    """
+    cfg = _load()
+    unifi_cfg = _unifi_cfg(cfg)
+
+    with console.status("[bold]Fetching UniFi switch port stats…[/]"):
+        ports = unifi_fetch_switch_ports(unifi_cfg, site=unifi_cfg.site)
+
+    if device:
+        ports = [p for p in ports if device.lower() in p.device_name.lower()]
+    if up_only:
+        ports = [p for p in ports if p.up]
+
+    if output == _Out.json:
+        console.print_json(_json.dumps([
+            {
+                "device": p.device_name, "port": p.port_idx, "name": p.port_name, "up": p.up,
+                "speed_mbps": p.speed_mbps, "tx_mbps": round(p.tx_mbps, 2), "rx_mbps": round(p.rx_mbps, 2),
+                "util_pct": round(p.util_pct, 1), "lag_member": p.lag_member, "lag_idx": p.lag_idx,
+                "aggregate_members": p.aggregate_members,
+            }
+            for p in ports
+        ]))
+        return
+
+    t = Table(box=box.SIMPLE, show_header=True, pad_edge=False)
+    t.add_column("Switch", min_width=12)
+    t.add_column("Port", min_width=8)
+    t.add_column("Speed", justify="right")
+    t.add_column("TX Mbps", justify="right")
+    t.add_column("RX Mbps", justify="right")
+    t.add_column("Util %", justify="right")
+    t.add_column("LAG", min_width=10)
+
+    for p in ports:
+        lag = f"lag{p.lag_idx}" if p.lag_member else "—"
+        if p.aggregate_members:
+            lag += f" (members: {p.aggregate_members})"
+        t.add_row(
+            p.device_name, p.port_name or str(p.port_idx),
+            f"{p.speed_mbps}M" if p.speed_mbps else "—",
+            f"{p.tx_mbps:.2f}", f"{p.rx_mbps:.2f}", f"{p.util_pct:.1f}", lag,
+        )
+
+    console.print(t)
+    console.print(f"\n[dim]{len(ports)} port(s) shown[/]")
 
 
 # ── pihole ────────────────────────────────────────────────────────────────────

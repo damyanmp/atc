@@ -209,6 +209,59 @@ class UniFiClient:
 
 
 @dataclass
+class UniFiClientStats:
+    mac: str
+    ip: str
+    name: str            # user alias, falls back to hostname
+    is_wired: bool
+    link_mbps: int        # negotiated link speed (wired only, 0 if unknown/wifi)
+    tx_bps: float          # current transmit rate, bytes/sec (client -> network)
+    rx_bps: float          # current receive rate, bytes/sec (network -> client)
+    tx_bytes_total: int    # cumulative bytes transmitted this session
+    rx_bytes_total: int    # cumulative bytes received this session
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @property
+    def tx_mbps(self) -> float:
+        return self.tx_bps * 8 / 1_000_000
+
+    @property
+    def rx_mbps(self) -> float:
+        return self.rx_bps * 8 / 1_000_000
+
+
+@dataclass
+class UniFiSwitchPort:
+    device_name: str       # switch this port belongs to
+    port_idx: int
+    port_name: str          # e.g. "Port 15", "SFP 2"
+    up: bool
+    speed_mbps: int          # negotiated link speed, 0 if down
+    tx_bps: float            # current transmit rate, bytes/sec
+    rx_bps: float            # current receive rate, bytes/sec
+    lag_member: bool         # part of a link-aggregation group
+    lag_idx: int             # LAG group index, 0 if not a member
+    aggregate_members: list  # port indices in this LAG (only set on the "primary" member)
+    aggregated_by: object    # port_idx of the primary member, or False if this IS the primary
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @property
+    def tx_mbps(self) -> float:
+        return self.tx_bps * 8 / 1_000_000
+
+    @property
+    def rx_mbps(self) -> float:
+        return self.rx_bps * 8 / 1_000_000
+
+    @property
+    def util_pct(self) -> float:
+        """Percent of negotiated link speed currently used by the busier direction."""
+        if not self.speed_mbps:
+            return 0.0
+        return max(self.tx_mbps, self.rx_mbps) / self.speed_mbps * 100
+
+
+@dataclass
 class UniFiDevice:
     name: str
     model: str
@@ -380,6 +433,69 @@ def fetch_clients(cfg: UniFiConfig, site: str = "default") -> list[UniFiClient]:
             raw=c,
         ))
     return sorted(clients, key=lambda x: (x.network, x.display_name.lower()))
+
+
+def fetch_client_stats(cfg: UniFiConfig, site: str = "default") -> list[UniFiClientStats]:
+    """Return live throughput stats (bytes/sec + cumulative totals) for every connected client.
+
+    Backed by the same stat/sta endpoint as fetch_clients() — UniFi's controller computes
+    the `-r` (rate) fields itself as a smoothed bytes/sec figure, no polling/derivation needed
+    on our end. Wired clients report under `wired-*` keys; wifi clients under bare `tx_bytes`/
+    `rx_bytes`/`tx_bytes-r`/`rx_bytes-r` — this normalizes both into one shape.
+    """
+    data = _get(cfg, f"/api/s/{site}/stat/sta")
+    out = []
+    for c in data.get("data", []):
+        is_wired = bool(c.get("is_wired", False))
+        prefix = "wired-" if is_wired else ""
+        out.append(UniFiClientStats(
+            mac=c.get("mac", ""),
+            ip=c.get("ip", ""),
+            name=c.get("name") or c.get("hostname", "") or c.get("mac", ""),
+            is_wired=is_wired,
+            link_mbps=int(c.get("wired_rate_mbps", 0) or 0) if is_wired else 0,
+            tx_bps=float(c.get(f"{prefix}tx_bytes-r", 0) or 0),
+            rx_bps=float(c.get(f"{prefix}rx_bytes-r", 0) or 0),
+            tx_bytes_total=int(c.get(f"{prefix}tx_bytes", 0) or 0),
+            rx_bytes_total=int(c.get(f"{prefix}rx_bytes", 0) or 0),
+            raw=c,
+        ))
+    return sorted(out, key=lambda x: x.name.lower())
+
+
+def fetch_switch_ports(cfg: UniFiConfig, site: str = "default") -> list[UniFiSwitchPort]:
+    """Return live per-port throughput + LAG membership for every switch's ports.
+
+    Source: stat/device port_table, same endpoint fetch_devices() uses for uptime/firmware —
+    this just pulls the per-port sub-objects instead. LAG members share a `lag_idx`; the
+    "primary" member of the pair carries `aggregate_members` (all port indices in the group)
+    and `aggregated_by = False`, while other members carry `aggregated_by = <primary port_idx>`.
+    Useful for confirming whether LACP hashing is actually spreading a flow across both
+    physical links, or dumping it all on one (visible as a large tx/rx-r gap between members
+    sharing the same lag_idx).
+    """
+    data = _get(cfg, f"/api/s/{site}/stat/device")
+    out = []
+    for d in data.get("data", []):
+        if d.get("type") != "usw":
+            continue
+        dev_name = d.get("name") or d.get("model", "")
+        for p in d.get("port_table", []):
+            out.append(UniFiSwitchPort(
+                device_name=dev_name,
+                port_idx=int(p.get("port_idx", 0) or 0),
+                port_name=p.get("name", ""),
+                up=bool(p.get("up", False)),
+                speed_mbps=int(p.get("speed", 0) or 0),
+                tx_bps=float(p.get("tx_bytes-r", 0) or 0),
+                rx_bps=float(p.get("rx_bytes-r", 0) or 0),
+                lag_member=bool(p.get("lag_member", False)),
+                lag_idx=int(p.get("lag_idx", 0) or 0),
+                aggregate_members=p.get("aggregate_members", []) or [],
+                aggregated_by=p.get("aggregated_by", False),
+                raw=p,
+            ))
+    return sorted(out, key=lambda x: (x.device_name, x.port_idx))
 
 
 def fetch_devices(cfg: UniFiConfig, site: str = "default") -> list[UniFiDevice]:
