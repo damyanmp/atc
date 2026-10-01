@@ -136,6 +136,7 @@ class ProxmoxClusterConfig:
 class GuestUpdateCmd:
     cmd: str
     headless: bool = False
+    use_sudo: bool = True   # False for user-level tools that refuse root (e.g. Homebrew)
 
 
 @dataclass
@@ -526,14 +527,18 @@ def load_config(config_path: Path | None = None) -> Config:
         with open(sidecar) as _f:
             guest_users.update(yaml.safe_load(_f) or {})
     # guest_update_cmds: optional sidecar for per-guest custom update commands
-    # Supports both plain string ("update") and dict ({cmd: ..., headless: true})
+    # Supports both plain string ("update") and dict ({cmd: ..., headless: true, use_sudo: false})
     def _parse_update_cmds(raw_dict: dict) -> dict:
         out = {}
         for name, val in raw_dict.items():
             if isinstance(val, str):
                 out[name] = GuestUpdateCmd(cmd=val)
             elif isinstance(val, dict):
-                out[name] = GuestUpdateCmd(cmd=val["cmd"], headless=bool(val.get("headless", False)))
+                out[name] = GuestUpdateCmd(
+                    cmd=val["cmd"],
+                    headless=bool(val.get("headless", False)),
+                    use_sudo=bool(val.get("use_sudo", True)),
+                )
         return out
 
     guest_update_cmds: dict[str, GuestUpdateCmd] = _parse_update_cmds(ssh_raw.get("guest_update_cmds", {}))
@@ -838,14 +843,14 @@ def save_guest_user(config_path: Path, guest_name: str, user: str) -> None:
         yaml.dump(data, f, default_flow_style=False)
 
 
-def save_guest_update_cmd(config_path: Path, guest_name: str, cmd: str, headless: bool = False) -> None:
+def save_guest_update_cmd(config_path: Path, guest_name: str, cmd: str, headless: bool = False, use_sudo: bool = True) -> None:
     """Persist a guest→update-command mapping to the guest_update_cmds.yaml sidecar file."""
     sidecar = config_path.parent / "guest_update_cmds.yaml"
     data: dict = {}
     if sidecar.exists():
         with open(sidecar) as f:
             data = yaml.safe_load(f) or {}
-    data[guest_name] = {"cmd": cmd, "headless": headless}
+    data[guest_name] = {"cmd": cmd, "headless": headless, "use_sudo": use_sudo}
     with open(sidecar, "w") as f:
         yaml.dump(data, f, default_flow_style=False)
 

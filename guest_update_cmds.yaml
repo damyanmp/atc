@@ -1,3 +1,7 @@
+hermes-host:
+  cmd: brew update && brew upgrade
+  headless: true
+  use_sudo: false
 pihole:
   cmd: pihole updatePihole --unattended
   headless: true

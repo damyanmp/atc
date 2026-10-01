@@ -101,6 +101,7 @@ class UpdateTarget:
     user: str = "root"
     update_cmd: str | None = None       # custom post-apt command
     update_cmd_headless: bool = False   # if True, stream output; if False, hand off PTY
+    update_cmd_use_sudo: bool = True    # False for user-level tools that refuse root (e.g. Homebrew)
 
 
 async def run_dry_run(

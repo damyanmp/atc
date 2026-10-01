@@ -1337,6 +1337,7 @@ def run_update_hosts(
             user=user,
             update_cmd=custom.cmd if custom else None,
             update_cmd_headless=custom.headless if custom else False,
+            update_cmd_use_sudo=custom.use_sudo if custom else True,
         ))
 
     if targets:
@@ -1553,6 +1554,7 @@ def update_set_cmd(
     guest: str = typer.Argument(..., help="Guest name (must match exactly, e.g. 'pihole')"),
     cmd: str = typer.Argument(..., help="Custom update command to run after apt (e.g. 'update')"),
     headless: bool = typer.Option(False, "--headless", help="Stream output instead of handing off a PTY"),
+    no_sudo: bool = typer.Option(False, "--no-sudo", help="Run WITHOUT sudo — required for user-level tools that refuse root (e.g. Homebrew)"),
 ) -> None:
     """Register a custom post-apt update command for a guest.
 
@@ -1563,14 +1565,21 @@ def update_set_cmd(
     Use [bold]--headless[/] when the script supports unattended mode (no TUI wizard),
     so atc streams the output inline instead of handing off the terminal.
 
+    By default the command runs via [bold]sudo[/] when the guest's SSH user isn't
+    root (matches the apt pass). Pass [bold]--no-sudo[/] for tools like Homebrew
+    that refuse to run as root/sudo — the command then runs as the guest's plain
+    SSH user instead.
+
     Example:
       [cyan]atc update set-cmd pihole "pihole updatePihole --unattended" --headless[/]
       [cyan]atc update set-cmd adguard update[/]   [dim]# interactive TUI — no flag[/]
+      [cyan]atc update set-cmd hermes-host "brew update && brew upgrade" --headless --no-sudo[/]
     """
     cfg = _load()
-    save_guest_update_cmd(cfg.config_path, guest, cmd, headless=headless)
+    save_guest_update_cmd(cfg.config_path, guest, cmd, headless=headless, use_sudo=not no_sudo)
     mode = "[green]headless[/] (streamed)" if headless else "[yellow]interactive[/] (PTY handoff)"
-    console.print(f"[green]✓[/] Saved: [cyan]{guest}[/] → [bold]{cmd}[/] ({mode})")
+    sudo_note = "[dim](no sudo)[/]" if no_sudo else "[dim](sudo if non-root user)[/]"
+    console.print(f"[green]✓[/] Saved: [cyan]{guest}[/] → [bold]{cmd}[/] ({mode}) {sudo_note}")
     console.print(f"[dim]Next [bold]atc update hosts {guest}[/bold] will run apt, then [bold]{cmd}[/bold].[/]")
 
 
@@ -1702,7 +1711,7 @@ def _confirm_and_update(targets: list[UpdateTarget], cfg: Config, yes: bool, ver
     async def _run_headless_custom(t: UpdateTarget) -> int:
         """Stream a headless custom command, return exit code."""
         cmd = f"{{ TERM=xterm-256color {t.update_cmd}; }} 2>&1; echo {_EXIT_MARKER}:$?"
-        if t.user != "root":
+        if t.user != "root" and t.update_cmd_use_sudo:
             cmd = f"sudo bash -c '{cmd}'"
         lines: list[str] = []
         async for line in stream_command(t.host, cmd, cfg.ssh, user=t.user):
