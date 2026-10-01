@@ -1,5 +1,6 @@
 hermes-host:
-  cmd: brew update && brew upgrade
+  cmd: /home/linuxbrew/.linuxbrew/bin/brew update && /home/linuxbrew/.linuxbrew/bin/brew
+    upgrade
   headless: true
   use_sudo: false
 pihole:
