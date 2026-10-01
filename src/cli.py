@@ -1687,6 +1687,7 @@ def _confirm_and_update(targets: list[UpdateTarget], cfg: Config, yes: bool, ver
                         f"  [cyan]{guest_name}[/] [dim]({target.host})[/]", total=None, status="connecting…"
                     )
                     lines2: list[str] = []
+                    short = ""
                     async for line in stream_command(target.host, _cmd_for(target), cfg.ssh, user=target.user):
                         lines2.append(line)
                         if line.startswith(_EXIT_MARKER):
@@ -1697,7 +1698,12 @@ def _confirm_and_update(targets: list[UpdateTarget], cfg: Config, yes: bool, ver
                     success = _parse_exit(lines2)
                     needs_reboot, failed_units = await _post_checks(target)
                     icon = "❌" if not success or failed_units else ("⚠️ " if needs_reboot else "✅")
-                    progress.update(htask, completed=1, total=1, status=f"{icon} done")
+                    # Pull the finished host out of the live region and print it as a
+                    # permanent scrollback line — on short terminals the live Progress
+                    # region can only render a bounded number of rows, so leaving
+                    # completed hosts stacked inside it causes them to disappear/flicker.
+                    progress.remove_task(htask)
+                    progress.console.print(f"  {icon} [cyan]{guest_name}[/] [dim]({target.host})[/] — {short if not success else 'done'}")
                     progress.advance(overall)
                     results.append((target, success, needs_reboot, failed_units, lines2))
 
@@ -1720,9 +1726,13 @@ def _confirm_and_update(targets: list[UpdateTarget], cfg: Config, yes: bool, ver
                 break
             short = line.strip()[:70]
             if short:
-                console.print(f"  [dim]{short}[/]")
                 if cprogress is not None and ctask is not None:
+                    # Live status line only — printing every line to scrollback
+                    # AND updating the live region at once is what made this look
+                    # like fast-flickering duplicate output.
                     cprogress.update(ctask, status=short)
+                else:
+                    console.print(f"  [dim]{short}[/]")
         return 0 if _parse_exit(lines) else 1
 
     if custom_targets:
@@ -1740,13 +1750,17 @@ def _confirm_and_update(targets: list[UpdateTarget], cfg: Config, yes: bool, ver
             ) as cprogress:
                 for t in headless:
                     guest_name = Text.from_markup(t.name).plain
-                    console.rule(f"[bold]{guest_name}[/] — [cyan]{t.update_cmd}[/]")
+                    cprogress.console.rule(f"[bold]{guest_name}[/] — [cyan]{t.update_cmd}[/]")
                     ctask = cprogress.add_task(f"  [cyan]{guest_name}[/]", total=None, status="connecting…")
                     rc = asyncio.run(_run_headless_custom(t, cprogress, ctask))
                     custom_results[guest_name] = rc
                     icon = "✅" if rc == 0 else "❌"
-                    cprogress.update(ctask, status=f"{icon} done")
-                    console.rule(f"{icon} [bold]{guest_name}[/] — [cyan]{t.update_cmd}[/] done")
+                    # Pull the finished host out of the live region — same reasoning
+                    # as the apt phase: a short terminal can only render a bounded
+                    # number of live rows, so stacking finished hosts inside the
+                    # Progress display causes them to disappear/flicker.
+                    cprogress.remove_task(ctask)
+                    cprogress.console.rule(f"{icon} [bold]{guest_name}[/] — [cyan]{t.update_cmd}[/] done")
 
         if interactive:
             console.print(
