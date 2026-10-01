@@ -18,7 +18,7 @@ from rich.console import Console
 from rich.table import Table
 from rich import box
 from rich.prompt import Confirm, Prompt
-from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, MofNCompleteColumn
+from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, MofNCompleteColumn, TimeElapsedColumn, TaskID
 from rich.text import Text
 from rich.markup import escape as rich_escape
 
@@ -1708,7 +1708,7 @@ def _confirm_and_update(targets: list[UpdateTarget], cfg: Config, yes: bool, ver
     custom_results: dict[str, int] = {}
     custom_targets = [t for t in targets if t.update_cmd]
 
-    async def _run_headless_custom(t: UpdateTarget) -> int:
+    async def _run_headless_custom(t: UpdateTarget, cprogress: Progress | None = None, ctask: TaskID | None = None) -> int:
         """Stream a headless custom command, return exit code."""
         cmd = f"{{ TERM=xterm-256color {t.update_cmd}; }} 2>&1; echo {_EXIT_MARKER}:$?"
         if t.user != "root" and t.update_cmd_use_sudo:
@@ -1721,6 +1721,8 @@ def _confirm_and_update(targets: list[UpdateTarget], cfg: Config, yes: bool, ver
             short = line.strip()[:70]
             if short:
                 console.print(f"  [dim]{short}[/]")
+                if cprogress is not None and ctask is not None:
+                    cprogress.update(ctask, status=short)
         return 0 if _parse_exit(lines) else 1
 
     if custom_targets:
@@ -1729,13 +1731,22 @@ def _confirm_and_update(targets: list[UpdateTarget], cfg: Config, yes: bool, ver
 
         if headless:
             console.print(f"\n[bold]Running headless custom update(s) on {len(headless)} host(s)…[/bold]")
-            for t in headless:
-                guest_name = Text.from_markup(t.name).plain
-                console.rule(f"[bold]{guest_name}[/] — [cyan]{t.update_cmd}[/]")
-                rc = asyncio.run(_run_headless_custom(t))
-                custom_results[guest_name] = rc
-                icon = "✅" if rc == 0 else "❌"
-                console.rule(f"{icon} [bold]{guest_name}[/] — [cyan]{t.update_cmd}[/] done")
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                TimeElapsedColumn(),
+                TextColumn("[dim]{task.fields[status]}"),
+                console=console,
+            ) as cprogress:
+                for t in headless:
+                    guest_name = Text.from_markup(t.name).plain
+                    console.rule(f"[bold]{guest_name}[/] — [cyan]{t.update_cmd}[/]")
+                    ctask = cprogress.add_task(f"  [cyan]{guest_name}[/]", total=None, status="connecting…")
+                    rc = asyncio.run(_run_headless_custom(t, cprogress, ctask))
+                    custom_results[guest_name] = rc
+                    icon = "✅" if rc == 0 else "❌"
+                    cprogress.update(ctask, status=f"{icon} done")
+                    console.rule(f"{icon} [bold]{guest_name}[/] — [cyan]{t.update_cmd}[/] done")
 
         if interactive:
             console.print(
