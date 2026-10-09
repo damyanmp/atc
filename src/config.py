@@ -481,14 +481,22 @@ class Config:
     unifi: UniFiConfig | None = None
     blackbox: BlackboxConfig = field(default_factory=BlackboxConfig)
     docker_hub: DockerHubConfig | None = None
-    scripts_dir: str = "../../"
+    scripts_dir: str | None = None
     refresh_interval: int = 30
     config_path: Path = field(default_factory=Path)
 
     @property
     def resolved_scripts_dir(self) -> Path:
+        # No scripts_dir configured: default to a `scripts/` folder next to
+        # config.yaml rather than walking up into sibling repos (the old
+        # "../../" default was only correct back when atc lived nested
+        # inside pentagon-management; after the 2026-09-08 repo split it
+        # silently resolved to ~/repos and scanned every sibling checkout).
         base = self.config_path.parent if self.config_path else Path.cwd()
-        return (base / self.scripts_dir).resolve()
+        if not self.scripts_dir:
+            return (base / "scripts").resolve()
+        raw = Path(self.scripts_dir).expanduser()
+        return raw.resolve() if raw.is_absolute() else (base / raw).resolve()
 
 
 # ── Loader ────────────────────────────────────────────────────────────────────
@@ -823,7 +831,7 @@ def load_config(config_path: Path | None = None) -> Config:
         unifi=unifi,
         blackbox=blackbox,
         docker_hub=docker_hub,
-        scripts_dir=raw.get("scripts_dir", "../../"),
+        scripts_dir=raw.get("scripts_dir"),
         refresh_interval=int(raw.get("refresh_interval", 30)),
         config_path=config_path.resolve(),
     )
