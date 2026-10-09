@@ -4103,9 +4103,24 @@ def _acars_fetch_prometheus(cfg) -> list[dict]:
 _ACARS_LOG_WINDOW_MINUTES = 15  # "current", not historical — see atc blackbox for the deep dump
 
 
+_ACARS_PORT_LINKDOWN_WARN = 3   # cumulative since switch boot — a handful is normal churn
+_ACARS_PORT_LINKDOWN_CRIT = 8   # this many flaps points at a flaky link/NIC, not routine churn
+
+
 def _acars_fetch_unifi(cfg) -> list[dict]:
-    """Devices offline, or rebooted/firmware-updated in the last _ACARS_LOG_WINDOW_MINUTES.
-    Returns [{text, severity}], raises on error."""
+    """Devices offline/rebooted/firmware-updated, plus per-port link-flap and error
+    counters on switches. Returns [{text, severity}], raises on error.
+
+    Port counters (link_down_count, rx_errors, tx_errors) are cumulative since the
+    switch's own last boot, not windowed like the device-reboot check above — there is
+    no delta/reset endpoint, so a count found here can reflect an old event, not
+    something that just happened. Still useful as a standing signal: a port with
+    many link-down events or any hardware error count is worth a look, and this is
+    exactly the kind of switch-side symptom (e.g. a flapping host NIC) that otherwise
+    only surfaces via manual `atc unifi` digging after the fact — see 2026-10-09
+    gripen incident, where Ramstein port 14 (gripen's uplink) logged 9 link-down
+    events during the node's hang and acars said nothing about it.
+    """
     import time
     from lib.unifi import fetch_devices
 
@@ -4119,14 +4134,40 @@ def _acars_fetch_unifi(cfg) -> list[dict]:
             continue
 
         boot_time = now - d.uptime if d.uptime else d.startup_timestamp
-        if not boot_time or boot_time < since:
+        if boot_time and boot_time >= since:
+            mins_ago = max(0, (now - boot_time) // 60)
+            if d.previous_firmware_version and d.previous_firmware_version != d.version:
+                text = f"{d.name} ({d.model}) firmware {d.previous_firmware_version} → {d.version}, rebooted {mins_ago}m ago"
+            else:
+                text = f"{d.name} ({d.model}) rebooted {mins_ago}m ago"
+            result.append({"text": text, "severity": "WARN"})
+
+        if d.type != "usw":
             continue
-        mins_ago = max(0, (now - boot_time) // 60)
-        if d.previous_firmware_version and d.previous_firmware_version != d.version:
-            text = f"{d.name} ({d.model}) firmware {d.previous_firmware_version} → {d.version}, rebooted {mins_ago}m ago"
-        else:
-            text = f"{d.name} ({d.model}) rebooted {mins_ago}m ago"
-        result.append({"text": text, "severity": "WARN"})
+        for p in (d.raw or {}).get("port_table", []):
+            if not p.get("enable", True) or not p.get("up", False):
+                continue
+            link_down = int(p.get("link_down_count", 0) or 0)
+            rx_err = int(p.get("rx_errors", 0) or 0)
+            tx_err = int(p.get("tx_errors", 0) or 0)
+            port_name = p.get("name") or f"Port {p.get('port_idx')}"
+            port_label = f"{d.name} {port_name}"
+
+            if rx_err or tx_err:
+                result.append({
+                    "text": f"{port_label} — rx_errors={rx_err} tx_errors={tx_err} (cumulative since switch boot)",
+                    "severity": "CRIT",
+                })
+            if link_down >= _ACARS_PORT_LINKDOWN_CRIT:
+                result.append({
+                    "text": f"{port_label} — {link_down} link-down events (cumulative since switch boot, flaky link/NIC on connected device)",
+                    "severity": "CRIT",
+                })
+            elif link_down >= _ACARS_PORT_LINKDOWN_WARN:
+                result.append({
+                    "text": f"{port_label} — {link_down} link-down events (cumulative since switch boot)",
+                    "severity": "WARN",
+                })
 
     return result
 
