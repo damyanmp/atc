@@ -16,8 +16,11 @@
 
 # ── General ───────────────────────────────────────────────────────────────────
 
-# Path to scan for *.sh scripts (relative to this config file's directory).
-scripts_dir: "../../"
+# Folder atc scans for *.sh scripts to run via `atc run`.
+# Leave unset to default to a `scripts/` folder next to this config file.
+# Set an absolute path to point anywhere on disk — easiest via:
+#   atc run set-dir /path/to/scripts
+# scripts_dir: "/home/dmp/repos/pentagon-management/infrastructure/cli"
 
 # Dashboard auto-refresh interval in seconds.
 refresh_interval: 30

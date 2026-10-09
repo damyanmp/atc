@@ -2166,12 +2166,39 @@ def backup_run(
 
 @app.command("run")
 def run_script(
-    name: str | None = typer.Argument(None, help="Script name or partial path. Omit to list all."),
+    name: str | None = typer.Argument(
+        None, help="Script name/partial path, or 'set-dir'/'show-dir'. Omit to list all."
+    ),
+    path_arg: str | None = typer.Argument(
+        None, help="Folder path — only used with 'set-dir'."
+    ),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Run with bash -v (echo each command)"),
 ) -> None:
-    """Run a script from the repo. Omit NAME to list available scripts."""
+    """Run a script from the configured scripts folder.
+
+    Omit NAME to list available scripts. `atc run set-dir PATH` points atc at
+    any folder on disk; `atc run show-dir` prints the folder currently in use.
+    """
+    if name == "set-dir":
+        if not path_arg:
+            console.print("[red]Usage:[/] atc run set-dir /path/to/scripts")
+            raise typer.Exit(1)
+        _run_set_dir(path_arg)
+        return
+
+    if name == "show-dir":
+        _run_show_dir()
+        return
+
     cfg = _load()
     scripts_dir = cfg.resolved_scripts_dir
+    if not scripts_dir.is_dir():
+        console.print(f"[red]Scripts folder not found:[/] {scripts_dir}")
+        console.print(
+            "Set one with [bold]atc run set-dir /path/to/scripts[/] "
+            "(see [bold]atc run show-dir[/] for the current value)."
+        )
+        raise typer.Exit(1)
     scripts = _find_scripts(scripts_dir)
 
     if not name:
@@ -2204,6 +2231,38 @@ def run_script(
     if result.returncode != 0:
         console.print(f"\n[red]Exit code: {result.returncode}[/]")
         raise typer.Exit(result.returncode)
+
+
+def _run_set_dir(path_str: str) -> None:
+    """Point `atc run` at a folder on disk — writes scripts_dir to config.yaml."""
+    import yaml as _yaml
+
+    resolved = Path(path_str).expanduser().resolve()
+    if not resolved.is_dir():
+        console.print(f"[red]Not a directory:[/] {resolved}")
+        raise typer.Exit(1)
+
+    cfg_path = Path(__file__).parent.parent / "config.yaml"
+    existing: dict = {}
+    if cfg_path.exists():
+        with open(cfg_path) as f:
+            existing = _yaml.safe_load(f) or {}
+
+    # Store as an absolute path — no ambiguity about what it's relative to,
+    # unlike the old repo-relative "../../" default.
+    existing["scripts_dir"] = str(resolved)
+    with open(cfg_path, "w") as f:
+        _yaml.dump(existing, f, sort_keys=False, default_flow_style=False)
+
+    console.print(f"[green]✓[/] scripts_dir set to [cyan]{resolved}[/] ({cfg_path})")
+
+
+def _run_show_dir() -> None:
+    """Show the folder `atc run` currently scans for scripts."""
+    cfg = _load()
+    scripts_dir = cfg.resolved_scripts_dir
+    exists = "" if scripts_dir.is_dir() else "  [red](does not exist)[/]"
+    console.print(f"{scripts_dir}{exists}")
 
 
 def _list_scripts(scripts: list[Path], scripts_dir: Path) -> None:
