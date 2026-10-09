@@ -31,6 +31,26 @@ import httpx
 from config import BeszelConfig
 
 
+async def _resolve_token(cfg: BeszelConfig, client: httpx.AsyncClient) -> str:
+    """Get a bearer token for this call.
+
+    Prefers minting a fresh one via PocketBase's auth-with-password using
+    stored email+password — this never expires because a new token is
+    obtained on every single call, so there's nothing sitting around to go
+    stale. Falls back to the legacy static api_key (a pre-generated JWT that
+    WILL eventually expire) only if no login creds are configured.
+    """
+    if cfg.has_login:
+        resp = await client.post(
+            f"{cfg.base_url}/api/collections/users/auth-with-password",
+            json={"identity": cfg.email, "password": cfg.password},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        return resp.json()["token"]
+    return cfg.api_key
+
+
 @dataclass
 class BeszelSystem:
     name: str
@@ -66,9 +86,10 @@ async def fetch_systems(cfg: BeszelConfig) -> list[BeszelSystem]:
     """Fetch all systems from the Beszel hub API."""
     try:
         async with httpx.AsyncClient(verify=cfg.verify_ssl) as client:
+            token = await _resolve_token(cfg, client)
             resp = await client.get(
                 f"{cfg.base_url}/api/collections/systems/records",
-                headers={"Authorization": f"Bearer {cfg.api_key}"},
+                headers={"Authorization": f"Bearer {token}"},
                 params={"perPage": 500},
                 timeout=10,
             )
@@ -111,9 +132,10 @@ async def fetch_raw_info(cfg: BeszelConfig) -> list[dict]:
     """Return the raw `info` dict per system — use this to discover available fields."""
     try:
         async with httpx.AsyncClient(verify=cfg.verify_ssl) as client:
+            token = await _resolve_token(cfg, client)
             resp = await client.get(
                 f"{cfg.base_url}/api/collections/systems/records",
-                headers={"Authorization": f"Bearer {cfg.api_key}"},
+                headers={"Authorization": f"Bearer {token}"},
                 params={"perPage": 500},
                 timeout=10,
             )

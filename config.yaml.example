@@ -68,11 +68,19 @@ ssh:
 beszel:
   # Beszel hub — lightweight host monitoring (CPU, memory, disk).
   # Replaces per-service health checks for non-Proxmox hosts (NAS, Docker hosts, etc.)
-  # Generate an API key: Beszel UI → Settings → API Keys → Create
   host: beszel.local.example.com
   port: 443
   https: true
-  api_key: keychain:beszel-api-key   # ← stored in keychain
+  # Preferred: your Beszel login. atc mints a fresh PocketBase auth token on
+  # every single API call instead of reusing one saved token — since nothing
+  # is cached, there's no stale/expired token to ever regenerate by hand.
+  email: keychain:beszel-email        # ← stored in keychain
+  password: keychain:beszel-password  # ← stored in keychain
+  # Legacy alternative: a pre-generated static JWT (Beszel UI → Settings →
+  # API Keys → Create). WILL expire periodically and has to be regenerated
+  # by hand when it does — only use this if you don't want atc to hold your
+  # Beszel login. Leave blank/omit if using email+password above.
+  # api_key: keychain:beszel-api-key
   verify_ssl: false
 
 # ── Network ───────────────────────────────────────────────────────────────────

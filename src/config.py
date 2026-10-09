@@ -168,7 +168,9 @@ class SSHConfig:
 @dataclass
 class BeszelConfig:
     host: str
-    api_key: str
+    api_key: str = ""     # legacy fallback: a pre-generated, finite-lived JWT
+    email: str = ""        # preferred: user login — a fresh token is minted per call
+    password: str = ""     # preferred: user login password
     port: int = 443
     https: bool = True
     verify_ssl: bool = False
@@ -177,6 +179,10 @@ class BeszelConfig:
     def base_url(self) -> str:
         scheme = "https" if self.https else "http"
         return f"{scheme}://{self.host}:{self.port}"
+
+    @property
+    def has_login(self) -> bool:
+        return bool(self.email and self.password)
 
 
 # ── Network ───────────────────────────────────────────────────────────────────
@@ -572,9 +578,16 @@ def load_config(config_path: Path | None = None) -> Config:
             host=bz["host"],
             port=int(bz.get("port", 443)),
             https=bool(bz.get("https", True)),
-            api_key=_resolve_secret(bz["api_key"], "beszel/api_key"),
+            api_key=_resolve_secret(bz["api_key"], "beszel/api_key") if bz.get("api_key") else "",
+            email=_resolve_secret(bz["email"], "beszel/email") if bz.get("email") else "",
+            password=_resolve_secret(bz["password"], "beszel/password") if bz.get("password") else "",
             verify_ssl=bool(bz.get("verify_ssl", False)),
         )
+        if not beszel.has_login and not beszel.api_key:
+            raise ValueError(
+                "beszel config needs either 'email'+'password' (preferred — atc mints "
+                "a fresh token on every call, nothing to rotate) or a legacy 'api_key'."
+            )
 
     # Pi-hole
     pihole_instances: list[PiholeInstanceConfig] = []
