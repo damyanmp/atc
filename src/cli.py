@@ -3660,7 +3660,7 @@ def ha_update(
 # ── certs ─────────────────────────────────────────────────────────────────────
 
 certs_app = typer.Typer(
-    help="Show TLS certificate expiry, or deploy a fresh cert to Pi-hole instances.",
+    help="Show TLS certificate expiry for all configured endpoints.",
     no_args_is_help=False,
     rich_markup_mode="rich",
 )
