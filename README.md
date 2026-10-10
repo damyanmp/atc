@@ -4,8 +4,23 @@ Homelab CLI for Proxmox, VMs, LXCs, Home Assistant, and the surrounding
 service stack (Portainer, Pi-hole, UniFi, Plex, Seerr, Grafana/Prometheus,
 Radarr/Sonarr, etc).
 
-Extracted from `pentagon-management` (2026-09-08) into its own repo since it
-had become the load-bearing tool for day-to-day homelab operations.
+## Why this exists
+
+Running a homelab with a dozen-plus services across Proxmox, Docker, and a
+few bare-metal boxes means the same handful of questions come up constantly
+— "is everything up?", "which node is this VM on?", "is this cert about to
+expire?", "what's using all the bandwidth?" — each normally answered by
+opening a different web UI, or SSHing in and remembering a different
+command for each service. `atc` collapses all of that into one CLI (and an
+optional TUI): one alert digest (`atc acars`) that correlates monitoring,
+TLS expiry, and device health across every integration in a single call
+instead of checking ten dashboards one at a time; one place secrets live
+(OS keychain, never plaintext); one command shape across wildly different
+services (Proxmox, Pi-hole, UniFi, Plex, Radarr/Sonarr, Grafana...) instead
+of a different mental model per vendor. It's built for one specific
+homelab, but the integration clients, config-driven design, and
+keychain-backed secrets handling generalize to anyone running a similar
+mixed Proxmox/Docker/service-stack setup.
 
 ## Install
 
@@ -187,6 +202,6 @@ A few standalone utilities live at the repo root, separate from the main
   --unattended`). Edit directly; not templated from `config.yaml.example`.
 
 Obsidian vault sync (`sync_vault.py`, `obsidian_decrypt.py`) and the
-Mac Keychain→host secret sync helper (`atc-sync-secrets.sh`) live in
-`pentagon-management/infrastructure/cli/` — they're homelab-specific
-automation, not part of the `atc` CLI itself.
+Mac Keychain→host secret sync helper (`atc-sync-secrets.sh`) live in a
+separate private automation repo — they're homelab-specific automation,
+not part of the `atc` CLI itself.
