@@ -7781,176 +7781,25 @@ def launch_tui() -> None:
 
 
 # ── quick (ad hoc file/page hosting) ────────────────────────────────────────
-# One standing Python static-file stack ("quick") on docker-1 serving
-# quick.local.damyanpetkov.com via NPM + the existing *.local.damyanpetkov.com
-# wildcard cert. `atc quick publish` tars a local file/dir and PUTs it into the
-# running container via the Docker Engine API (proxied through Portainer) —
-# no SSH needed for routine use. https://quick.local.damyanpetkov.com/directory
-# is a small built-in web UI to browse and delete published pages.
+# One standing stack ("quick") on docker-1 serving quick.local.damyanpetkov.com
+# via NPM + the existing *.local.damyanpetkov.com wildcard cert.
+# `atc quick publish` tars a local file/dir and PUTs it into the running
+# container via the Docker Engine API (proxied through Portainer) — no SSH
+# needed for routine use. https://quick.local.damyanpetkov.com/directory is a
+# built-in web UI to browse and delete published pages.
 #
-# Uses a tiny stdlib-only Python HTTP server instead of nginx (baked into the
-# image via `command`) so the /directory admin UI can be self-hosted without
-# a custom Docker image build. The server script itself is delivered into the
-# named volume via the same upload_to_container tar-PUT path `publish` uses —
-# the container's startup command waits for it to appear rather than trying
-# to embed the script inline in the compose command (avoids YAML/shell/python
-# triple-quoting hell).
+# The server itself (stdlib-only Python, no deps) lives in its own repo,
+# https://github.com/damyanmp/quick-site, and is baked into a prebuilt image
+# at ghcr.io/damyanmp/quick-site:latest (private GHCR, same manually-deployed
+# pattern as peppermint — Watchtower can't auto-pull it, so a new release
+# needs `cd quick-site && ./scripts/release.sh` then `atc quick bootstrap`
+# again to roll it out). This CLI only owns the deploy (stack/DNS/NPM), not
+# the server code.
 
 QUICK_STACK_NAME = "quick"
 QUICK_DOMAIN = "quick.local.damyanpetkov.com"
 QUICK_SERVE_ROOT = "/data"
-QUICK_CONTROL_DIR = ".control"
-QUICK_SERVER_SCRIPT_NAME = "server.py"
-
-_QUICK_SERVER_SCRIPT = '''\
-import html
-import http.server
-import os
-import shutil
-import socketserver
-import urllib.parse
-
-ROOT = "/data"
-CONTROL_DIR = ".control"
-PORT = 80
-
-
-def _entries():
-    out = []
-    for name in sorted(os.listdir(ROOT)):
-        if name == CONTROL_DIR or name.startswith("."):
-            continue
-        full = os.path.join(ROOT, name)
-        is_dir = os.path.isdir(full)
-        size = 0
-        try:
-            if is_dir:
-                for dp, _dn, fn in os.walk(full):
-                    for f in fn:
-                        try:
-                            size += os.path.getsize(os.path.join(dp, f))
-                        except OSError:
-                            pass
-            else:
-                size = os.path.getsize(full)
-        except OSError:
-            pass
-        out.append((name, is_dir, size))
-    return out
-
-
-def _fmt_size(n):
-    for unit in ("B", "KB", "MB", "GB"):
-        if n < 1024:
-            return f"{n:.0f}{unit}" if unit == "B" else f"{n:.1f}{unit}"
-        n /= 1024
-    return f"{n:.1f}TB"
-
-
-def _render_directory_page(message=""):
-    rows = []
-    for name, is_dir, size in _entries():
-        url = f"/{name}/" if is_dir else f"/{name}"
-        rows.append(
-            f'<tr><td><input type="checkbox" name="selected" value="{html.escape(name)}"></td>'
-            f'<td><a href="{html.escape(url)}" target="_blank">{html.escape(name)}</a></td>'
-            f'<td>{_fmt_size(size)}</td></tr>'
-        )
-    rows_html = "\\n".join(rows) if rows else '<tr><td colspan="3"><em>Nothing published yet.</em></td></tr>'
-    msg_html = f'<p class="msg">{html.escape(message)}</p>' if message else ""
-    return f"""<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>quick — directory</title>
-<style>
-body {{ font-family: system-ui, sans-serif; background:#0f172a; color:#e2e8f0; padding:2rem; max-width:720px; margin:0 auto; }}
-h1 {{ font-size:1.25rem; }}
-table {{ width:100%; border-collapse:collapse; margin-top:1rem; }}
-td, th {{ padding:0.5rem; border-bottom:1px solid #334155; text-align:left; }}
-a {{ color:#22d3ee; text-decoration:none; }}
-a:hover {{ text-decoration:underline; }}
-button {{ background:#dc2626; color:white; border:none; padding:0.5rem 1rem; border-radius:0.375rem; cursor:pointer; margin-top:1rem; }}
-button:hover {{ background:#b91c1c; }}
-.msg {{ color:#4ade80; }}
-</style></head>
-<body>
-<h1>quick.local.damyanpetkov.com — published pages</h1>
-{msg_html}
-<form method="POST" action="/directory" onsubmit="return confirm('Delete the selected item(s)? This cannot be undone.');">
-<table>
-<tr><th></th><th>Name</th><th>Size</th></tr>
-{rows_html}
-</table>
-<button type="submit">Delete selected</button>
-</form>
-</body></html>"""
-
-
-class Handler(http.server.SimpleHTTPRequestHandler):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, directory=ROOT, **kwargs)
-
-    def log_message(self, fmt, *args):
-        pass
-
-    def do_GET(self):
-        path = urllib.parse.urlsplit(self.path).path
-        if path in ("/directory", "/directory/"):
-            body = _render_directory_page().encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-            return
-        if path.startswith(f"/{CONTROL_DIR}"):
-            self.send_error(404)
-            return
-        super().do_GET()
-
-    def do_POST(self):
-        path = urllib.parse.urlsplit(self.path).path
-        if path != "/directory":
-            self.send_error(404)
-            return
-        length = int(self.headers.get("Content-Length", 0))
-        body = self.rfile.read(length).decode("utf-8")
-        selected = urllib.parse.parse_qs(body).get("selected", [])
-        deleted, errors = [], []
-        for name in selected:
-            # Reject anything that isn't a plain top-level child of ROOT.
-            if not name or "/" in name or ".." in name or name.startswith("."):
-                errors.append(name)
-                continue
-            full = os.path.join(ROOT, name)
-            if not os.path.abspath(full).startswith(os.path.abspath(ROOT) + os.sep):
-                errors.append(name)
-                continue
-            try:
-                if os.path.isdir(full):
-                    shutil.rmtree(full)
-                elif os.path.exists(full):
-                    os.remove(full)
-                deleted.append(name)
-            except OSError as e:
-                errors.append(f"{name} ({e})")
-
-        msg_parts = []
-        if deleted:
-            msg_parts.append(f"Deleted: {', '.join(deleted)}")
-        if errors:
-            msg_parts.append(f"Failed: {', '.join(errors)}")
-        body = _render_directory_page(" — ".join(msg_parts)).encode("utf-8")
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-
-if __name__ == "__main__":
-    with socketserver.ThreadingTCPServer(("", PORT), Handler) as httpd:
-        httpd.allow_reuse_address = True
-        httpd.serve_forever()
-'''
+QUICK_IMAGE = "ghcr.io/damyanmp/quick-site:latest"
 
 quick_app = typer.Typer(
     help="Publish quick throwaway files/pages to https://quick.local.damyanpetkov.com",
@@ -7961,23 +7810,15 @@ app.add_typer(quick_app, name="quick")
 
 
 def _quick_compose() -> str:
-    control = f"{QUICK_SERVE_ROOT}/{QUICK_CONTROL_DIR}/{QUICK_SERVER_SCRIPT_NAME}"
-    wait_and_run = (
-        f"while [ ! -f {control} ]; do sleep 1; done; exec python3 {control}"
-    )
     return (
         "services:\n"
         "  quick:\n"
-        "    image: python:3.12-alpine\n"
+        f"    image: {QUICK_IMAGE}\n"
         "    restart: unless-stopped\n"
         "    networks:\n"
         "      - npm_network\n"
         "    volumes:\n"
         f"      - quick_data:{QUICK_SERVE_ROOT}\n"
-        "    command:\n"
-        "      - sh\n"
-        "      - -c\n"
-        f"      - \"{wait_and_run}\"\n"
         "networks:\n"
         "  npm_network:\n"
         "    external: true\n"
@@ -7995,9 +7836,11 @@ def quick_bootstrap(
     """Set up (or upgrade) the 'quick' stack, Pi-hole A record, and NPM proxy host.
 
     Safe to re-run — each step checks for an existing resource first, and the
-    stack itself is always redeployed with the current compose content (picks
-    up e.g. an image change like the nginx→python server swap) via the same
-    update_stack Env-preserving safety path 'atc docker compose up' uses.
+    stack itself is always redeployed with the current compose content, which
+    always pulls ghcr.io/damyanmp/quick-site:latest (via the same update_stack
+    Env-preserving safety path 'atc docker compose up' uses). Run this again
+    after a fresh `./scripts/release.sh` in the quick-site repo to roll out a
+    new image.
     """
     cfg = _load()
     pt_cfg = _require_portainer(cfg)
@@ -8005,8 +7848,8 @@ def quick_bootstrap(
     primary_pihole = _pihole_primary(cfg)
 
     from lib.portainer import (
-        fetch_environments, fetch_stacks, fetch_containers,
-        create_stack, update_stack, upload_to_container,
+        fetch_environments, fetch_stacks,
+        create_stack, update_stack,
     )
 
     with console.status("[bold]Resolving target environment…[/]"):
@@ -8029,13 +7872,12 @@ def quick_bootstrap(
     )
 
     console.print(f"[bold]Plan for '{QUICK_STACK_NAME}' on {env.name}:[/]")
-    console.print(f"  1. Stack '{QUICK_STACK_NAME}' (python:3.12-alpine + named volume) — "
+    console.print(f"  1. Stack '{QUICK_STACK_NAME}' ({QUICK_IMAGE} + named volume) — "
                    f"{'[green]update[/]' if existing_stack else '[green]create[/]'}")
     console.print(f"  2. Pi-hole A record {QUICK_DOMAIN} → {docker1_ip} — "
                    f"{'[dim]already exists, skip[/]' if existing_dns else '[green]create[/]'}")
     console.print(f"  3. NPM proxy host {QUICK_DOMAIN} → quick:80 (cert #12, ssl-forced) — "
                    f"{'[dim]already exists, skip[/]' if existing_npm else '[green]create[/]'}")
-    console.print(f"  4. Directory/delete admin UI at https://{QUICK_DOMAIN}/directory — [green]install/refresh[/]")
 
     if dry_run:
         return
@@ -8072,47 +7914,13 @@ def quick_bootstrap(
     else:
         console.print(f"[dim]✓ NPM proxy host already exists (#{existing_npm.id})[/]")
 
-    # Upload the admin server script into the container's control dir. The
-    # container's own startup command polls for this file and (re)execs into
-    # it once present, so this also covers first boot after a fresh create.
-    with console.status("[bold]Waiting for container and installing directory UI…[/]"):
-        import io
-        import tarfile
-        import time
-
-        quick_container = None
-        for _ in range(30):
-            containers = fetch_containers(pt_cfg, env.id, env.name, all_containers=False)
-            quick_container = next((c for c in containers if c.name.startswith(QUICK_STACK_NAME)), None)
-            if quick_container:
-                break
-            time.sleep(1)
-        if not quick_container:
-            console.print(f"[red]✗[/] 'quick' container never came up on {env.name} — check `atc docker logs quick`.")
-            raise typer.Exit(1)
-
-        buf = io.BytesIO()
-        with tarfile.open(fileobj=buf, mode="w") as tar:
-            info = tarfile.TarInfo(name=f"{QUICK_CONTROL_DIR}/{QUICK_SERVER_SCRIPT_NAME}")
-            data = _QUICK_SERVER_SCRIPT.encode("utf-8")
-            info.size = len(data)
-            tar.addfile(info, io.BytesIO(data))
-        # Upload relative to the serve root (which always exists as the volume
-        # mount point) rather than QUICK_SERVE_ROOT/QUICK_CONTROL_DIR directly —
-        # Docker's archive-upload endpoint requires the destination path to
-        # already exist, and .control won't on a first-ever bootstrap.
-        upload_to_container(
-            pt_cfg, env.id, quick_container.id, buf.getvalue(), QUICK_SERVE_ROOT,
-        )
-    console.print("[green]✓[/] Directory UI installed.")
-
     console.print(
         f"\n[bold green]Ready.[/] Publish with: [cyan]atc quick publish <file_or_dir>[/]\n"
         f"Browse/delete at: [cyan]https://{QUICK_DOMAIN}/directory[/]"
     )
 
 
-_QUICK_RESERVED_SLUGS = {"directory", QUICK_CONTROL_DIR.lstrip(".")}
+_QUICK_RESERVED_SLUGS = {"directory"}
 
 
 @quick_app.command("publish")
