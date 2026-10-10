@@ -1,5 +1,8 @@
 # atc — Air Traffic Control config
-# Copy to config.yaml and fill in your values.
+# Recommended: put this file at ~/.config/atc/config.yaml (outside any git
+# working tree) instead of next to this script — gitignored still means the
+# file sits inside a repo folder, one `git add -A`/misconfigured .gitignore
+# away from being tracked. Override the location entirely with $ATC_CONFIG.
 # config.yaml is gitignored — never commit it.
 #
 # ── Secrets ──────────────────────────────────────────────────────────────────
@@ -20,7 +23,7 @@
 # Leave unset to default to a `scripts/` folder next to this config file.
 # Set an absolute path to point anywhere on disk — easiest via:
 #   atc run set-dir /path/to/scripts
-# scripts_dir: "/home/dmp/repos/pentagon-management/infrastructure/cli"
+# scripts_dir: "/path/to/your/scripts"
 
 # Dashboard auto-refresh interval in seconds.
 refresh_interval: 30

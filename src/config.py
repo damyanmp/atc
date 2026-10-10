@@ -507,10 +507,33 @@ class Config:
 
 # ── Loader ────────────────────────────────────────────────────────────────────
 
+def default_config_path() -> Path:
+    """Resolve where config.yaml lives when no --config is given.
+
+    Order: $ATC_CONFIG (explicit full path) > XDG config dir
+    (~/.config/atc/config.yaml) > legacy repo-root config.yaml (back-compat
+    for existing installs that haven't moved their file yet). The repo-root
+    location sits inside a git working tree even though it's gitignored —
+    moving real IPs/hostnames to the XDG path keeps them off disk anywhere
+    `git add -A`/misconfigured .gitignore could ever reach them.
+    """
+    import os
+
+    env_path = os.environ.get("ATC_CONFIG")
+    if env_path:
+        return Path(env_path).expanduser()
+
+    xdg_path = Path(os.environ.get("XDG_CONFIG_HOME", "~/.config")).expanduser() / "atc" / "config.yaml"
+    if xdg_path.exists():
+        return xdg_path
+
+    return Path(__file__).parent.parent / "config.yaml"
+
+
 def load_config(config_path: Path | None = None) -> Config:
     """Load config.yaml, resolving any keychain:* secret sentinels."""
     if config_path is None:
-        config_path = Path(__file__).parent.parent / "config.yaml"
+        config_path = default_config_path()
 
     if not config_path.exists():
         raise FileNotFoundError(
@@ -1136,7 +1159,7 @@ def secrets_scan_config(config_path: Path | None = None) -> tuple[list[str], lis
       missing  — keys referenced in config.yaml but not yet stored in the keychain
     """
     if config_path is None:
-        config_path = Path(__file__).parent.parent / "config.yaml"
+        config_path = default_config_path()
 
     with open(config_path) as f:
         data = yaml.safe_load(f)

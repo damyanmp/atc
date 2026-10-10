@@ -808,7 +808,7 @@ def cmd_init(
                     "(e.g. 'beszel'). Omit to pick from a menu."
     ),
     config_path_opt: Path | None = typer.Option(
-        None, "--config", help="Path to config.yaml (default: alongside this install)"
+        None, "--config", help="Path to config.yaml (default: $ATC_CONFIG, else ~/.config/atc/config.yaml, else alongside this install)"
     ),
 ) -> None:
     """Interactive setup wizard — pick which integrations to configure.
@@ -820,9 +820,10 @@ def cmd_init(
     """
     import yaml as _yaml
 
+    from config import default_config_path
     from lib.config_sections import SECTIONS, merge_config, section_by_key
 
-    cfg_path = (config_path_opt or Path(__file__).parent.parent / "config.yaml").resolve()
+    cfg_path = (config_path_opt or default_config_path()).resolve()
 
     existing: dict = {}
     if cfg_path.exists():
@@ -2237,12 +2238,14 @@ def _run_set_dir(path_str: str) -> None:
     """Point `atc run` at a folder on disk — writes scripts_dir to config.yaml."""
     import yaml as _yaml
 
+    from config import default_config_path
+
     resolved = Path(path_str).expanduser().resolve()
     if not resolved.is_dir():
         console.print(f"[red]Not a directory:[/] {resolved}")
         raise typer.Exit(1)
 
-    cfg_path = Path(__file__).parent.parent / "config.yaml"
+    cfg_path = default_config_path()
     existing: dict = {}
     if cfg_path.exists():
         with open(cfg_path) as f:
@@ -3709,61 +3712,6 @@ def certs_check() -> None:
     """Show TLS certificate expiry for all configured endpoints. (same as bare 'atc certs')"""
     _certs_check()
 
-
-@certs_app.command("deploy")
-def certs_deploy(
-    target: str | None = typer.Argument(
-        None, help="Target name (substring, e.g. 'globemaster', 'viggen'). Omit for all targets."
-    ),
-    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation"),
-) -> None:
-    """Deploy the current nginx-proxy-manager cert to Pi-hole instances.
-
-    Fetches fullchain+privkey from Docker-01 (nginx-proxy-manager) and
-    installs it on Globemaster (Synology) and the Viggen/Draken LXCs,
-    backing up each existing cert first and restarting pihole-FTL after.
-    Mirrors infrastructure/pihole/certs/deploy-pihole-tls.sh, but callable
-    directly (no interactive script, scriptable with -y, JSON-friendly errors).
-    """
-    from lib.tls_deploy import ALL_TARGETS, fetch_combined_pem, deploy_target
-
-    targets = ALL_TARGETS
-    if target:
-        tf = target.lower()
-        targets = [t for t in ALL_TARGETS if tf in t.name.lower()]
-        if not targets:
-            names = ", ".join(t.name for t in ALL_TARGETS)
-            console.print(f"[red]No target matching '{target}'. Available: {names}[/]")
-            raise typer.Exit(1)
-
-    console.print("[bold]Cert deploy targets:[/]")
-    for t in targets:
-        console.print(f"  [cyan]•[/] {t.name} [dim]({t.host})[/]")
-
-    if not yes and not Confirm.ask(f"\nDeploy cert to {len(targets)} target(s)?"):
-        raise typer.Exit(0)
-
-    async def _run() -> int:
-        console.print("\n[bold]Fetching cert from Docker-01…[/]")
-        pem = await fetch_combined_pem(lambda line: console.print(line))
-
-        failed = 0
-        for t in targets:
-            console.print(f"\n[bold]{t.name}[/]")
-            ok = await deploy_target(t, pem, lambda line: console.print(line))
-            if ok:
-                console.print(f"  [green]✓[/] {t.name} done")
-            else:
-                console.print(f"  [red]✗[/] {t.name} failed")
-                failed += 1
-        return failed
-
-    failed = asyncio.run(_run())
-    console.print()
-    if failed:
-        console.print(f"[red]{failed}/{len(targets)} target(s) failed.[/]")
-        raise typer.Exit(1)
-    console.print(f"[green]✓[/] Cert deployed to {len(targets)} target(s).")
 
 
 # ── metrics (Prometheus) ─────────────────────────────────────────────────────

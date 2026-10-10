@@ -22,10 +22,19 @@ if ! command -v uv &>/dev/null; then
     exit 1
 fi
 
-if [[ ! -f "$SCRIPT_DIR/config.yaml" ]]; then
+if [[ -n "${ATC_CONFIG:-}" ]]; then
+    CONFIG_FILE="$ATC_CONFIG"
+elif [[ -f "${XDG_CONFIG_HOME:-$HOME/.config}/atc/config.yaml" ]]; then
+    CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/atc/config.yaml"
+else
+    CONFIG_FILE="$SCRIPT_DIR/config.yaml"
+fi
+
+if [[ ! -f "$CONFIG_FILE" ]]; then
     echo "Error: config.yaml not found."
-    echo "Copy the template and fill in your values:"
-    echo "  cp $SCRIPT_DIR/config.yaml.example $SCRIPT_DIR/config.yaml"
+    echo "Copy the template and fill in your values, then put it at"
+    echo "~/.config/atc/config.yaml (recommended) or set \$ATC_CONFIG:"
+    echo "  mkdir -p ~/.config/atc && cp $SCRIPT_DIR/config.yaml.example ~/.config/atc/config.yaml"
     exit 1
 fi
 
