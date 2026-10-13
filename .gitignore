@@ -1,5 +1,11 @@
 config.yaml
 guest_users.yaml
+# Homelab-specific automation (CouchDB host, vault layout) lives in the
+# private pentagon-management repo, not here — never let stray local
+# copies get staged into this (sharable) repo.
+sync_vault.py
+obsidian_decrypt.py
+atc-sync-secrets.sh
 .venv/
 __pycache__/
 src/**/__pycache__/
