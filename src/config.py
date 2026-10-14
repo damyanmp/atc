@@ -49,10 +49,14 @@ def _try_use_encrypted_keyring() -> None:
         backend.file_path = str(_ENCRYPTED_KEYRING_FILE)
         backend.keyring_key = password
         keyring.set_keyring(backend)
-    except Exception:
+    except Exception as exc:
         # Never hard-fail config loading over a keyring backend issue —
-        # fall through to whatever `keyring` auto-detected.
-        pass
+        # fall through to whatever `keyring` auto-detected. But don't
+        # swallow it silently: a fallback to the plaintext keyring means
+        # secrets that only exist in the encrypted backend (e.g. beszel
+        # creds) will look "unset" and trigger an interactive re-prompt,
+        # which aborts non-interactively. Log so that's debuggable.
+        print(f"atc: encrypted keyring backend failed, falling back ({exc!r})", file=sys.stderr)
 
 
 def _fast_cryptfile_keyring_class():
