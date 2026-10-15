@@ -85,7 +85,7 @@ host/user/path/credential info:
   `tests/test_config.py` for the existing pattern).
 - If a feature only makes sense against one specific infra setup and isn't
   generically configurable, it probably doesn't belong in this repo at all
-  — it belongs in his private `pentagon-management` repo as a standalone
+  — it belongs in a private automation repo as a standalone
   script, reachable generically via `atc run` (`scripts_dir` is user-set,
   see `atc run set-dir` / `atc run show-dir`).
 - Before committing, grep your diff for `192.168.`, `/home/`, and any
@@ -94,7 +94,7 @@ host/user/path/credential info:
 ## Commit identity
 
 Global git config on this machine uses `git@localhost` as the commit
-email (not his real address) — if you're setting up a fresh clone/checkout,
+email (not a real address) — if you're setting up a fresh clone/checkout,
 match that rather than letting git pick up a different default identity.
 
 ## Testing changes that touch `atc` itself end-to-end
