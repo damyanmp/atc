@@ -2,6 +2,7 @@
 name = "atc"
 version = "0.1.0"
 description = "Air Traffic Control — homelab CLI for Proxmox, VMs, LXCs, and DSM"
+license = "MIT"
 requires-python = ">=3.11"
 dependencies = [
     "textual>=0.89",

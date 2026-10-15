@@ -16,3 +16,9 @@ default.profraw
 blackbox-*.txt
 .coverage
 htmlcov/
+
+# Stray local work that doesn't belong in this (sharable) repo's history —
+# present on disk but must never be staged.
+/scratch/
+/scripts/
+/src/q*.py

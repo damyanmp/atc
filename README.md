@@ -307,8 +307,8 @@ atc  Air Traffic Control — homelab management CLI
 │   standalone hosts. (alias: get hosts)
 ├── push-key  [selector] --key-file/-k <text> --yes/-y  Push your SSH public key
 │   to guests without needing existing SSH access.
-├── quick  Publish quick throwaway files/pages to
-│   https://quick.local.damyanpetkov.com
+├── quick  Publish quick throwaway files/pages via your configured 'quick'
+│   stack
 │   ├── bootstrap  --target <text> --dry-run --yes/-y  Set up (or upgrade) the
 │   │   'quick' stack, Pi-hole A record, and NPM proxy host.
 │   ├── list  List what's currently published (fetches the live /directory
@@ -428,3 +428,7 @@ Obsidian vault sync (`sync_vault.py`, `obsidian_decrypt.py`) and the
 Mac Keychain→host secret sync helper (`atc-sync-secrets.sh`) live in a
 separate private automation repo — they're homelab-specific automation,
 not part of the `atc` CLI itself.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

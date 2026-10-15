@@ -466,6 +466,16 @@ class BlackboxConfig:
     # Proxmox nodes are always added automatically
 
 
+@dataclass
+class QuickConfig:
+    """'atc quick' ad hoc file/page hosting — all fields are site-specific,
+    fill these in from your own setup (see config.yaml.example)."""
+    domain: str = ""  # e.g. "quick.local.example.com"
+    image: str = ""  # e.g. "ghcr.io/youruser/quick-site:latest"
+    fallback_ip: str = ""  # known LAN IP of the target host, empty = no fallback
+    cert_id: int = 0  # NPM certificate id to attach, 0 = no cert
+
+
 # ── Top-level config ──────────────────────────────────────────────────────────
 
 @dataclass
@@ -491,6 +501,7 @@ class Config:
     unifi: UniFiConfig | None = None
     blackbox: BlackboxConfig = field(default_factory=BlackboxConfig)
     docker_hub: DockerHubConfig | None = None
+    quick: QuickConfig = field(default_factory=QuickConfig)
     scripts_dir: str | None = None
     refresh_interval: int = 30
     config_path: Path = field(default_factory=Path)
@@ -849,6 +860,15 @@ def load_config(config_path: Path | None = None) -> Config:
             token=_resolve_secret(dh["token"], "docker_hub/token"),
         )
 
+    # Quick (optional — 'atc quick' ad hoc file/page hosting)
+    qk_raw = raw.get("quick", {})
+    quick = QuickConfig(
+        domain=qk_raw.get("domain", ""),
+        image=qk_raw.get("image", ""),
+        fallback_ip=qk_raw.get("fallback_ip", ""),
+        cert_id=int(qk_raw.get("cert_id", 0)),
+    )
+
     return Config(
         proxmox=proxmox,
         ssh=ssh,
@@ -871,6 +891,7 @@ def load_config(config_path: Path | None = None) -> Config:
         unifi=unifi,
         blackbox=blackbox,
         docker_hub=docker_hub,
+        quick=quick,
         scripts_dir=raw.get("scripts_dir"),
         refresh_interval=int(raw.get("refresh_interval", 30)),
         config_path=config_path.resolve(),

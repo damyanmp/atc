@@ -21,8 +21,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "lib"))
 
 from config import Config
 
-QUICK_DOMAIN = "quick.local.damyanpetkov.com"
-
 
 class QuickScreen(Screen):
     BINDINGS = [
@@ -57,14 +55,21 @@ class QuickScreen(Screen):
 
     @work(exclusive=True, thread=True)
     def _load(self) -> None:
+        domain = self.config.quick.domain
+        if not domain:
+            self.app.call_from_thread(
+                self.query_one("#status-bar", Static).update,
+                "❌ 'quick' is not configured — set quick.domain in config.yaml",
+            )
+            return
         self.app.call_from_thread(
-            self.query_one("#status-bar", Static).update, f"⏳ Fetching https://{QUICK_DOMAIN}/directory…"
+            self.query_one("#status-bar", Static).update, f"⏳ Fetching https://{domain}/directory…"
         )
         try:
             import httpx
 
             with httpx.Client(verify=False, timeout=10) as client:
-                r = client.get(f"https://{QUICK_DOMAIN}/directory")
+                r = client.get(f"https://{domain}/directory")
             r.raise_for_status()
 
             names = re.findall(r'value="([^"]+)"', r.text)
@@ -72,7 +77,7 @@ class QuickScreen(Screen):
             t = self.query_one("#sites-table", DataTable)
             self.app.call_from_thread(t.clear)
             for name in names:
-                self.app.call_from_thread(t.add_row, name, f"https://{QUICK_DOMAIN}/{name}/")
+                self.app.call_from_thread(t.add_row, name, f"https://{domain}/{name}/")
 
             summary = (
                 "(nothing published)" if not names

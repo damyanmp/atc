@@ -2977,8 +2977,8 @@ def _resolve_certificate_id(
     certificate id, or 0 (no cert) if neither was given.
 
     certificate_name matches against each cert's nice_name or any of its
-    domain_names (exact or wildcard, e.g. "local.damyanpetkov.com" matches
-    a "*.local.damyanpetkov.com" cert). Prints the known cert list and exits
+    domain_names (exact or wildcard, e.g. "local.example.com" matches
+    a "*.local.example.com" cert). Prints the known cert list and exits
     on no-match or ambiguous-match, so the caller never silently gets 0.
     """
     if certificate_id is not None and certificate_name is not None:
@@ -3017,7 +3017,7 @@ def _resolve_certificate_id(
 
 @npm_app.command("create")
 def npm_create(
-    domain: str = typer.Argument(..., help="Domain name, e.g. myservice.local.damyanpetkov.com"),
+    domain: str = typer.Argument(..., help="Domain name, e.g. myservice.local.example.com"),
     forward_host: str = typer.Argument(..., help="IP or hostname to forward to"),
     forward_port: int = typer.Argument(..., help="Port to forward to"),
     scheme: str = typer.Option("http", "--scheme", help="http or https"),
@@ -3028,7 +3028,7 @@ def npm_create(
     ),
     certificate_name: str | None = typer.Option(
         None, "--certificate-name",
-        help="Attach a cert by name/domain instead of id, e.g. '*.local.damyanpetkov.com' (see 'atc npm certs'). Errors out on no/ambiguous match rather than silently leaving the host cert-less.",
+        help="Attach a cert by name/domain instead of id, e.g. '*.local.example.com' (see 'atc npm certs'). Errors out on no/ambiguous match rather than silently leaving the host cert-less.",
     ),
     ssl_forced: bool = typer.Option(
         False, "--ssl-forced/--no-ssl-forced", help="Force SSL (requires a certificate to actually be attached).",
@@ -3077,7 +3077,7 @@ def npm_update(
     ),
     certificate_name: str | None = typer.Option(
         None, "--certificate-name",
-        help="Attach a cert by name/domain instead of id, e.g. '*.local.damyanpetkov.com' (see 'atc npm certs').",
+        help="Attach a cert by name/domain instead of id, e.g. '*.local.example.com' (see 'atc npm certs').",
     ),
     ssl_forced: bool | None = typer.Option(None, "--ssl-forced/--no-ssl-forced", help="Force SSL on/off"),
     websocket: bool | None = typer.Option(None, "--websocket/--no-websocket"),
@@ -3089,7 +3089,7 @@ def npm_update(
     Common fix: a host created without a cert (see 'SSL: —' in 'atc npm list')
     is silently served over plain HTTP or falls through to the backend's own
     cert — attach the right one here, e.g.:
-      atc npm update mail.local.damyanpetkov.com --certificate-name '*.local.damyanpetkov.com' --ssl-forced
+      atc npm update mail.local.example.com --certificate-name '*.local.example.com' --ssl-forced
     """
     cfg = _load()
     npm_cfg = _npm_cfg(cfg)
@@ -3260,8 +3260,8 @@ app.add_typer(service_app, name="service")
 
 @service_app.command("publish")
 def service_publish(
-    domain: str = typer.Argument(..., help="Local domain, e.g. myservice.local.damyanpetkov.com"),
-    forward_host: str = typer.Argument(..., help="IP the service actually runs on, e.g. 192.168.1.78"),
+    domain: str = typer.Argument(..., help="Local domain, e.g. myservice.local.example.com"),
+    forward_host: str = typer.Argument(..., help="IP the service actually runs on, e.g. 192.168.1.100"),
     forward_port: int = typer.Argument(..., help="Port the service listens on"),
     dns_ip: str | None = typer.Option(
         None, "--dns-ip",
@@ -7781,39 +7781,44 @@ def launch_tui() -> None:
 
 
 # ── quick (ad hoc file/page hosting) ────────────────────────────────────────
-# One standing stack ("quick") on docker-1 serving quick.local.damyanpetkov.com
-# via NPM + the existing *.local.damyanpetkov.com wildcard cert.
+# Optional standing stack ("quick") that serves static files/pages from a
+# Portainer-managed container, fronted by your own domain + NPM/cert.
 # `atc quick publish` tars a local file/dir and PUTs it into the running
 # container via the Docker Engine API (proxied through Portainer) — no SSH
-# needed for routine use. https://quick.local.damyanpetkov.com/directory is a
+# needed for routine use. https://<your quick domain>/directory is a
 # built-in web UI to browse and delete published pages.
 #
-# The server itself (stdlib-only Python, no deps) lives in its own repo,
-# https://github.com/damyanmp/quick-site, and is baked into a prebuilt image
-# at ghcr.io/damyanmp/quick-site:latest (private GHCR, same manually-deployed
-# pattern as peppermint — Watchtower can't auto-pull it, so a new release
-# needs `cd quick-site && ./scripts/release.sh` then `atc quick bootstrap`
-# again to roll it out). This CLI only owns the deploy (stack/DNS/NPM), not
-# the server code.
+# All of domain/image/fallback_ip are site-specific — set them under
+# `quick:` in your config.yaml (see config.yaml.example). The server itself
+# (stdlib-only Python, no deps) is not part of this repo; bring your own
+# static-file server image.
 
 QUICK_STACK_NAME = "quick"
-QUICK_DOMAIN = "quick.local.damyanpetkov.com"
 QUICK_SERVE_ROOT = "/data"
-QUICK_IMAGE = "ghcr.io/damyanmp/quick-site:latest"
 
 quick_app = typer.Typer(
-    help="Publish quick throwaway files/pages to https://quick.local.damyanpetkov.com",
+    help="Publish quick throwaway files/pages via your configured 'quick' stack",
     no_args_is_help=True,
     rich_markup_mode="rich",
 )
 app.add_typer(quick_app, name="quick")
 
 
-def _quick_compose() -> str:
+def _require_quick(cfg) -> "QuickConfig":  # noqa: F821
+    if not cfg.quick.domain or not cfg.quick.image:
+        console.print(
+            "[red]✗[/] 'quick' is not configured — set quick.domain and quick.image "
+            "in config.yaml (see config.yaml.example)."
+        )
+        raise typer.Exit(1)
+    return cfg.quick
+
+
+def _quick_compose(image: str) -> str:
     return (
         "services:\n"
         "  quick:\n"
-        f"    image: {QUICK_IMAGE}\n"
+        f"    image: {image}\n"
         "    restart: unless-stopped\n"
         "    networks:\n"
         "      - npm_network\n"
@@ -7837,12 +7842,11 @@ def quick_bootstrap(
 
     Safe to re-run — each step checks for an existing resource first, and the
     stack itself is always redeployed with the current compose content, which
-    always pulls ghcr.io/damyanmp/quick-site:latest (via the same update_stack
-    Env-preserving safety path 'atc docker compose up' uses). Run this again
-    after a fresh `./scripts/release.sh` in the quick-site repo to roll out a
-    new image.
+    always pulls the configured quick.image (via the same update_stack
+    env-preserving safety path 'atc docker compose up' uses).
     """
     cfg = _load()
+    quick_cfg = _require_quick(cfg)
     pt_cfg = _require_portainer(cfg)
     npm_cfg = _npm_cfg(cfg)
     primary_pihole = _pihole_primary(cfg)
@@ -7861,22 +7865,29 @@ def quick_bootstrap(
 
     with console.status(f"[bold]Checking DNS on {primary_pihole.name}…[/]"):
         dns_records = asyncio.run(list_custom_dns(primary_pihole))
-    existing_dns = next((d for d in dns_records if d.get("domain") == QUICK_DOMAIN), None)
-    existing_npm = npm_find_proxy_host(npm_cfg, QUICK_DOMAIN)
+    existing_dns = next((d for d in dns_records if d.get("domain") == quick_cfg.domain), None)
+    existing_npm = npm_find_proxy_host(npm_cfg, quick_cfg.domain)
 
-    # docker-1's known LAN IP — reuse whatever its other DNS entries already point at,
-    # falling back to the documented 192.168.1.78 if none found.
-    docker1_ip = next(
-        (d["ip"] for d in dns_records if "portainer" in d.get("domain", "") or d.get("ip") == "192.168.1.78"),
-        "192.168.1.78",
+    # Target host's known LAN IP — reuse whatever its other DNS entries
+    # already point at, falling back to quick.fallback_ip if configured.
+    target_ip = next(
+        (d["ip"] for d in dns_records if target in d.get("domain", "") or d.get("ip") == quick_cfg.fallback_ip),
+        quick_cfg.fallback_ip,
     )
+    if not target_ip:
+        console.print(
+            "[red]✗[/] Could not determine the target host's LAN IP and no quick.fallback_ip is "
+            "configured — set one in config.yaml."
+        )
+        raise typer.Exit(1)
 
     console.print(f"[bold]Plan for '{QUICK_STACK_NAME}' on {env.name}:[/]")
-    console.print(f"  1. Stack '{QUICK_STACK_NAME}' ({QUICK_IMAGE} + named volume) — "
+    console.print(f"  1. Stack '{QUICK_STACK_NAME}' ({quick_cfg.image} + named volume) — "
                    f"{'[green]update[/]' if existing_stack else '[green]create[/]'}")
-    console.print(f"  2. Pi-hole A record {QUICK_DOMAIN} → {docker1_ip} — "
+    console.print(f"  2. Pi-hole A record {quick_cfg.domain} → {target_ip} — "
                    f"{'[dim]already exists, skip[/]' if existing_dns else '[green]create[/]'}")
-    console.print(f"  3. NPM proxy host {QUICK_DOMAIN} → quick:80 (cert #12, ssl-forced) — "
+    console.print(f"  3. NPM proxy host {quick_cfg.domain} → quick:80 "
+                   f"(cert #{quick_cfg.cert_id or '—'}, ssl-forced) — "
                    f"{'[dim]already exists, skip[/]' if existing_npm else '[green]create[/]'}")
 
     if dry_run:
@@ -7886,18 +7897,18 @@ def quick_bootstrap(
 
     if not existing_stack:
         with console.status("[bold]Creating 'quick' stack…[/]"):
-            stack_id = create_stack(pt_cfg, env.id, QUICK_STACK_NAME, _quick_compose())
+            stack_id = create_stack(pt_cfg, env.id, QUICK_STACK_NAME, _quick_compose(quick_cfg.image))
         console.print(f"[green]✓[/] Created stack #{stack_id}")
     else:
         with console.status("[bold]Updating 'quick' stack…[/]"):
-            update_stack(pt_cfg, existing_stack.id, env.id, _quick_compose(), env_vars=None, pull_image=True)
+            update_stack(pt_cfg, existing_stack.id, env.id, _quick_compose(quick_cfg.image), env_vars=None, pull_image=True)
         console.print(f"[green]✓[/] Updated stack (#{existing_stack.id})")
 
     if not existing_dns:
         with console.status("[bold]Adding Pi-hole record…[/]"):
-            ok, err = asyncio.run(add_custom_dns(primary_pihole, QUICK_DOMAIN, docker1_ip))
+            ok, err = asyncio.run(add_custom_dns(primary_pihole, quick_cfg.domain, target_ip))
         if ok:
-            console.print(f"[green]✓[/] Added Pi-hole record {QUICK_DOMAIN} → {docker1_ip}")
+            console.print(f"[green]✓[/] Added Pi-hole record {quick_cfg.domain} → {target_ip}")
         else:
             console.print(f"[red]✗[/] Failed to add Pi-hole record — {err}")
             raise typer.Exit(1)
@@ -7906,17 +7917,17 @@ def quick_bootstrap(
 
     if not existing_npm:
         npm_create_proxy_host(
-            npm_cfg, QUICK_DOMAIN, "quick", 80,
+            npm_cfg, quick_cfg.domain, "quick", 80,
             forward_scheme="http", block_exploits=True, allow_websocket_upgrade=False,
-            certificate_id=12, ssl_forced=True,
+            certificate_id=quick_cfg.cert_id, ssl_forced=bool(quick_cfg.cert_id),
         )
-        console.print(f"[green]✓[/] Created NPM proxy host for {QUICK_DOMAIN}")
+        console.print(f"[green]✓[/] Created NPM proxy host for {quick_cfg.domain}")
     else:
         console.print(f"[dim]✓ NPM proxy host already exists (#{existing_npm.id})[/]")
 
     console.print(
         f"\n[bold green]Ready.[/] Publish with: [cyan]atc quick publish <file_or_dir>[/]\n"
-        f"Browse/delete at: [cyan]https://{QUICK_DOMAIN}/directory[/]"
+        f"Browse/delete at: [cyan]https://{quick_cfg.domain}/directory[/]"
     )
 
 
@@ -7937,6 +7948,7 @@ def quick_publish(
     import tarfile
 
     cfg = _load()
+    quick_cfg = _require_quick(cfg)
     pt_cfg = _require_portainer(cfg)
 
     from lib.portainer import fetch_environments, fetch_containers, upload_to_container
@@ -7976,14 +7988,14 @@ def quick_publish(
         upload_to_container(pt_cfg, env.id, quick_container.id, buf.getvalue(), QUICK_SERVE_ROOT)
 
     if path.is_file() and path.suffix == ".html":
-        url = f"https://{QUICK_DOMAIN}/{slug}/"
+        url = f"https://{quick_cfg.domain}/{slug}/"
     elif path.is_file():
-        url = f"https://{QUICK_DOMAIN}/{slug}/{path.name}"
+        url = f"https://{quick_cfg.domain}/{slug}/{path.name}"
     else:
-        url = f"https://{QUICK_DOMAIN}/{slug}/"
+        url = f"https://{quick_cfg.domain}/{slug}/"
 
     console.print(f"[green]✓[/] Published. [bold cyan]{url}[/]")
-    console.print(f"[dim]Manage/delete published pages at https://{QUICK_DOMAIN}/directory[/]")
+    console.print(f"[dim]Manage/delete published pages at https://{quick_cfg.domain}/directory[/]")
 
 
 @quick_app.command("list")
@@ -7992,24 +8004,27 @@ def quick_list() -> None:
     import re
     import httpx as _httpx
 
+    cfg = _load()
+    quick_cfg = _require_quick(cfg)
+
     try:
         with _httpx.Client(verify=False, timeout=10) as client:
-            r = client.get(f"https://{QUICK_DOMAIN}/directory")
+            r = client.get(f"https://{quick_cfg.domain}/directory")
         r.raise_for_status()
     except Exception as e:
-        console.print(f"[red]❌  Could not reach https://{QUICK_DOMAIN}/directory — {e}[/]")
+        console.print(f"[red]❌  Could not reach https://{quick_cfg.domain}/directory — {e}[/]")
         raise typer.Exit(1)
 
     names = re.findall(r'value="([^"]+)"', r.text)
     if not names:
-        console.print(f"[dim]Nothing published — https://{QUICK_DOMAIN}/directory is empty.[/]")
+        console.print(f"[dim]Nothing published — https://{quick_cfg.domain}/directory is empty.[/]")
         return
 
     t = Table(box=box.SIMPLE, show_header=True, pad_edge=False)
     t.add_column("Slug", style="bold")
     t.add_column("URL")
     for name in names:
-        t.add_row(name, f"https://{QUICK_DOMAIN}/{name}/")
+        t.add_row(name, f"https://{quick_cfg.domain}/{name}/")
     console.print(t)
-    console.print(f"\n[dim]Manage/delete at https://{QUICK_DOMAIN}/directory[/]")
+    console.print(f"\n[dim]Manage/delete at https://{quick_cfg.domain}/directory[/]")
 

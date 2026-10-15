@@ -276,3 +276,14 @@ tls:
 #     - name: docker-1
 #       host: 192.168.x.x
 #       # user: root   # optional — defaults to ssh.default_user
+
+# ── Quick (optional) ─────────────────────────────────────────────────────────
+
+# `atc quick` publishes throwaway files/pages via a Portainer-managed stack
+# fronted by Nginx Proxy Manager + Pi-hole. Needs its own static-file-serving
+# image (not included in this repo) and a domain you control DNS/TLS for.
+# quick:
+#   domain: quick.local.example.com
+#   image: ghcr.io/youruser/quick-site:latest
+#   fallback_ip: 192.168.x.x   # LAN IP of the host running the stack
+#   cert_id: 0                 # NPM certificate id to attach, 0 = none
