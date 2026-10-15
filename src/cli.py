@@ -8070,7 +8070,13 @@ def quick_list() -> None:
         console.print(f"[red]❌  Could not reach https://{quick_cfg.domain}/directory — {e}[/]")
         raise typer.Exit(1)
 
-    names = re.findall(r'value="([^"]+)"', r.text)
+    # The quick-site server's directory page has shipped two different HTML
+    # shapes over time (old: <input value="slug">, new: card div with
+    # data-entry="slug") — match both so this doesn't break again on the
+    # next redesign, and de-dupe while preserving first-seen order.
+    names = list(dict.fromkeys(
+        re.findall(r'data-entry="([^"]+)"', r.text) + re.findall(r'value="([^"]+)"', r.text)
+    ))
     if not names:
         console.print(f"[dim]Nothing published — https://{quick_cfg.domain}/directory is empty.[/]")
         return

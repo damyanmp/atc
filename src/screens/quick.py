@@ -72,7 +72,11 @@ class QuickScreen(Screen):
                 r = client.get(f"https://{domain}/directory")
             r.raise_for_status()
 
-            names = re.findall(r'value="([^"]+)"', r.text)
+            # Match both old (<input value="slug">) and new (data-entry="slug"
+            # card) directory page formats — see cli.py's quick_list for why.
+            names = list(dict.fromkeys(
+                re.findall(r'data-entry="([^"]+)"', r.text) + re.findall(r'value="([^"]+)"', r.text)
+            ))
 
             t = self.query_one("#sites-table", DataTable)
             self.app.call_from_thread(t.clear)
