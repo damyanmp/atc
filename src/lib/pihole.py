@@ -253,6 +253,34 @@ async def fetch_seen_ips_all(
     return seen, errors
 
 
+# ── FTL diagnostic messages ──────────────────────────────────────────────────
+# Pi-hole's own curated issue feed (what the admin UI's Diagnostics > Messages
+# page shows) — distinct from the Loki-scraped dnsmasq log lines in loki.py.
+# Covers things like RATE_LIMIT, CERTIFICATE_DOMAIN_MISMATCH, LOAD, LIST
+# (blocklist fetch failures), NTP, DISK_MESSAGE, CONNECTION_ERROR. Messages
+# persist (by id) until FTL clears them — there's no "acknowledged" flag, so
+# callers should treat this as "current known issues", same as a status check,
+# not an append-only event log.
+
+async def fetch_messages(cfg: PiholeInstanceConfig) -> list[dict]:
+    """Returns raw message dicts: {id, timestamp, type, plain, html}."""
+    async with _session(cfg) as (client, headers):
+        r = await client.get(f"{cfg.base_url}/api/info/messages", headers=headers)
+        r.raise_for_status()
+        return r.json().get("messages", [])
+
+
+async def fetch_messages_all(
+    cfgs: list[PiholeInstanceConfig],
+) -> list[tuple[str, list[dict] | BaseException]]:
+    """Per-instance (name, messages_or_exception) — one bad instance doesn't
+    hide the others."""
+    results = await asyncio.gather(
+        *[fetch_messages(cfg) for cfg in cfgs], return_exceptions=True
+    )
+    return list(zip((cfg.name for cfg in cfgs), results))
+
+
 # ── Gravity ───────────────────────────────────────────────────────────────────
 
 async def trigger_gravity(cfg: PiholeInstanceConfig) -> tuple[bool, str]:

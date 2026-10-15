@@ -4196,6 +4196,45 @@ def _acars_fetch_loki(cfg) -> list[dict]:
     return result
 
 
+# Pi-hole's own FTL message `type` -> severity. Anything not listed defaults
+# to WARN (informational/cosmetic) — only genuinely service-impacting types
+# are promoted to CRIT. See lib.pihole.fetch_messages_all's docstring for
+# why this is a separate, more authoritative source than the Loki log scrape
+# above (it's FTL's own curated diagnostic feed, not a keyword grep over
+# forwarded syslog — confirmed 2026-10-15: RATE_LIMIT/CERTIFICATE_DOMAIN_
+# MISMATCH/LOAD/LIST all showed up here but matched NONE of PIHOLE_LOG_TERMS,
+# so they were invisible to acars entirely until this was added).
+_PIHOLE_MESSAGE_SEVERITY = {
+    "DISK_MESSAGE": "CRIT",       # disk full/near-full on the Pi-hole host
+    "CONNECTION_ERROR": "CRIT",   # FTL lost DB/upstream connectivity
+}
+
+
+def _acars_fetch_pihole_messages(cfgs) -> list[dict]:
+    """Pi-hole FTL's own diagnostic message feed (GET /api/info/messages),
+    across ALL configured instances, not just the primary. Returns
+    [{text, severity}], raises only if every instance failed (a single bad
+    instance is folded into the text as its own WARN-less entry so the
+    others still get reported — mirrors fetch_seen_ips_all's pattern)."""
+    import asyncio as _asyncio
+
+    from lib.pihole import fetch_messages_all
+
+    result = []
+    per_instance = _asyncio.run(fetch_messages_all(cfgs))
+    all_failed = all(isinstance(msgs, BaseException) for _, msgs in per_instance)
+    if all_failed and per_instance:
+        raise RuntimeError("; ".join(f"{name}: {msgs}" for name, msgs in per_instance))
+    for name, msgs in per_instance:
+        if isinstance(msgs, BaseException):
+            result.append({"text": f"{name} — messages fetch failed: {msgs}", "severity": "WARN"})
+            continue
+        for m in msgs:
+            sev = _PIHOLE_MESSAGE_SEVERITY.get(m.get("type", ""), "WARN")
+            result.append({"text": f"{name}: [{m.get('type', '?')}] {m.get('plain', '')}", "severity": sev})
+    return result
+
+
 @app.command("acars")
 def cmd_acars(
     certs_warn: int = typer.Option(30, "--certs-warn", help="Warn when cert expires within N days"),
@@ -4211,7 +4250,10 @@ def cmd_acars(
     """Active alerts across all configured infrastructure.
 
     Checks: Uptime Kuma monitors · TLS cert expiry · Proxmox nodes
-            · Prometheus · Pi-hole instances · UniFi device state/firmware
+            · Prometheus · Pi-hole instance up/down · Pi-hole FTL diagnostic
+            messages (RATE_LIMIT, CERTIFICATE_DOMAIN_MISMATCH, LOAD, LIST/
+            gravity failures, DISK_MESSAGE, NTP, etc — across ALL configured
+            instances, not just the primary) · UniFi device state/firmware
             · Beszel host resources (CPU/Mem/Disk) + API token expiry
             · Loki syslog/pihole log events (last 15 min — live, not historical;
             see `atc blackbox` for a deep historical dump).
@@ -4237,6 +4279,8 @@ def cmd_acars(
             coros["prometheus"] = _sync(_acars_fetch_prometheus, cfg.prometheus)
         if cfg.pihole_instances:
             coros["pihole"] = pihole_fetch_all(cfg.pihole_instances)
+        if cfg.pihole_instances:
+            coros["pihole_messages"] = _sync(_acars_fetch_pihole_messages, cfg.pihole_instances)
         if cfg.unifi:
             coros["unifi"] = _sync(_acars_fetch_unifi, cfg.unifi)
         if cfg.beszel:
@@ -4311,6 +4355,17 @@ def cmd_acars(
             for s in v:
                 if not s.online:
                     alerts.append(("CRIT", "Pi-hole", f"{s.name} ({s.host}) — offline"))
+
+    # ── Pi-hole FTL messages (RATE_LIMIT, CERTIFICATE_DOMAIN_MISMATCH, LOAD,
+    #    LIST/gravity failures, DISK_MESSAGE, NTP, etc — FTL's own curated
+    #    diagnostic feed, all configured instances) ────────────────────────
+    if "pihole_messages" in result_map:
+        v = result_map["pihole_messages"]
+        if isinstance(v, BaseException):
+            source_errors.append(f"Pi-hole messages: {v}")
+        else:
+            for e in v:
+                alerts.append((e["severity"], "Pi-hole Msgs", e["text"]))
 
     # ── UniFi ────────────────────────────────────────────────────────────────
     if "unifi" in result_map:
