@@ -18,6 +18,7 @@ from lib.selfupdate import (
     commit_hash,
     current_branch,
     dirty_files,
+    is_diverged,
     is_git_repo,
     remote_name_for_branch,
     remote_url,
@@ -146,6 +147,57 @@ class TestCheckForUpdates:
         _, clone = upstream_and_clone
         status = check_for_updates(clone, remote_url_override="https://fork.example/atc.git")
         assert status.remote_url == "https://fork.example/atc.git"
+
+
+# ── divergence (rewritten remote history, e.g. a PII scrub force-push) ──────
+
+def _rewrite_remote_history(remote):
+    """Simulate a force-pushed history rewrite: amend the initial commit so
+    its hash changes, making the clone's old HEAD unreachable from the new
+    remote tip — the same shape as a git-filter-repo mailmap rewrite."""
+    _git(["commit", "--amend", "-m", "initial commit (rewritten)"], remote)
+
+
+class TestDivergence:
+    def test_is_diverged_false_normally(self, upstream_and_clone):
+        remote, clone = upstream_and_clone
+        _commit(remote, "file.txt", "v2", "second commit")
+        _git(["fetch", "origin"], clone)
+        assert not is_diverged(clone, "main", "origin")
+
+    def test_is_diverged_true_after_rewrite(self, upstream_and_clone):
+        remote, clone = upstream_and_clone
+        _rewrite_remote_history(remote)
+        _git(["fetch", "origin"], clone)
+        assert is_diverged(clone, "main", "origin")
+
+    def test_check_for_updates_flags_diverged_and_not_up_to_date(self, upstream_and_clone):
+        remote, clone = upstream_and_clone
+        _rewrite_remote_history(remote)
+        status = check_for_updates(clone)
+        assert status.diverged
+        assert not status.up_to_date
+
+    def test_run_upgrade_resets_onto_rewritten_remote_when_clean(self, upstream_and_clone, monkeypatch):
+        remote, clone = upstream_and_clone
+        _rewrite_remote_history(remote)
+
+        import lib.selfupdate as su
+        monkeypatch.setattr(su, "sync_dependencies", lambda root, timeout=120: None)
+
+        status, log = run_upgrade(clone)
+        assert status.up_to_date
+        assert not status.diverged
+        assert status.current_commit == status.latest_commit
+        assert commit_hash(clone) == commit_hash(remote)
+
+    def test_run_upgrade_refuses_diverged_when_dirty(self, upstream_and_clone):
+        remote, clone = upstream_and_clone
+        _rewrite_remote_history(remote)
+        (clone / "file.txt").write_text("local edit")
+
+        with pytest.raises(DirtyWorkingTreeError):
+            run_upgrade(clone)
 
 
 # ── changelog_since ──────────────────────────────────────────────────────────

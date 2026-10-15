@@ -33,6 +33,7 @@ class UpgradeStatus:
     commits_behind: int
     up_to_date: bool
     dirty: bool
+    diverged: bool = False
     dirty_files: list[str] = field(default_factory=list)
 
 
@@ -102,6 +103,22 @@ def commits_behind(root: Path, branch: str, remote: str) -> int:
         return 0
 
 
+def is_diverged(root: Path, branch: str, remote: str) -> bool:
+    """True if HEAD is NOT an ancestor of <remote>/<branch> — i.e. the local
+    branch has commits the rewritten remote history doesn't contain, so a
+    fast-forward pull is impossible no matter how many times you retry it.
+
+    This is the normal signature of a remote history rewrite (e.g. a PII
+    scrub via git-filter-repo + force-push), not a sign of real local work:
+    on an atc install directory nobody commits on top of upstream, so if
+    HEAD isn't reachable from the remote tip, upstream moved out from under
+    it rather than the other way around.
+    """
+    r = _run(["git", "merge-base", "--is-ancestor", "HEAD", f"{remote}/{branch}"], root)
+    # exit 0 = ancestor (fine, plain ff-only applies); 1 = diverged; other = error, assume not diverged
+    return r.returncode == 1
+
+
 def check_for_updates(root: Path | None = None, remote_url_override: str | None = None) -> UpgradeStatus:
     """Fetch from the remote and report how far behind the local checkout is.
 
@@ -125,6 +142,7 @@ def check_for_updates(root: Path | None = None, remote_url_override: str | None 
     current = commit_hash(root)
     latest = commit_hash(root, f"{remote}/{branch}")
     behind = commits_behind(root, branch, remote)
+    diverged = is_diverged(root, branch, remote)
 
     return UpgradeStatus(
         repo_root=root,
@@ -134,8 +152,9 @@ def check_for_updates(root: Path | None = None, remote_url_override: str | None 
         current_commit=current,
         latest_commit=latest,
         commits_behind=behind,
-        up_to_date=(behind == 0),
+        up_to_date=(behind == 0 and not diverged),
         dirty=bool(dirty),
+        diverged=diverged,
         dirty_files=dirty,
     )
 
@@ -158,6 +177,21 @@ def pull(root: Path, remote: str, branch: str, timeout: int = 60) -> None:
         raise RuntimeError(f"git pull --ff-only failed: {r.stderr.strip() or r.stdout.strip()}")
 
 
+def reset_to_remote(root: Path, remote: str, branch: str, timeout: int = 30) -> None:
+    """Hard-reset the local branch onto <remote>/<branch> and re-sync tags.
+
+    Only ever called when the working tree is already confirmed clean (see
+    run_upgrade), so this can't discard uncommitted work — it only discards
+    local commits that are unreachable from the rewritten remote history,
+    which on an atc install directory is never real work, just the stale
+    pre-rewrite copy of commits upstream already has under new hashes.
+    """
+    r = _run(["git", "reset", "--hard", f"{remote}/{branch}"], root, timeout=timeout)
+    if r.returncode != 0:
+        raise RuntimeError(f"git reset --hard failed: {r.stderr.strip() or r.stdout.strip()}")
+    _run(["git", "fetch", "--tags", "--force", remote], root, timeout=timeout)
+
+
 def sync_dependencies(root: Path, timeout: int = 120) -> None:
     """Re-sync the uv venv against pyproject.toml/uv.lock after a pull."""
     r = _run(["uv", "sync"], root, timeout=timeout)
@@ -171,6 +205,12 @@ def run_upgrade(root: Path | None = None) -> tuple[UpgradeStatus, list[str]]:
     Raises DirtyWorkingTreeError if there are uncommitted local changes —
     never silently discards local edits. Raises NotAGitRepoError /
     RuntimeError on git/uv failures.
+
+    If the remote history has been rewritten (force-push, e.g. a PII scrub)
+    such that HEAD is no longer an ancestor of the remote tip, a plain
+    --ff-only pull can never succeed — so once the working tree is confirmed
+    clean, this hard-resets onto the remote tip instead of failing and
+    making you do that by hand every time.
     """
     status = check_for_updates(root)
     if status.dirty:
@@ -183,8 +223,15 @@ def run_upgrade(root: Path | None = None) -> tuple[UpgradeStatus, list[str]]:
     if status.up_to_date:
         return status, []
 
-    log = changelog_since(status.repo_root, status.current_commit, status.latest_commit)
-    pull(status.repo_root, status.remote_name, status.branch)
+    if status.diverged:
+        # Can't diff a sane changelog across rewritten history — just report
+        # what moved.
+        log = [f"(remote history was rewritten — resetting to {status.latest_commit})"]
+        reset_to_remote(status.repo_root, status.remote_name, status.branch)
+    else:
+        log = changelog_since(status.repo_root, status.current_commit, status.latest_commit)
+        pull(status.repo_root, status.remote_name, status.branch)
+
     sync_dependencies(status.repo_root)
 
     new_status = check_for_updates(status.repo_root)

@@ -5385,10 +5385,17 @@ def cmd_upgrade(
         console.print("[green]✓[/] Already up to date.")
         return
 
-    console.print(
-        f"[yellow]{status.commits_behind}[/] commit(s) behind "
-        f"[cyan]{status.remote_name}/{status.branch}[/] ({status.latest_commit})"
-    )
+    if status.diverged:
+        console.print(
+            f"\n[yellow]⚠[/]  Remote history has been rewritten (force-push) — "
+            f"local [cyan]{status.current_commit}[/] is no longer an ancestor of "
+            f"[cyan]{status.remote_name}/{status.branch}[/] ({status.latest_commit})."
+        )
+    else:
+        console.print(
+            f"[yellow]{status.commits_behind}[/] commit(s) behind "
+            f"[cyan]{status.remote_name}/{status.branch}[/] ({status.latest_commit})"
+        )
 
     if status.dirty:
         console.print(
@@ -5402,7 +5409,15 @@ def cmd_upgrade(
         console.print("[dim](--check: not pulling)[/]")
         return
 
-    if not yes and not Confirm.ask(f"Pull {status.commits_behind} commit(s) and sync dependencies?"):
+    if status.diverged:
+        prompt = (
+            f"Reset local branch to match {status.remote_name}/{status.branch}? "
+            f"(working tree is clean — this only discards stale pre-rewrite commits)"
+        )
+    else:
+        prompt = f"Pull {status.commits_behind} commit(s) and sync dependencies?"
+
+    if not yes and not Confirm.ask(prompt):
         console.print("[dim]Aborted.[/]")
         raise typer.Exit(0)
 
