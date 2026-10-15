@@ -5,7 +5,7 @@ All notable changes to `atc` are documented here. Format loosely follows
 semver (this is a personal tool, not a published library) but bumps roughly
 track breaking config/CLI changes.
 
-## [Unreleased]
+## [0.2.0] - 2026-10-15
 
 ### Added
 - `atc init` now opens with a p10k-`configure`-style keyring-hardening step:
