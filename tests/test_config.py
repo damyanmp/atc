@@ -250,8 +250,13 @@ class TestLoadConfig:
         assert cfg.config_path == path.resolve()
 
     def test_scripts_dir_default(self, tmp_path):
+        # scripts_dir unset in config.yaml → no raw default string; the
+        # fallback behavior lives in resolved_scripts_dir (scripts/ next to
+        # config.yaml), not in the raw field itself. See the comment on
+        # resolved_scripts_dir for why "../../" stopped being the default.
         cfg = load_config(_minimal_yaml(tmp_path))
-        assert cfg.scripts_dir == "../../"
+        assert cfg.scripts_dir is None
+        assert cfg.resolved_scripts_dir == (tmp_path / "scripts").resolve()
 
     def test_pihole_primary_flag(self, tmp_path):
         cfg = load_config(_minimal_yaml(tmp_path, extra=textwrap.dedent("""\
