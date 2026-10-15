@@ -369,6 +369,25 @@ class PortainerConfig:
         return f"{scheme}://{self.host}:{self.port}"
 
 
+# ── Dockhand ──────────────────────────────────────────────────────────────────
+# Eventual Portainer replacement — see lib/dockhand.py. Generate a token:
+# Dockhand UI → Profile (avatar in sidebar) → API tokens → Generate token.
+# All Dockhand tokens start with "dh_".
+
+@dataclass
+class DockhandConfig:
+    host: str
+    api_token: str        # Dockhand API token ("dh_...")
+    port: int = 3000
+    https: bool = False
+    verify_ssl: bool = False
+
+    @property
+    def base_url(self) -> str:
+        scheme = "https" if self.https else "http"
+        return f"{scheme}://{self.host}:{self.port}"
+
+
 # ── Nginx Proxy Manager ──────────────────────────────────────────────────────
 
 @dataclass
@@ -494,6 +513,7 @@ class Config:
     tls_checks: list[TLSCheckConfig] = field(default_factory=list)
     uptimekuma: UptimeKumaConfig | None = None
     portainer: PortainerConfig | None = None
+    dockhand: DockhandConfig | None = None
     nginx_proxy_manager: NginxProxyManagerConfig | None = None
     prometheus: PrometheusConfig | None = None
     loki: LokiConfig | None = None
@@ -755,6 +775,18 @@ def load_config(config_path: Path | None = None) -> Config:
             verify_ssl=bool(pt.get("verify_ssl", False)),
         )
 
+    # Dockhand
+    dockhand: DockhandConfig | None = None
+    if "dockhand" in raw:
+        dh = raw["dockhand"]
+        dockhand = DockhandConfig(
+            host=dh["host"],
+            port=int(dh.get("port", 3000)),
+            https=bool(dh.get("https", False)),
+            api_token=_resolve_secret(dh["api_token"], "dockhand/api_token"),
+            verify_ssl=bool(dh.get("verify_ssl", False)),
+        )
+
     # Nginx Proxy Manager
     nginx_proxy_manager: NginxProxyManagerConfig | None = None
     if "nginx_proxy_manager" in raw:
@@ -884,6 +916,7 @@ def load_config(config_path: Path | None = None) -> Config:
         tls_checks=tls_checks,
         uptimekuma=uptimekuma,
         portainer=portainer,
+        dockhand=dockhand,
         nginx_proxy_manager=nginx_proxy_manager,
         prometheus=prometheus,
         loki=loki,

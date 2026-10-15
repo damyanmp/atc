@@ -253,6 +253,16 @@ portainer:
   api_key: keychain:portainer-api-key   # ← stored in keychain
   verify_ssl: false
 
+dockhand:
+  # Dockhand — eventual Portainer replacement (lib/dockhand.py, dev branch).
+  # Generate a token: Dockhand UI → Profile (avatar) → API tokens → Generate token.
+  # All Dockhand tokens start with "dh_".
+  host: 192.168.x.x
+  port: 3000
+  https: false
+  api_token: keychain:dockhand-api-token   # ← stored in keychain
+  verify_ssl: false
+
 tls:
   # TLS certificate expiry checks — shown in the dashboard.
   # sni: override SNI for wildcard certs on internal IPs.
