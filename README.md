@@ -155,8 +155,8 @@ atc  Air Traffic Control — homelab management CLI
 ├── acars  --certs-warn <integer> --certs-crit <integer> --beszel-cpu-warn
 │   <float> --beszel-cpu-crit <float> --beszel-mem-warn <float>
 │   --beszel-mem-crit <float> --beszel-disk-warn <float> --beszel-disk-crit
-│   <float> --beszel-token-warn-days <integer>  Active alerts across all
-│   configured infrastructure.
+│   <float> --beszel-token-warn-days <integer> -o/--output <text>  Active alerts
+│   across all configured infrastructure.
 ├── auth  Manage PIN-based access control for atc.
 │   ├── clear  Remove the PIN, disabling auth entirely.
 │   ├── set-pin  Set or change the PIN required to run atc.

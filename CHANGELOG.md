@@ -5,6 +5,14 @@ All notable changes to `atc` are documented here. Format loosely follows
 semver (this is a personal tool, not a published library) but bumps roughly
 track breaking config/CLI changes.
 
+## [Unreleased]
+
+### Added
+- `atc acars -o json` — machine-readable alert digest for scripts and
+  monitoring wrappers: `{summary: {total, crit, warn, sources_checked},
+  alerts: [{severity, source, message}], source_errors: [...]}`. No spinner
+  or table in JSON mode; exit code is still 1 when any CRIT is present.
+
 ## [0.2.0] - 2026-10-15
 
 ### Added

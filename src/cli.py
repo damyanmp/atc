@@ -4235,6 +4235,34 @@ def _acars_fetch_pihole_messages(cfgs) -> list[dict]:
     return result
 
 
+def _acars_to_json(
+    alerts: list[tuple[str, str, str]],
+    source_errors: list[str],
+    sources_checked: list[str],
+) -> dict:
+    """Machine-readable acars result for `atc acars -o json`.
+
+    Shape (stable — monitoring wrappers depend on it):
+      {"summary": {"total", "crit", "warn", "sources_checked": [...]},
+       "alerts": [{"severity", "source", "message"}, ...],   # CRIT first, then by source
+       "source_errors": ["<source>: <error>", ...]}
+    """
+    ordered = sorted(alerts, key=lambda x: (0 if x[0] == "CRIT" else 1, x[1]))
+    return {
+        "summary": {
+            "total": len(alerts),
+            "crit": sum(1 for sev, _, _ in alerts if sev == "CRIT"),
+            "warn": sum(1 for sev, _, _ in alerts if sev != "CRIT"),
+            "sources_checked": list(sources_checked),
+        },
+        "alerts": [
+            {"severity": sev, "source": src, "message": msg}
+            for sev, src, msg in ordered
+        ],
+        "source_errors": list(source_errors),
+    }
+
+
 @app.command("acars")
 def cmd_acars(
     certs_warn: int = typer.Option(30, "--certs-warn", help="Warn when cert expires within N days"),
@@ -4246,6 +4274,7 @@ def cmd_acars(
     beszel_disk_warn: float = typer.Option(85.0, "--beszel-disk-warn", help="Warn when Beszel host Disk % ≥ this"),
     beszel_disk_crit: float = typer.Option(95.0, "--beszel-disk-crit", help="Critical when Beszel host Disk % ≥ this"),
     beszel_token_warn_days: int = typer.Option(14, "--beszel-token-warn-days", help="Warn when beszel-api-key expires within N days"),
+    output: str = typer.Option("table", "-o", "--output", help="table | json"),
 ) -> None:
     """Active alerts across all configured infrastructure.
 
@@ -4258,8 +4287,15 @@ def cmd_acars(
             · Loki syslog/pihole log events (last 15 min — live, not historical;
             see `atc blackbox` for a deep historical dump).
 
-    Exit code 1 when any CRIT alerts are present.
+    Exit code 1 when any CRIT alerts are present (both output formats).
+
+    `-o json` prints one machine-readable object (see `_acars_to_json`) for
+    scripting / monitoring wrappers — no spinner, no table.
     """
+    if output not in ("table", "json"):
+        console.print(f"[red]Unknown --output '{output}' (expected table | json)[/]")
+        raise typer.Exit(2)
+
     cfg = _load()
 
     alerts: list[tuple[str, str, str]] = []   # (sev, source, message)
@@ -4297,8 +4333,11 @@ def cmd_acars(
         results = await asyncio.gather(*coros.values(), return_exceptions=True)
         return dict(zip(coros.keys(), results))
 
-    with console.status("[bold]Checking all sources…[/]"):
+    if output == "json":
         result_map = asyncio.run(_collect_all())
+    else:
+        with console.status("[bold]Checking all sources…[/]"):
+            result_map = asyncio.run(_collect_all())
 
     # ── Uptime Kuma ──────────────────────────────────────────────────────────
     if "uk" in result_map:
@@ -4398,6 +4437,14 @@ def cmd_acars(
 
     n_sources = len(result_map)
     n_crits = sum(1 for sev, _, _ in alerts if sev == "CRIT")
+
+    if output == "json":
+        console.print_json(_json.dumps(
+            _acars_to_json(alerts, source_errors, sorted(result_map.keys()))
+        ))
+        if n_crits:
+            raise typer.Exit(1)
+        return
 
     if not alerts and not source_errors:
         console.print(f"[green]✓[/]  ACARS — all clear  [dim]({n_sources} source(s) checked)[/]")
