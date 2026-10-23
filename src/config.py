@@ -149,7 +149,7 @@ class SSHConfig:
     key_file: str = "~/.ssh/id_rsa"
     connect_timeout: int = 10
     node_host_pattern: str = "{name}"  # e.g. "pve-{name}.local.example.com"
-    verify_host_keys: bool = False     # set True to enforce ~/.ssh/known_hosts checking
+    verify_host_keys: bool = True      # set False to skip ~/.ssh/known_hosts checking (lab rebuilds)
     guest_users: dict = field(default_factory=dict)                      # guest name → ssh user
     guest_update_cmds: dict = field(default_factory=dict)                # guest name → GuestUpdateCmd
 
@@ -617,7 +617,7 @@ def load_config(config_path: Path | None = None) -> Config:
         key_file=ssh_raw.get("key_file", "~/.ssh/id_rsa"),
         connect_timeout=int(ssh_raw.get("connect_timeout", 10)),
         node_host_pattern=ssh_raw.get("node_host_pattern", "{name}"),
-        verify_host_keys=bool(ssh_raw.get("verify_host_keys", False)),
+        verify_host_keys=bool(ssh_raw.get("verify_host_keys", True)),
         guest_users=guest_users,
         guest_update_cmds=guest_update_cmds,
     )
