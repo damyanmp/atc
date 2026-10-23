@@ -171,6 +171,18 @@ SECTIONS: list[SectionSpec] = [
         ],
     ),
     SectionSpec(
+        key="media_search",
+        title="Forced Radarr/Sonarr searches (indexer-throttle guard rails)",
+        help="Lets `atc media search` / `search-missing` / `search-today` fire indexer "
+             "searches. Off by default; --force overrides once.",
+        fields=[
+            FieldSpec("enabled", "Allow forced searches?", kind="bool", default=False, required=False),
+            FieldSpec("max_items", "Max items per search-missing run", kind="int", default=10, required=False),
+            FieldSpec("min_healthy_pct", "Refuse if fewer than this % of indexers are healthy",
+                      kind="int", default=50, required=False),
+        ],
+    ),
+    SectionSpec(
         key="prometheus",
         title="Prometheus (metrics queries, alert rules in blackbox)",
         fields=[

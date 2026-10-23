@@ -297,6 +297,19 @@ class SeerrConfig:
 
 
 @dataclass
+class MediaSearchConfig:
+    """Guard rails for forcing Radarr/Sonarr indexer searches from atc.
+
+    Seerr sometimes never searches for a request, so atc can force one — but
+    unbounded searches got indexers throttled. Off by default; `--force` on a
+    single command overrides `enabled` (and the health gate) one time.
+    """
+    enabled: bool = False
+    max_items: int = 10            # cap per search-missing run (rolling batches via cooldown)
+    min_healthy_pct: int = 50      # refuse when fewer auto-search indexers than this % are healthy
+
+
+@dataclass
 class TautulliConfig:
     host: str
     api_key: str
@@ -490,6 +503,7 @@ class Config:
     sonarr: ArrConfig | None = None
     tautulli: TautulliConfig | None = None
     seerr: SeerrConfig | None = None
+    media_search: MediaSearchConfig = field(default_factory=MediaSearchConfig)
     openspeedtest: OpenSpeedTestConfig | None = None
     tls_checks: list[TLSCheckConfig] = field(default_factory=list)
     uptimekuma: UptimeKumaConfig | None = None
@@ -721,6 +735,14 @@ def load_config(config_path: Path | None = None) -> Config:
             verify_ssl=bool(sr2.get("verify_ssl", False)),
         )
 
+    # Forced *arr searches (guard rails) — always present, defaults = disabled
+    ms = raw.get("media_search") or {}
+    media_search = MediaSearchConfig(
+        enabled=bool(ms.get("enabled", False)),
+        max_items=max(1, int(ms.get("max_items", 10))),
+        min_healthy_pct=min(100, max(0, int(ms.get("min_healthy_pct", 50)))),
+    )
+
     # OpenSpeedTest
     openspeedtest: OpenSpeedTestConfig | None = None
     if "openspeedtest" in raw:
@@ -880,6 +902,7 @@ def load_config(config_path: Path | None = None) -> Config:
         sonarr=sonarr,
         tautulli=tautulli,
         seerr=seerr,
+        media_search=media_search,
         openspeedtest=openspeedtest,
         tls_checks=tls_checks,
         uptimekuma=uptimekuma,

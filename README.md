@@ -227,30 +227,38 @@ atc  Air Traffic Control — homelab management CLI
 ├── init  [section] --config <path>  Interactive setup wizard — pick which
 │   integrations to configure.
 ├── media  Media pipeline: Seerr · Radarr · Sonarr · Plex · Streams
-│   ├── calendar  [days] --radarr --sonarr  Show Radarr and Sonarr releases.
-│   │   Positive days = upcoming, negative = past.
-│   ├── pipeline  <query>  Show the complete media pipeline: request → *arr →
+│   ├── calendar  [days] --radarr --sonarr --pick/-p <integer> -o <choice>  Show
+│   │   Radarr and Sonarr releases. Positive days = upcoming, negative = past.
+│   ├── pipeline  [query] --tmdb <integer> --type/-t <text> --pick/-p <integer>
+│   │   -o <choice> --no-menu  Trace one title: Seerr request → Radarr/Sonarr →
 │   │   download → Plex.
+│   ├── queue  --stuck/-s --radarr --sonarr -o <choice>  Download queue across
+│   │   Radarr + Sonarr, one row per download.
 │   ├── radarr  Manage Radarr (movies)
 │   │   ├── scan  Trigger a full library rescan.
-│   │   ├── search-missing  --yes/-y  Search for all missing movies.
-│   │   └── status  Show Radarr version and connectivity.
-│   ├── search-today  --yes/-y --dry-run  Search for today's calendar releases
-│   │   that haven't been downloaded yet.
+│   │   └── search-missing  --limit/-n <integer> --dry-run --force --yes/-y
+│   │       Search the newest N missing movies (capped, cooled-down batches).
+│   ├── search  [query] --tmdb <integer> --type/-t <text> --pick/-p <integer>
+│   │   --season/-s <integer> --dry-run --force --yes/-y -o <choice>  Force an
+│   │   indexer search for ONE title Seerr didn't pick up.
+│   ├── search-today  --yes/-y --dry-run --force  Search for today's calendar
+│   │   releases that haven't been downloaded yet.
 │   ├── seerr  Search and request media via Seerr
-│   │   ├── list (ls)  --all/-a --tv/-t --movies/-m --processing/-p -o <choice>
-│   │   │   -j  List media requests. Unfulfilled only by default.
-│   │   ├── request  <tmdb_id> --type/-t <text> --yes/-y  Request a movie or TV
-│   │   │   show by TMDB ID.
-│   │   └── search  <query> -o <choice> -j  Search for movies and TV shows.
+│   │   ├── list (ls)  --all/-a --tv/-t --movies/-m --processing/-p --failed/-f
+│   │   │   -o <choice> -j  List media requests. Unfulfilled only by default.
+│   │   ├── request  <tmdb_id> --type/-t <text> --seasons <text> --force
+│   │   │   --yes/-y -o <choice>  Request a movie or TV show by TMDB ID. Refuses
+│   │   │   duplicates unless --force.
+│   │   └── search  <query> -o <choice> -j  Search for movies and TV shows. JSON
+│   │       includes poster_url (TMDB w500).
 │   ├── sonarr  Manage Sonarr (TV shows)
 │   │   ├── scan  Trigger a full library rescan.
-│   │   ├── search-missing  --yes/-y  Search for all missing monitored episodes.
-│   │   └── status  Show Sonarr version and connectivity.
-│   ├── status  --radarr --sonarr --seerr --plex --tautulli  Show connectivity
-│   │   status for all media services.
-│   └── today  Today's media — scheduled releases, requests, and downloads with
-│       file details.
+│   │   └── search-missing  --limit/-n <integer> --dry-run --force --yes/-y
+│   │       Search the newest N missing episodes (capped, cooled-down batches).
+│   ├── status  --radarr --sonarr --seerr --plex --tautulli -o <choice>
+│   │   Connectivity + version for every media service.
+│   └── today  -o <choice>  Today's media — scheduled releases, requests, and
+│       downloads with file details.
 ├── metrics  Run ad-hoc PromQL queries against Prometheus.
 │   ├── names  [match]  List available metric names (discovery — 'what can I
 │   │   query?').

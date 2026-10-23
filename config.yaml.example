@@ -189,6 +189,15 @@ seerr:
   api_key: keychain:seerr-api-key   # ← stored in keychain
   verify_ssl: false
 
+media_search:
+  # Guard rails for forcing Radarr/Sonarr indexer searches from atc
+  # (`atc media search`, `search-missing`, `search-today`). Seerr sometimes
+  # never searches for a request; this lets you force it without hammering
+  # indexers. Off by default — `--force` on one command overrides once.
+  enabled: false
+  max_items: 10          # cap per search-missing run; cooldowns roll the batch forward
+  min_healthy_pct: 50    # refuse when fewer than this % of auto-search indexers are healthy
+
 # ── Monitoring ────────────────────────────────────────────────────────────────
 
 prometheus:

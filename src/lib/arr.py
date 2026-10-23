@@ -5,7 +5,7 @@ Authentication uses X-Api-Key header.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime
 
 import httpx
@@ -78,11 +78,6 @@ def radarr_scan(cfg: ArrConfig) -> ArrCommand:
     return _run_command(cfg, "RefreshMovie")
 
 
-def radarr_search_missing(cfg: ArrConfig) -> ArrCommand:
-    """Search for all missing/unmonitored movies."""
-    return _run_command(cfg, "MissingMoviesSearch")
-
-
 # ── Sonarr commands ───────────────────────────────────────────────────────────
 
 def sonarr_scan(cfg: ArrConfig) -> ArrCommand:
@@ -90,9 +85,14 @@ def sonarr_scan(cfg: ArrConfig) -> ArrCommand:
     return _run_command(cfg, "RefreshSeries")
 
 
-def sonarr_search_missing(cfg: ArrConfig) -> ArrCommand:
-    """Search for all missing monitored episodes."""
-    return _run_command(cfg, "MissingEpisodeSearch")
+# Broad MissingMoviesSearch / MissingEpisodeSearch are deliberately NOT exposed:
+# one call fans out to every missing item x every indexer and was the source of
+# indexer throttling. Use get_missing() + the per-ID searches below in capped
+# batches instead.
+
+def sonarr_search_season(cfg: ArrConfig, series_id: int, season: int) -> ArrCommand:
+    """Trigger a search for one season of a series."""
+    return _run_command(cfg, "SeasonSearch", seriesId=series_id, seasonNumber=season)
 
 
 def sonarr_search_series(cfg: ArrConfig, series_id: int) -> ArrCommand:
@@ -165,12 +165,94 @@ class ArrQueueItem:
     size_left: int = 0
     time_left: str = ""
     error_message: str = ""
+    download_id: str = ""     # download-client hash — one torrent can be N queue rows (one per episode)
+    episode_id: int = 0
+    tracked_status: str = ""  # "ok", "warning", "error"
+    indexer: str = ""
+    added: str = ""           # ISO datetime the grab was added
+    series_title: str = ""    # Sonarr only (includeSeries)
+    season: int = 0
+    episode: int = 0
+    status_messages: list[str] = field(default_factory=list)   # every title + message, flattened
 
     @property
     def progress_pct(self) -> float:
         if self.size_bytes == 0:
             return 0.0
         return (self.size_bytes - self.size_left) / self.size_bytes * 100
+
+    @property
+    def stuck(self) -> bool:
+        """Needs a human: failed/blocked import, client error, or stalled with an error."""
+        state = (self.tracked_state or "").lower()
+        if state in ("importblocked", "failedpending", "failed"):
+            return True
+        if self.status in ("failed", "warning") or self.tracked_status in ("warning", "error"):
+            return True
+        return state == "importpending" and bool(self.error_message)
+
+    @property
+    def hint(self) -> str:
+        """Suggested fix for a stuck item, from the *arr's own status text."""
+        text = " ".join([self.error_message, *self.status_messages]).lower()
+        if "already imported" in text:
+            return "files already imported — safe to remove from queue"
+        if "not a quality revision upgrade" in text or "not an upgrade" in text:
+            return "existing file is same/better — remove from queue (or manual-import to replace)"
+        if "stalled" in text:
+            return "stalled — remove + blocklist so the *arr grabs another release"
+        if "no files found" in text or "sample" in text:
+            return "nothing importable in the download — remove + blocklist"
+        return ""
+
+
+@dataclass
+class QueueGroup:
+    """Queue rows collapsed per download (a season pack is one torrent, N rows)."""
+    download_id: str
+    title: str
+    items: list[ArrQueueItem]
+
+    @property
+    def first(self) -> ArrQueueItem:
+        return self.items[0]
+
+    @property
+    def stuck(self) -> bool:
+        return any(i.stuck for i in self.items)
+
+    @property
+    def hint(self) -> str:
+        return next((i.hint for i in self.items if i.hint), "")
+
+
+def group_queue(items: list[ArrQueueItem]) -> list[QueueGroup]:
+    """Collapse queue rows sharing a download_id, preserving first-seen order."""
+    groups: dict[str, QueueGroup] = {}
+    for it in items:
+        key = it.download_id or f"q{it.queue_id}"
+        if key not in groups:
+            groups[key] = QueueGroup(download_id=it.download_id, title=it.title, items=[])
+        groups[key].items.append(it)
+    return list(groups.values())
+
+
+def _queue_error(rec: dict) -> str:
+    """Best human-readable reason from a queue record.
+
+    errorMessage is often empty; statusMessages is a list of {title, messages}
+    where the useful text can be in either field (e.g. importBlocked season
+    packs put the reason in title and per-file detail in messages).
+    """
+    if rec.get("errorMessage"):
+        return rec["errorMessage"]
+    for sm in rec.get("statusMessages") or []:
+        msgs = sm.get("messages") or []
+        if msgs:
+            return msgs[0]
+        if sm.get("title"):
+            return sm["title"]
+    return ""
 
 
 def get_movie_by_id(cfg: ArrConfig, arr_id: int) -> ArrMovieRecord | None:
@@ -277,23 +359,32 @@ def get_series_by_title(cfg: ArrConfig, title: str) -> ArrSeriesRecord | None:
 
 
 def get_queue(cfg: ArrConfig) -> list[ArrQueueItem]:
-    """Fetch the full download queue."""
+    """Fetch the full download queue (all pages)."""
+    records: list[dict] = []
+    page = 1
     with _client(cfg) as client:
-        r = client.get(
-            f"{cfg.base_url}/api/v3/queue",
-            headers=_headers(cfg),
-            params={"page": 1, "pageSize": 100, "includeUnknownMovieItems": False},
-        )
-        if not r.is_success:
-            return []
-        data = r.json()
-    records = data.get("records", []) if isinstance(data, dict) else data
+        while True:
+            r = client.get(
+                f"{cfg.base_url}/api/v3/queue",
+                headers=_headers(cfg),
+                params={"page": page, "pageSize": 250, "includeUnknownMovieItems": False,
+                        "includeSeries": True, "includeEpisode": True},
+            )
+            if not r.is_success:
+                break
+            data = r.json()
+            if not isinstance(data, dict):     # very old API returned a bare list
+                records.extend(data)
+                break
+            batch = data.get("records", [])
+            records.extend(batch)
+            if not batch or len(records) >= data.get("totalRecords", 0):
+                break
+            page += 1
     items = []
     for rec in records:
-        err = rec.get("errorMessage", "")
-        if not err and rec.get("statusMessages"):
-            msgs = rec["statusMessages"][0].get("messages", [])
-            err = msgs[0] if msgs else ""
+        err = _queue_error(rec)
+        ep = rec.get("episode") or {}
         items.append(ArrQueueItem(
             queue_id=rec.get("id", 0),
             title=rec.get("title", ""),
@@ -305,8 +396,142 @@ def get_queue(cfg: ArrConfig) -> list[ArrQueueItem]:
             size_left=int(rec.get("sizeleft", 0) or 0),
             time_left=rec.get("timeleft", "") or "",
             error_message=err or "",
+            download_id=rec.get("downloadId", "") or "",
+            episode_id=rec.get("episodeId", 0) or 0,
+            tracked_status=rec.get("trackedDownloadStatus", "") or "",
+            indexer=rec.get("indexer", "") or "",
+            added=rec.get("added", "") or "",
+            series_title=(rec.get("series") or {}).get("title", ""),
+            season=rec.get("seasonNumber", ep.get("seasonNumber", 0)) or 0,
+            episode=ep.get("episodeNumber", 0) or 0,
+            status_messages=[
+                t for sm in (rec.get("statusMessages") or [])
+                for t in [sm.get("title", ""), *(sm.get("messages") or [])] if t
+            ],
         ))
     return items
+
+
+# ── Health / indexers ─────────────────────────────────────────────────────────
+
+@dataclass
+class HealthItem:
+    type: str        # "ok", "notice", "warning", "error"
+    source: str      # e.g. "IndexerStatusCheck"
+    message: str
+
+
+def get_health(cfg: ArrConfig) -> list[HealthItem]:
+    """The *arr's own health checks (System → Status → Health in the UI)."""
+    with _client(cfg) as client:
+        r = client.get(f"{cfg.base_url}/api/v3/health", headers=_headers(cfg))
+        r.raise_for_status()
+        return [HealthItem(h.get("type", ""), h.get("source", ""), h.get("message", "")) for h in r.json()]
+
+
+def parse_failing_indexers(health: list[HealthItem]) -> set[str]:
+    """Indexer names the *arr reports as unavailable/backed-off.
+
+    The per-indexer status endpoint isn't available on every version (404 on
+    current Radarr/Sonarr), but the health check message lists them:
+    "Indexers unavailable due to failures: a, b, c".
+    """
+    names: set[str] = set()
+    for h in health:
+        if h.source not in ("IndexerStatusCheck", "IndexerLongTermStatusCheck"):
+            continue
+        _, _, tail = h.message.partition(":")
+        names.update(n.strip() for n in tail.split(",") if n.strip())
+    return names
+
+
+@dataclass
+class IndexerHealth:
+    auto_search: list[str]      # indexers with automatic search enabled
+    failing: set[str]           # subset currently failing / backed off
+
+    @property
+    def healthy(self) -> int:
+        return len([n for n in self.auto_search if n not in self.failing])
+
+    @property
+    def total(self) -> int:
+        return len(self.auto_search)
+
+    @property
+    def ratio(self) -> float:
+        return self.healthy / self.total if self.total else 0.0
+
+
+def get_indexer_health(cfg: ArrConfig, health: list[HealthItem] | None = None) -> IndexerHealth:
+    """Auto-search indexers and which of them are failing. Pass `health` to reuse a fetch."""
+    with _client(cfg) as client:
+        r = client.get(f"{cfg.base_url}/api/v3/indexer", headers=_headers(cfg))
+        r.raise_for_status()
+        auto = [i.get("name", "") for i in r.json() if i.get("enableAutomaticSearch")]
+    if health is None:
+        health = get_health(cfg)
+    return IndexerHealth(auto_search=auto, failing=parse_failing_indexers(health))
+
+
+# ── Wanted / missing ──────────────────────────────────────────────────────────
+
+@dataclass
+class MissingItem:
+    arr_id: int          # Radarr movie id, or Sonarr EPISODE id
+    title: str           # movie title, or series title
+    year: int = 0
+    series_id: int = 0   # Sonarr only
+    season: int = 0
+    episode: int = 0
+    episode_title: str = ""
+    date: str = ""       # release/air date YYYY-MM-DD (sort key)
+
+
+def get_missing(cfg: ArrConfig, page_size: int = 100) -> list[MissingItem]:
+    """Monitored items with no file, newest release/air date first.
+
+    Newest-first because recent releases are the ones indexers actually have;
+    a years-old backlog item that never resolved is unlikely to start now.
+    Only fetches one page — callers search in capped batches anyway.
+    """
+    is_sonarr = cfg.name == "sonarr"
+    params = {"page": 1, "pageSize": page_size, "monitored": "true",
+              "sortDirection": "descending"}
+    if is_sonarr:
+        params.update(sortKey="episodes.airDateUtc", includeSeries="true")
+    else:
+        params.update(sortKey="movies.digitalRelease")
+    with _client(cfg) as client:
+        r = client.get(f"{cfg.base_url}/api/v3/wanted/missing", headers=_headers(cfg), params=params)
+        r.raise_for_status()
+        records = r.json().get("records", [])
+    out: list[MissingItem] = []
+    for rec in records:
+        if is_sonarr:
+            out.append(MissingItem(
+                arr_id=rec.get("id", 0),
+                title=(rec.get("series") or {}).get("title", ""),
+                series_id=rec.get("seriesId", 0),
+                season=rec.get("seasonNumber", 0),
+                episode=rec.get("episodeNumber", 0),
+                episode_title=rec.get("title", ""),
+                date=(rec.get("airDateUtc") or rec.get("airDate") or "")[:10],
+            ))
+        else:
+            # Radarr's missing list includes announced/in-cinemas titles no
+            # indexer can have yet — searching those is pure indexer load.
+            if rec.get("isAvailable") is False:
+                continue
+            date_ = rec.get("digitalRelease") or rec.get("physicalRelease") or rec.get("inCinemas") or ""
+            out.append(MissingItem(
+                arr_id=rec.get("id", 0),
+                title=rec.get("title", ""),
+                year=rec.get("year", 0),
+                date=date_[:10],
+            ))
+    out.sort(key=lambda m: m.date or "0000", reverse=True)
+    return out
 
 
 def get_movie_import_date(cfg: ArrConfig, movie_id: int) -> str:

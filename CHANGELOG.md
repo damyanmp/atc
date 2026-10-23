@@ -7,6 +7,51 @@ track breaking config/CLI changes.
 
 ## [Unreleased]
 
+### Media overhaul
+
+**Fixed**
+- Seerr request status `5` (completed) was unmapped and showed as "pending";
+  media statuses `6`/`7` (blocklisted/deleted) showed as "unknown".
+- `media seerr list` only read the newest 100 requests before filtering —
+  it now pages through all of them, and looks up titles only for rows shown.
+  The default view hides available, completed and declined requests.
+- `media status` reported Seerr as "online" with no version (reads `/api/v1/status` now).
+- `seerr request` refuses duplicates (already available / processing / in an
+  active request; TV checks per season) unless `--force`.
+- Queue reasons were often blank (`statusMessages[0].messages` empty) — now
+  falls back to the status title; queue fetch pages past 100 records.
+- Pipeline "Download" stage said "Imported" for movies whose file was since
+  deleted; stuck queue items now show as stuck with a suggested fix.
+
+**Added**
+- `atc media queue [--stuck] [-o json]` — Radarr + Sonarr queue, one row per
+  download (season packs collapsed), stuck detection + fix hints.
+- `atc media search <title> | --tmdb ID --type T [--season N]` — force one
+  indexer search when Seerr didn't trigger one.
+- `media_search:` config section (`enabled`, `max_items`, `min_healthy_pct`)
+  replacing the hardcoded `ENABLE_ARR_SEARCH` constant. Every search path
+  (search, search-missing, search-today, pipeline menu) checks it, plus an
+  indexer-health gate (from the *arr's own health checks), per-item cooldowns,
+  and skip-if-queued. `--force` overrides once. Exit 3 = refused by a guard rail.
+- `acars` "Media" source: stuck queue items, *arr health errors, indexers
+  mostly failing, failed Seerr requests (all WARN).
+- `-o json` on `pipeline`, `calendar`, `status`, `today`, `queue`, `search`,
+  `seerr request`; `poster_url` in `seerr search -o json`.
+- `pipeline`/`calendar`/`search` never prompt without a TTY: ambiguous titles
+  print candidates and exit 2 (`--pick N` or `--tmdb ID --type T`).
+- `seerr request --seasons 1,3` / `2-4`.
+
+**Changed / removed**
+- `radarr|sonarr search-missing` no longer fire the broad
+  MissingMoviesSearch/MissingEpisodeSearch (whole backlog × every indexer).
+  They search the newest `--limit N` items (default `media_search.max_items`),
+  skipping queued/cooled-down ones, so repeated runs roll through the backlog.
+  Radarr skips titles that aren't released yet.
+- Removed `media radarr status` / `media sonarr status` (use `media status --radarr|--sonarr`).
+- `media status` exits 1 when a configured service is down.
+- `search-today` matches the queue per episode, not per series.
+- Merged the two near-identical pipeline implementations (search vs calendar).
+
 ### Added
 - `atc acars -o json` — machine-readable alert digest for scripts and
   monitoring wrappers: `{summary: {total, crit, warn, sources_checked},

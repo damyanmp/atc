@@ -81,12 +81,6 @@ from screens.scripts import _find_scripts, _get_script_description
 
 console = Console()
 
-# ── Feature flags ─────────────────────────────────────────────────────────────
-# Set to True to allow Radarr/Sonarr search commands (missing, search-today,
-# and the interactive pipeline search action) to actually fire indexer searches.
-# Disabled by default to prevent accidental indexer hammering.
-ENABLE_ARR_SEARCH: bool = False
-
 # ── Output format enum ────────────────────────────────────────────────────────
 
 class _Out(str, Enum):
@@ -4235,6 +4229,57 @@ def _acars_fetch_pihole_messages(cfgs) -> list[dict]:
     return result
 
 
+def _acars_fetch_media(cfg) -> list[dict]:
+    """Media pipeline problems that otherwise sit silently until someone asks:
+    stuck Radarr/Sonarr queue items (import blocked/failed, stalled), *arr
+    health checks of type "error", auto-search indexers mostly failing, and
+    failed Seerr requests. All WARN — nothing here takes the homelab down.
+    Raises only if every configured service failed to answer."""
+    from lib.arr import get_queue, group_queue, get_health, get_indexer_health
+    from lib.seerr import list_requests, enrich_titles
+
+    result: list[dict] = []
+    errors: list[str] = []
+    attempted = 0
+    for label, acfg in (("Radarr", cfg.radarr), ("Sonarr", cfg.sonarr)):
+        if acfg is None:
+            continue
+        attempted += 1
+        try:
+            for g in group_queue(get_queue(acfg)):
+                if not g.stuck:
+                    continue
+                f = g.first
+                n = f" ({len(g.items)} items)" if len(g.items) > 1 else ""
+                why = g.hint or f.error_message or ""
+                result.append({"text": f"{label} queue: {g.title[:60]}{n} — {f.tracked_state or f.status}"
+                                       + (f": {why[:90]}" if why else ""), "severity": "WARN"})
+            health = get_health(acfg)
+            for h in health:
+                if h.type == "error":
+                    result.append({"text": f"{label} health: {h.message[:140]}", "severity": "WARN"})
+            ih = get_indexer_health(acfg, health)
+            if ih.total and ih.ratio * 100 < cfg.media_search.min_healthy_pct:
+                result.append({"text": f"{label}: only {ih.healthy}/{ih.total} auto-search indexers healthy "
+                                       f"— searches will be throttled/empty", "severity": "WARN"})
+        except Exception as e:
+            errors.append(f"{label}: {e}")
+    if cfg.seerr is not None:
+        attempted += 1
+        try:
+            failed = list_requests(cfg.seerr, filter="failed", fetch_all=True, enrich=False)
+            enrich_titles(cfg.seerr, failed)
+            for r in failed:
+                result.append({"text": f"Seerr request failed: {r.title} ({r.media_type}, #{r.request_id})",
+                                "severity": "WARN"})
+        except Exception as e:
+            errors.append(f"Seerr: {e}")
+    if errors and len(errors) == attempted:
+        raise RuntimeError("; ".join(errors))
+    result.extend({"text": f"{e} — check failed", "severity": "WARN"} for e in errors)
+    return result
+
+
 def _acars_to_json(
     alerts: list[tuple[str, str, str]],
     source_errors: list[str],
@@ -4285,7 +4330,9 @@ def cmd_acars(
             instances, not just the primary) · UniFi device state/firmware
             · Beszel host resources (CPU/Mem/Disk) + API token expiry
             · Loki syslog/pihole log events (last 15 min — live, not historical;
-            see `atc blackbox` for a deep historical dump).
+            see `atc blackbox` for a deep historical dump)
+            · Media: stuck Radarr/Sonarr queue items, *arr health errors,
+            indexers mostly failing, failed Seerr requests (all WARN).
 
     Exit code 1 when any CRIT alerts are present (both output formats).
 
@@ -4329,6 +4376,8 @@ def cmd_acars(
             )
         if cfg.loki:
             coros["loki"] = _sync(_acars_fetch_loki, cfg.loki)
+        if cfg.radarr or cfg.sonarr or cfg.seerr:
+            coros["media"] = _sync(_acars_fetch_media, cfg)
 
         results = await asyncio.gather(*coros.values(), return_exceptions=True)
         return dict(zip(coros.keys(), results))
@@ -4432,6 +4481,15 @@ def cmd_acars(
         else:
             for e in v:
                 alerts.append((e["severity"], "Loki", e["text"]))
+
+    # ── Media (stuck queue, *arr health errors, indexers, failed requests) ──
+    if "media" in result_map:
+        v = result_map["media"]
+        if isinstance(v, Exception):
+            source_errors.append(f"Media: {v}")
+        else:
+            for e in v:
+                alerts.append((e["severity"], "Media", e["text"]))
 
     # ── Render ────────────────────────────────────────────────────────────────
 
@@ -5488,6 +5546,15 @@ def cmd_upgrade(
 
 
 # ── media ─────────────────────────────────────────────────────────────────────
+#
+# Agent-friendly conventions for every media command:
+#   * -o json prints plain JSON on stdout (no Rich wrapping) for scripting.
+#   * Nothing prompts when stdin/stdout isn't a TTY: ambiguous lookups print
+#     the candidates and exit 2 (re-run with --pick N or --tmdb ID --type T),
+#     and confirmations require -y.
+#   * Exit 3 = refused by a guard rail (search disabled, indexers unhealthy,
+#     cooldown). Exit 0 with a message = nothing to do (already available,
+#     already queued, ...).
 
 media_app = typer.Typer(
     help="Media pipeline: Seerr · Radarr · Sonarr · Plex · Streams",
@@ -5496,13 +5563,23 @@ media_app = typer.Typer(
 )
 app.add_typer(media_app, name="media")
 
+import re as _re
+from collections import Counter as _Counter, defaultdict as _defaultdict
+from dataclasses import asdict as _asdict, dataclass as _dataclass, field as _field
+from datetime import date as _date, timedelta as _timedelta
 
-# ── pipeline ──────────────────────────────────────────────────────────────────
+import httpx as _httpx
 
 from lib.arr import (
     get_movie_by_id, get_movie_by_tmdb, get_series_by_id, get_series_by_title,
-    get_queue as arr_get_queue, get_movie_import_date,
-    ArrMovieRecord, ArrSeriesRecord,
+    get_queue as arr_get_queue, group_queue as arr_group_queue,
+    get_movie_import_date, get_today_imports as arr_get_today_imports,
+    get_status as arr_get_status, get_indexer_health as arr_get_indexer_health,
+    get_missing as arr_get_missing,
+    radarr_scan, radarr_search_movies,
+    sonarr_scan, sonarr_search_episodes, sonarr_search_series, sonarr_search_season,
+    get_radarr_calendar, get_sonarr_calendar,
+    ArrMovieRecord, ArrSeriesRecord, CalendarMovie, CalendarEpisode,
 )
 from lib.plex import (
     find_media as plex_find_media,
@@ -5512,14 +5589,37 @@ from lib.plex import (
     analyze_library as plex_analyze_library,
     empty_trash as plex_empty_trash,
     clean_bundles as plex_clean_bundles,
-    PlexMatch,
     _section_key as plex_section_key,
     get_activities as plex_get_activities,
     get_butler_tasks as plex_get_butler_tasks,
     list_sessions as plex_list_sessions,
     terminate_session as plex_terminate_session,
 )
+from lib.search_state import load_state as _load_search_state
+from lib.seerr import (
+    search as seerr_search,
+    get_details as seerr_get_details,
+    get_version as seerr_get_version,
+    check_requestable as seerr_check_requestable,
+    request_media as seerr_request_media,
+    list_requests as seerr_list_requests,
+    enrich_titles as seerr_enrich_titles,
+    enrich_tv_seasons as seerr_enrich_tv_seasons,
+    MEDIA_TYPE_MOVIE, MEDIA_TYPE_TV,
+)
 
+# Errors/warnings go to stderr so `-o json` stdout stays parseable.
+econsole = Console(stderr=True)
+
+EXIT_AMBIGUOUS = 2   # lookup matched several titles; re-run with --pick/--tmdb
+EXIT_REFUSED = 3     # a search guard rail said no
+
+_LIMIT_HELP = "Max items this run (default media_search.max_items)"
+_FORCE_BATCH_HELP = "Override media_search.enabled and the indexer-health gate (not cooldowns)"
+_FORCE_ONE_HELP = "Override media_search.enabled, indexer health, cooldown and already-queued checks"
+
+
+# ── shared helpers ────────────────────────────────────────────────────────────
 
 def _fmt_bytes(b: int) -> str:
     if b == 0:
@@ -5536,41 +5636,218 @@ def _mini_bar(pct: float, width: int = 12) -> str:
     return "█" * filled + "░" * (width - filled)
 
 
-def _pipeline_row(
-    step: int, label: str, icon: str, style: str, summary: str, detail: str = ""
-) -> None:
-    detail_str = f" [dim]· {detail}[/]" if detail else ""
+_YEAR_SFX = _re.compile(r"\s*\((\d{4})\)$")
+
+
+def _strip_year(raw: str) -> tuple[str, int]:
+    """'Dark Matter (2024)' -> ('Dark Matter', 2024). Sonarr appends the year
+    to disambiguate series; Seerr/Plex searches match better without it."""
+    m = _YEAR_SFX.search(raw)
+    return (raw[:m.start()], int(m.group(1))) if m else (raw, 0)
+
+
+def _interactive() -> bool:
+    return sys.stdin.isatty() and sys.stdout.isatty()
+
+
+def _print_json(obj) -> None:
+    # Plain print, not console.print_json: Rich may wrap long strings at the
+    # terminal width, which corrupts JSON for anything parsing stdout.
+    print(_json.dumps(obj, indent=2, default=str))
+
+
+def _confirm(question: str, yes: bool) -> bool:
+    if yes:
+        return True
+    if not _interactive():
+        econsole.print("[yellow]Non-interactive session — pass -y/--yes to proceed.[/]")
+        return False
+    return Confirm.ask(question)
+
+
+def _seerr(cfg: Config):
+    if cfg.seerr is None:
+        console.print("[red]No seerr section in config.yaml[/]")
+        raise typer.Exit(1)
+    return cfg.seerr
+
+
+def _radarr(cfg: Config):
+    if cfg.radarr is None:
+        console.print("[red]No radarr section in config.yaml[/]")
+        raise typer.Exit(1)
+    return cfg.radarr
+
+
+def _sonarr(cfg: Config):
+    if cfg.sonarr is None:
+        console.print("[red]No sonarr section in config.yaml[/]")
+        raise typer.Exit(1)
+    return cfg.sonarr
+
+
+def _arr_result(cmd) -> None:
+    """Print the result of a dispatched Servarr command."""
     console.print(
-        f"  [dim]{step}.[/] [dim]{label:<17}[/] [{style}]{icon}[/]  [{style}]{summary}[/]{detail_str}"
+        f"[green]✓[/] Command [bold]{cmd.name}[/] queued "
+        f"(id={cmd.command_id}, status={cmd.status})"
+        + (f" — {cmd.message}" if cmd.message else "")
     )
 
 
+# ── title resolution (Seerr search → one pick, never a hanging prompt) ──────
+
+def _resolve_title(cfg, query: str | None, tmdb: int, media_type: str, pick: int, as_json: bool):
+    """Return exactly one SeerrSearchResult or exit.
+
+    --tmdb + --type is an exact lookup. Otherwise search; a single hit, or a
+    single exact-title hit, is taken automatically; --pick N selects from the
+    list. If still ambiguous: prompt on a TTY, else print candidates + exit 2.
+    """
+    sc = _seerr(cfg)
+    if media_type and media_type not in (MEDIA_TYPE_MOVIE, MEDIA_TYPE_TV):
+        econsole.print("[red]--type must be 'movie' or 'tv'[/]")
+        raise typer.Exit(2)
+    if tmdb:
+        if not media_type:
+            econsole.print("[red]--tmdb needs --type movie|tv (TMDB IDs overlap between movies and shows)[/]")
+            raise typer.Exit(2)
+        try:
+            with console.status("[bold]Looking up TMDB ID…[/]"):
+                return seerr_get_details(sc, tmdb, media_type)
+        except LookupError as e:
+            econsole.print(f"[red]{e}[/]")
+            raise typer.Exit(1)
+    if not query:
+        econsole.print("[red]Give a title, or --tmdb ID --type movie|tv[/]")
+        raise typer.Exit(2)
+
+    with console.status("[bold]Searching Seerr…[/]"):
+        try:
+            results = seerr_search(sc, query)
+        except Exception as e:
+            econsole.print(f"[red]Search error:[/] {e}")
+            raise typer.Exit(1)
+    if media_type:
+        results = [r for r in results if r.media_type == media_type]
+    results = results[:10]
+    if not results:
+        econsole.print("[dim]No results.[/]")
+        raise typer.Exit(1)
+    if pick:
+        if not 1 <= pick <= len(results):
+            econsole.print(f"[red]--pick must be 1..{len(results)}[/]")
+            raise typer.Exit(2)
+        return results[pick - 1]
+    if len(results) == 1:
+        return results[0]
+    exact = [r for r in results if r.title.lower() == query.lower()]
+    if len(exact) == 1:
+        return exact[0]
+
+    if _interactive() and not as_json:
+        _print_candidates(results)
+        n = typer.prompt("Pick a number", type=int, default=1)
+        if not 1 <= n <= len(results):
+            econsole.print("[red]Invalid choice[/]")
+            raise typer.Exit(1)
+        return results[n - 1]
+
+    if as_json:
+        _print_json({
+            "ambiguous": True,
+            "hint": "re-run with --pick N, or --tmdb ID --type movie|tv",
+            "candidates": [
+                {"pick": i, "tmdb_id": r.id, "type": r.media_type, "title": r.title,
+                 "year": r.year, "status": r.status}
+                for i, r in enumerate(results, 1)
+            ],
+        })
+    else:
+        _print_candidates(results)
+        econsole.print("[yellow]Ambiguous — re-run with [bold]--pick N[/] or [bold]--tmdb ID --type movie|tv[/][/]")
+    raise typer.Exit(EXIT_AMBIGUOUS)
+
+
+def _print_candidates(results) -> None:
+    t = Table(box=box.SIMPLE, show_header=True, pad_edge=False)
+    t.add_column("#", justify="right", style="dim", width=3)
+    t.add_column("TMDB", justify="right", style="dim")
+    t.add_column("Type", style="dim")
+    t.add_column("Title", style="bold")
+    t.add_column("Year")
+    t.add_column("Status")
+    for i, r in enumerate(results, 1):
+        t.add_row(str(i), str(r.id), r.media_type, r.title, r.year, r.status)
+    console.print(t)
+
+
+# ── pipeline (request → *arr → download → Plex) ──────────────────────────────
+
+@_dataclass
+class _Target:
+    """What to trace through the pipeline — from a Seerr pick or a calendar row."""
+    title: str
+    media_type: str              # "movie" | "tv"
+    year: int = 0
+    tmdb_id: int = 0
+    tvdb_id: int = 0
+    arr_id: int = 0              # Radarr movie id / Sonarr series id, when already known
+    subtitle: str = ""           # e.g. "S02E09 How to Build the Box"
+    seerr: object = None         # SeerrSearchResult | None
+    seerr_lookup: bool = False   # resolve Seerr status by title (calendar rows)
+
+
+def _target_from_seerr(r) -> _Target:
+    is_tv = r.media_type == MEDIA_TYPE_TV
+    return _Target(
+        title=r.title, media_type=r.media_type, year=int(r.year or 0), tmdb_id=r.id,
+        tvdb_id=r.tvdb_id if is_tv else 0,
+        arr_id=r.external_service_id if is_tv else 0,
+        seerr=r,
+    )
+
+
+def _target_from_calendar(item) -> _Target:
+    if isinstance(item, CalendarMovie):
+        return _Target(title=item.title, media_type=MEDIA_TYPE_MOVIE, year=item.year,
+                       tmdb_id=item.tmdb_id, arr_id=item.arr_id, seerr_lookup=True)
+    title, year = _strip_year(item.series_title)
+    return _Target(title=title, media_type=MEDIA_TYPE_TV, year=year, arr_id=item.series_id,
+                   subtitle=f"S{item.season:02d}E{item.episode:02d} {item.title}".strip(),
+                   seerr_lookup=True)
+
+
+@_dataclass
+class _Pipeline:
+    target: _Target
+    stages: list = _field(default_factory=list)      # (name, icon, style, summary, detail)
+    arr_record: object = None
+    queue_items: list = _field(default_factory=list)
+    plex_match: object = None
+    errors: list = _field(default_factory=list)
+
+
 def _stage_seerr(r) -> tuple[str, str, str, str]:
-    """Returns (icon, style, summary, detail) for the Seerr stage."""
+    """(icon, style, summary, detail) for the Seerr stage."""
     code = r.media_status_code
     req = r.request_status_code
     by_date = " · ".join(p for p in [r.request_by, r.request_date] if p)
 
     def _season_str(progress: bool = False) -> str:
-        """Season count label for TV shows.
-
-        progress=True  → "avail/total seasons · avail_eps/req_eps eps" (zeros suppressed)
-        progress=False → "req seasons · req_eps eps" (what entered the pipeline)
-        Falls back gracefully when counts aren't populated yet.
-        """
-        if r.media_type != "tv":
+        """TV season label. progress=True → "avail/req seasons · avail/req eps";
+        progress=False → what entered the pipeline."""
+        if r.media_type != MEDIA_TYPE_TV:
             return ""
         parts: list[str] = []
         if progress:
             if r.seasons_requested:
-                # We know exactly which seasons were requested
                 if r.seasons_available > 0:
                     parts.append(f"{r.seasons_available}/{r.seasons_requested} seasons")
                 else:
                     n = r.seasons_requested
                     parts.append(f"{n} season{'s' if n != 1 else ''} requested")
             elif r.seasons_total:
-                # Only total is known — show it without implying it was all requested
                 parts.append(f"{r.seasons_total} seasons tracked")
             req_eps = r.episodes_requested or r.episodes_total
             if req_eps and r.episodes_available > 0:
@@ -5584,34 +5861,36 @@ def _stage_seerr(r) -> tuple[str, str, str, str]:
                 parts.append(f"{n_eps} eps")
         return " · ".join(parts)
 
+    def _d(progress: bool = False) -> str:
+        return " · ".join(p for p in [_season_str(progress), by_date] if p)
+
     if r.seerr_media_id == 0:
         return "·", "dim", "Not requested", ""
     if code == 5:
-        detail = " · ".join(p for p in [_season_str(progress=True), by_date] if p)
-        return "✓", "green", "Available", detail
+        return "✓", "green", "Available", _d(True)
     if code == 4:
-        detail = " · ".join(p for p in [_season_str(progress=True), by_date] if p)
-        return "✓", "cyan", "Partially available", detail
+        return "✓", "cyan", "Partially available", _d(True)
+    if code == 7:
+        return "✗", "yellow", "Deleted from media server", _d()
+    if code == 6:
+        return "✗", "red", "Blocklisted", _d()
     if req == 3:
-        detail = " · ".join(p for p in [_season_str(), by_date] if p)
-        return "✗", "red", "Declined", detail
+        return "✗", "red", "Declined", _d()
+    if req == 4:
+        return "✗", "red", "Request failed", _d()
     if req == 2:
-        detail = " · ".join(p for p in [_season_str(), by_date] if p)
-        return "⟳", "cyan", "Approved — processing", detail
+        return "⟳", "cyan", "Approved — processing", _d()
     if req == 1:
-        detail = " · ".join(p for p in [_season_str(), by_date] if p)
-        return "·", "yellow", "Pending approval", detail
+        return "·", "yellow", "Pending approval", _d()
     if code == 3:
-        detail = " · ".join(p for p in [_season_str(), by_date] if p)
-        return "⟳", "cyan", "Requested — processing", detail
-    if r.seerr_media_id != 0:
-        detail = " · ".join(p for p in [_season_str(), by_date] if p)
-        return "⟳", "dim", "Requested", detail
-    return "?", "dim", "Unknown", ""
+        return "⟳", "cyan", "Requested — processing", _d()
+    return "⟳", "dim", "Requested", _d()
 
 
 def _stage_arr(record) -> tuple[str, str, str, str]:
-    """Returns (icon, style, summary, detail) for the Radarr/Sonarr stage."""
+    """(icon, style, summary, detail) for the Radarr/Sonarr stage."""
+    if record is None:
+        return "✗", "dim", "Not in library", ""
     if isinstance(record, ArrMovieRecord):
         if record.has_file:
             parts = [p for p in [record.quality, _fmt_bytes(record.size_bytes) if record.size_bytes else ""] if p]
@@ -5619,29 +5898,26 @@ def _stage_arr(record) -> tuple[str, str, str, str]:
         if record.monitored:
             return "⟳", "yellow", "Monitored — missing", ""
         return "·", "dim", "Not monitored", ""
-    # ArrSeriesRecord
     if record.episode_file_count > 0:
-        eps = f"{record.episode_file_count}/{record.episode_count} eps"
-        pct = f"{record.percent:.0f}%"
         style = "green" if record.percent >= 100 else "cyan"
-        return "✓", style, eps, pct
+        return "✓", style, f"{record.episode_file_count}/{record.episode_count} eps", f"{record.percent:.0f}%"
     if record.monitored:
         return "⟳", "yellow", "Monitored — no files", ""
     return "·", "dim", "Not monitored", ""
 
 
 def _stage_download(queue_items, arr_record, import_date: str) -> tuple[str, str, str, str]:
-    """Returns (icon, style, summary, detail) for the download stage."""
+    """(icon, style, summary, detail) for the download stage."""
     if queue_items:
         item = queue_items[0]
         state = (item.tracked_state or "").lower()
+        if item.stuck:
+            note = (item.hint or item.error_message or "")[:100]
+            return "✗", "red", f"Stuck — {item.tracked_state or item.status}", note
         if "import" in state:
             return "⟳", "cyan", "Importing…", ""
-        if "failed" in state or item.status in ("warning", "error"):
-            return "✗", "red", "Failed", (item.error_message or "")[:80]
-        # Seeding: torrent client still uploading after import
-        # Detected when: explicit completed status, size_left==0, or files already
-        # exist in the arr library (most reliable — sizeleft stays full during seeding)
+        # Seeding: torrent still uploading after import. sizeleft stays full
+        # while seeding, so "files already in the library" is the reliable tell.
         already_imported = (
             (isinstance(arr_record, ArrMovieRecord) and arr_record.has_file)
             or (isinstance(arr_record, ArrSeriesRecord) and arr_record.episode_file_count > 0)
@@ -5651,14 +5927,15 @@ def _stage_download(queue_items, arr_record, import_date: str) -> tuple[str, str
             size_str = _fmt_bytes(item.size_bytes) if item.size_bytes else ""
             return "⬆", "yellow", f"Seeding{' · ' + size_str if size_str else ''}", ""
         pct = item.progress_pct
-        bar = _mini_bar(pct)
-        parts: list[str] = [f"{pct:.1f}% {bar}"]
+        parts: list[str] = [f"{pct:.1f}% {_mini_bar(pct)}"]
         if item.size_bytes:
             parts.append(f"{_fmt_bytes(item.size_bytes - item.size_left)} / {_fmt_bytes(item.size_bytes)}")
         if item.time_left:
             parts.append(f"ETA {item.time_left}")
         return "⟳", "cyan", " · ".join(parts), ""
 
+    if isinstance(arr_record, ArrMovieRecord) and import_date and not arr_record.has_file:
+        return "✗", "yellow", "Imported once — file since removed", import_date
     if import_date:
         return "✓", "green", "Imported", import_date
     if isinstance(arr_record, ArrMovieRecord) and arr_record.has_file:
@@ -5668,398 +5945,403 @@ def _stage_download(queue_items, arr_record, import_date: str) -> tuple[str, str
     return "·", "dim", "—", ""
 
 
-def _render_plex_row(plex_match, plex_err: str = "") -> None:
-    """Render stage 4 Plex row from a PlexMatch (or error string)."""
-    if plex_err:
-        _pipeline_row(4, "Plex", "?", "yellow", "Error", plex_err)
-        return
-    if plex_match is None:
-        _pipeline_row(4, "Plex", "·", "dim", "Not checked", "")
-        return
-    if plex_match.error:
-        _pipeline_row(4, "Plex", "?", "yellow", "Error", plex_match.error)
-        return
-    if not plex_match.found:
-        _pipeline_row(4, "Plex", "✗", "red", "Not in Plex", "")
-        return
-    parts = [f'library "{plex_match.library}"']
-    if plex_match.episode_count:
-        parts.append(f"{plex_match.episode_count} eps")
-    if plex_match.added_at:
-        parts.append(f"added {plex_match.added_at}")
-    _pipeline_row(4, "Plex", "✓", "green", "Available", " · ".join(parts))
+def _stage_plex(m) -> tuple[str, str, str, str]:
+    if m is None:
+        return "·", "dim", "Not checked", ""
+    if m.error:
+        return "?", "yellow", "Error", m.error
+    if not m.found:
+        return "✗", "red", "Not in Plex", ""
+    parts = [f'library "{m.library}"']
+    if m.episode_count:
+        parts.append(f"{m.episode_count} eps")
+    if m.added_at:
+        parts.append(f"added {m.added_at}")
+    return "✓", "green", "Available", " · ".join(parts)
 
 
-def _seerr_pick(cfg, query: str):
-    """Search Seerr and return the chosen SeerrSearchResult, or None on cancel."""
-    if cfg.seerr is None:
-        console.print("[red]No seerr section in config.yaml[/]")
-        return None
-    with console.status("[bold]Searching Seerr…[/]"):
-        try:
-            results = seerr_search(cfg.seerr, query)
-        except Exception as e:
-            console.print(f"[red]Search error:[/] {e}")
-            return None
-    if not results:
-        console.print("[dim]No results.[/]")
-        return None
-    if len(results) == 1:
-        return results[0]
-    t = Table(box=box.SIMPLE, show_header=True, pad_edge=False)
-    t.add_column("#", justify="right", style="dim", width=3)
-    t.add_column("Type", style="dim")
-    t.add_column("Title", style="bold")
-    t.add_column("Year")
-    t.add_column("Status")
-    for i, r in enumerate(results[:10], 1):
-        t.add_row(str(i), r.media_type, r.title, r.year, r.status)
-    console.print(t)
-    n = typer.prompt("Pick a number", type=int, default=1)
-    if not 1 <= n <= min(len(results), 10):
-        console.print("[red]Invalid choice[/]")
-        return None
-    return results[n - 1]
-
-
-def _display_pipeline(cfg, pick) -> tuple:
-    """Render all 4 pipeline stages for a SeerrSearchResult.
-
-    Returns (arr_record, plex_match, is_movie).
-    """
-    is_movie = pick.media_type == "movie"
-    arr_cfg  = cfg.radarr if is_movie else cfg.sonarr
+def _pipeline_collect(cfg, t: _Target) -> _Pipeline:
+    """Query all four stages for one title. No printing besides spinners."""
+    p = _Pipeline(target=t)
+    is_movie = t.media_type == MEDIA_TYPE_MOVIE
+    arr_cfg = cfg.radarr if is_movie else cfg.sonarr
     arr_label = "Radarr" if is_movie else "Sonarr"
 
-    console.print()
-    console.print(f"  [bold]{pick.title}[/] [dim]({pick.year}) · {pick.media_type} · TMDB {pick.id}[/]")
-    console.print()
+    # 1. Seerr
+    sr = t.seerr
+    if sr is None and t.seerr_lookup and cfg.seerr is not None:
+        try:
+            with console.status("[bold]Checking Seerr…[/]"):
+                same = [r for r in seerr_search(cfg.seerr, t.title) if r.media_type == t.media_type]
+            sr = (
+                next((r for r in same if t.tmdb_id and r.id == t.tmdb_id), None)
+                or next((r for r in same if r.title.lower() == t.title.lower()), None)
+                or (same[0] if same else None)
+            )
+        except Exception as e:
+            p.errors.append(f"seerr: {e}")
+    if sr is None:
+        p.stages.append(("Seerr Request", "·", "dim",
+                         "Not configured" if cfg.seerr is None else "Not requested", ""))
+    else:
+        if not is_movie and sr.seerr_media_id and cfg.seerr is not None:
+            with console.status("[bold]Fetching season details…[/]"):
+                seerr_enrich_tv_seasons(cfg.seerr, sr)
+        p.stages.append(("Seerr Request", *_stage_seerr(sr)))
+        t.tmdb_id = t.tmdb_id or sr.id
+        if not is_movie:
+            t.tvdb_id = t.tvdb_id or sr.tvdb_id
+            t.arr_id = t.arr_id or sr.external_service_id
+    t.seerr = sr
 
-    # ── Stage 1: Seerr ────────────────────────────────────────────────────────
-    if not is_movie and cfg.seerr is not None and pick.seerr_media_id != 0:
-        with console.status("[bold]Fetching season details…[/]"):
-            seerr_enrich_tv_seasons(cfg.seerr, pick)
-    icon, style, summary, detail = _stage_seerr(pick)
-    _pipeline_row(1, "Seerr Request", icon, style, summary, detail)
-
-    # ── Stage 2: Radarr / Sonarr ──────────────────────────────────────────────
-    arr_record = None
-    arr_queue: list = []
+    # 2. Radarr / Sonarr
     import_date = ""
-
+    arr_queue: list = []
     if arr_cfg is None:
-        _pipeline_row(2, arr_label, "·", "dim", "Not configured", "add to config.yaml")
+        p.stages.append((arr_label, "·", "dim", "Not configured", "add to config.yaml"))
     else:
         with console.status(f"[bold]Querying {arr_label}…[/]"):
             try:
                 if is_movie:
-                    arr_record = get_movie_by_tmdb(arr_cfg, pick.id)
+                    rec = get_movie_by_id(arr_cfg, t.arr_id) if t.arr_id else None
+                    if rec is None and t.tmdb_id:
+                        rec = get_movie_by_tmdb(arr_cfg, t.tmdb_id)
                 else:
-                    if pick.external_service_id:
-                        arr_record = get_series_by_id(arr_cfg, pick.external_service_id)
-                    if arr_record is None:
-                        arr_record = get_series_by_title(arr_cfg, pick.title)
+                    rec = get_series_by_id(arr_cfg, t.arr_id) if t.arr_id else None
+                    if rec is None:
+                        rec = get_series_by_title(arr_cfg, t.title)
+                p.arr_record = rec
                 arr_queue = arr_get_queue(arr_cfg)
-                if arr_record and is_movie:
-                    import_date = get_movie_import_date(arr_cfg, arr_record.arr_id)
+                if rec and is_movie:
+                    import_date = get_movie_import_date(arr_cfg, rec.arr_id)
             except Exception as e:
-                console.print(f"  [dim]  ({arr_label} error: {e})[/]")
+                p.errors.append(f"{arr_label.lower()}: {e}")
+        p.stages.append((arr_label, *_stage_arr(p.arr_record)))
 
-        if arr_record is None:
-            _pipeline_row(2, arr_label, "✗", "dim", "Not in library", "")
-        else:
-            icon, style, summary, detail = _stage_arr(arr_record)
-            _pipeline_row(2, arr_label, icon, style, summary, detail)
+    # 3. Download
+    if p.arr_record and arr_queue:
+        key = "movie_id" if is_movie else "series_id"
+        p.queue_items = [q for q in arr_queue if getattr(q, key) == p.arr_record.arr_id]
+    p.stages.append(("Download", *_stage_download(p.queue_items, p.arr_record, import_date)))
 
-    # ── Stage 3: Download ─────────────────────────────────────────────────────
-    queue_items = []
-    if arr_record and arr_queue:
-        if is_movie and isinstance(arr_record, ArrMovieRecord):
-            queue_items = [q for q in arr_queue if q.movie_id == arr_record.arr_id]
-        elif not is_movie and isinstance(arr_record, ArrSeriesRecord):
-            queue_items = [q for q in arr_queue if q.series_id == arr_record.arr_id]
-
-    icon, style, summary, detail = _stage_download(queue_items, arr_record, import_date)
-    _pipeline_row(3, "Download", icon, style, summary, detail)
-
-    # ── Stage 4: Plex ─────────────────────────────────────────────────────────
-    plex_match = None
-    plex_err = ""
+    # 4. Plex
     if cfg.plex is None:
-        _pipeline_row(4, "Plex", "·", "dim", "Not configured", "add plex: to config.yaml")
+        p.stages.append(("Plex", "·", "dim", "Not configured", "add plex: to config.yaml"))
     else:
         with console.status("[bold]Checking Plex…[/]"):
             try:
-                plex_year = int(pick.year or 0)
-                is_tv = pick.media_type == "tv"
-                plex_match = plex_find_media(
-                    cfg.plex, pick.title, pick.media_type,
-                    year=plex_year,
-                    tvdb_id=pick.tvdb_id if is_tv else 0,
-                    tmdb_id=pick.id if not is_tv else 0,
-                )
-                if not plex_match.found and plex_year:
-                    plex_match = plex_find_media(
-                        cfg.plex, pick.title, pick.media_type,
-                        year=0,
-                        tvdb_id=pick.tvdb_id if is_tv else 0,
-                        tmdb_id=pick.id if not is_tv else 0,
-                    )
+                ids = {"tvdb_id": 0 if is_movie else t.tvdb_id, "tmdb_id": t.tmdb_id if is_movie else 0}
+                m = plex_find_media(cfg.plex, t.title, t.media_type, year=t.year, **ids)
+                if not m.found and t.year:
+                    m = plex_find_media(cfg.plex, t.title, t.media_type, year=0, **ids)
+                p.plex_match = m
             except Exception as e:
-                plex_match = None
-                plex_err = str(e)
+                p.errors.append(f"plex: {e}")
+        p.stages.append(("Plex", *_stage_plex(p.plex_match)))
+    return p
 
-        _render_plex_row(plex_match, plex_err if plex_match is None else "")
 
+def _pipeline_row(step: int, label: str, icon: str, style: str, summary: str, detail: str = "") -> None:
+    detail_str = f" [dim]· {detail}[/]" if detail else ""
+    console.print(f"  [dim]{step}.[/] [dim]{label:<17}[/] [{style}]{icon}[/]  [{style}]{summary}[/]{detail_str}")
+
+
+def _pipeline_render(p: _Pipeline) -> None:
+    t = p.target
+    meta = [m for m in [f"({t.year})" if t.year else "", t.media_type, t.subtitle,
+                        f"TMDB {t.tmdb_id}" if t.tmdb_id else ""] if m]
     console.print()
-    return arr_record, plex_match, is_movie
-
-
-def _pipeline_interactive_menu(cfg, arr_record, plex_match, is_movie) -> None:
-    """Show a post-pipeline action menu and execute the chosen action."""
-    arr_cfg = cfg.radarr if is_movie else cfg.sonarr
-    actions: list[tuple[str, str]] = []
-
-    if ENABLE_ARR_SEARCH and arr_record is not None and arr_cfg is not None:
-        if isinstance(arr_record, ArrMovieRecord) and not arr_record.has_file and arr_record.monitored:
-            actions.append(("search", "Search for missing movie in Radarr"))
-        elif (
-            isinstance(arr_record, ArrSeriesRecord)
-            and arr_record.monitored
-            and arr_record.episode_count > 0
-            and arr_record.episode_file_count < arr_record.episode_count
-        ):
-            missing = arr_record.episode_count - arr_record.episode_file_count
-            actions.append(("search", f"Search for {missing} missing episode(s) in Sonarr"))
-
-    if (
-        cfg.plex is not None
-        and plex_match is not None
-        and not plex_match.found
-        and not plex_match.error
-    ):
-        actions.append(("plex_scan", "Scan Plex libraries"))
-
-    if not actions:
-        return
-
-    action_keys = {key: key for key, _ in actions}
-    parts = []
-    if "search" in action_keys:
-        parts.append("Search(s)")
-    if "plex_scan" in action_keys:
-        parts.append("Plex Scan(p)")
-    parts.append("Nothing(n)")
-
+    console.print(f"  [bold]{t.title}[/] [dim]{' · '.join(meta)}[/]")
     console.print()
-    raw = typer.prompt(", ".join(parts), default="n").strip().lower()
+    for i, (name, icon, style, summary, detail) in enumerate(p.stages, 1):
+        _pipeline_row(i, name, icon, style, summary, detail)
+    for e in p.errors:
+        console.print(f"  [dim]  ({e})[/]")
+    console.print()
 
-    if raw in ("n", ""):
+
+def _pipeline_json(p: _Pipeline) -> dict:
+    t = p.target
+    return {
+        "title": t.title, "media_type": t.media_type, "year": t.year,
+        "tmdb_id": t.tmdb_id, "tvdb_id": t.tvdb_id, "subtitle": t.subtitle,
+        "stages": [
+            {"stage": name, "ok": icon == "✓", "summary": summary, "detail": detail}
+            for name, icon, _style, summary, detail in p.stages
+        ],
+        "seerr": _asdict(t.seerr) if t.seerr is not None else None,
+        "arr": _asdict(p.arr_record) if p.arr_record is not None else None,
+        "queue": [{**_asdict(q), "stuck": q.stuck, "hint": q.hint} for q in p.queue_items],
+        "plex": _asdict(p.plex_match) if p.plex_match is not None else None,
+        "errors": p.errors,
+    }
+
+
+def _pipeline_menu(cfg, p: _Pipeline) -> None:
+    """Interactive follow-up actions (TTY only)."""
+    is_movie = p.target.media_type == MEDIA_TYPE_MOVIE
+    rec = p.arr_record
+    can_search = False
+    if rec is not None:
+        if isinstance(rec, ArrMovieRecord):
+            can_search = rec.monitored and not rec.has_file
+        else:
+            can_search = rec.monitored and rec.episode_count > rec.episode_file_count
+    can_scan = cfg.plex is not None and p.plex_match is not None and not p.plex_match.found and not p.plex_match.error
+
+    choices = []
+    if can_search:
+        choices.append("Search(s)")
+    if can_scan:
+        choices.append("Plex Scan(p)")
+    if not choices:
         return
-    action = "search" if raw == "s" else "plex_scan" if raw == "p" else ""
-    if not action or action not in action_keys:
-        return
-
-    if action == "search":
-        if is_movie and isinstance(arr_record, ArrMovieRecord):
-            with console.status("[bold]Triggering Radarr search…[/]"):
-                try:
-                    _arr_result(radarr_search_movies(arr_cfg, [arr_record.arr_id]))
-                except Exception as e:
-                    console.print(f"[red]Error:[/] {e}")
-        elif not is_movie and isinstance(arr_record, ArrSeriesRecord):
-            with console.status("[bold]Triggering Sonarr search…[/]"):
-                try:
-                    _arr_result(sonarr_search_series(arr_cfg, arr_record.arr_id))
-                except Exception as e:
-                    console.print(f"[red]Error:[/] {e}")
-
-    elif action == "plex_scan":
+    raw = typer.prompt(", ".join([*choices, "Nothing(n)"]), default="n").strip().lower()
+    if raw == "s" and can_search:
+        _targeted_search(cfg, p, season=-1, dry_run=False, force=False, yes=True)
+    elif raw == "p" and can_scan:
         libs = plex_list_libraries(cfg.plex)
         if isinstance(libs, str):
             console.print(f"[red]Error listing libraries:[/] {libs}")
             return
         lib_type = "movie" if is_movie else "show"
-        to_scan = [lib for lib in libs if lib.lib_type == lib_type]
-        if not to_scan:
-            console.print(f"[red]No {lib_type} libraries found in Plex[/]")
-            return
-        for lib in to_scan:
+        for lib in [lib for lib in libs if lib.lib_type == lib_type]:
             with console.status(f"[bold]Scanning '{lib.title}'…[/]"):
                 err = plex_scan_library(cfg.plex, lib.key)
-            if err:
-                console.print(f"[red]✗[/] {lib.title}: {err}")
-            else:
-                console.print(f"[green]✓[/] Scan queued for '{lib.title}'")
-
-
-def _display_pipeline_from_calendar(cfg, item) -> tuple:
-    """Render the pipeline for a CalendarMovie or CalendarEpisode.
-
-    Bypasses Seerr search disambiguation — arr item is already known.
-    Seerr is queried silently (exact title match) only for request status.
-    Returns (arr_record, plex_match, is_movie).
-    """
-    from lib.arr import CalendarMovie as _CM
-    is_movie   = isinstance(item, _CM)
-    arr_cfg    = cfg.radarr if is_movie else cfg.sonarr
-    arr_label  = "Radarr" if is_movie else "Sonarr"
-    media_type = "movie"  if is_movie else "tv"
-    title      = item.title if is_movie else item.series_title
-
-    console.print()
-    if is_movie:
-        console.print(f"  [bold]{item.title}[/] [dim]({item.year}) · movie[/]")
-    else:
-        ep_tag = f"S{item.season:02d}E{item.episode:02d}"
-        console.print(f"  [bold]{item.series_title}[/] [dim]· tv · {ep_tag} {item.title}[/]")
-    console.print()
-
-    # ── Stage 1: Seerr (silent — no disambiguation prompt) ────────────────────
-    if cfg.seerr is None:
-        _pipeline_row(1, "Seerr Request", "·", "dim", "Not configured", "")
-        seerr_result = None
-    else:
-        seerr_result = None
-        try:
-            with console.status("[bold]Checking Seerr…[/]"):
-                results = seerr_search(cfg.seerr, title)
-            # Prefer exact title match of correct type; fall back to first of correct type
-            seerr_result = next(
-                (r for r in results if r.media_type == media_type and r.title.lower() == title.lower()),
-                next((r for r in results if r.media_type == media_type), None),
-            )
-        except Exception:
-            pass
-        if seerr_result is None:
-            _pipeline_row(1, "Seerr Request", "·", "dim", "Not requested", "")
-        else:
-            if media_type == "tv" and seerr_result.seerr_media_id != 0:
-                with console.status("[bold]Fetching season details…[/]"):
-                    seerr_enrich_tv_seasons(cfg.seerr, seerr_result)
-            icon, style, summary, detail = _stage_seerr(seerr_result)
-            _pipeline_row(1, "Seerr Request", icon, style, summary, detail)
-
-    # ── Stage 2: Arr (use known IDs — no extra search needed) ─────────────────
-    arr_record = None
-    arr_queue: list = []
-    import_date = ""
-
-    if arr_cfg is None:
-        _pipeline_row(2, arr_label, "·", "dim", "Not configured", "add to config.yaml")
-    else:
-        with console.status(f"[bold]Querying {arr_label}…[/]"):
-            try:
-                if is_movie:
-                    arr_record = get_movie_by_id(arr_cfg, item.arr_id) if item.arr_id else None
-                    if arr_record is None and item.tmdb_id:
-                        arr_record = get_movie_by_tmdb(arr_cfg, item.tmdb_id)
-                else:
-                    arr_record = get_series_by_id(arr_cfg, item.series_id) if item.series_id else None
-                    if arr_record is None:
-                        arr_record = get_series_by_title(arr_cfg, title)
-                arr_queue = arr_get_queue(arr_cfg)
-                if arr_record and is_movie:
-                    import_date = get_movie_import_date(arr_cfg, arr_record.arr_id)
-            except Exception as e:
-                console.print(f"  [dim]  ({arr_label} error: {e})[/]")
-
-        if arr_record is None:
-            _pipeline_row(2, arr_label, "✗", "dim", "Not in library", "")
-        else:
-            icon, style, summary, detail = _stage_arr(arr_record)
-            _pipeline_row(2, arr_label, icon, style, summary, detail)
-
-    # ── Stage 3: Download ─────────────────────────────────────────────────────
-    queue_items = []
-    if arr_record and arr_queue:
-        if is_movie and isinstance(arr_record, ArrMovieRecord):
-            queue_items = [q for q in arr_queue if q.movie_id == arr_record.arr_id]
-        elif not is_movie and isinstance(arr_record, ArrSeriesRecord):
-            queue_items = [q for q in arr_queue if q.series_id == arr_record.arr_id]
-
-    icon, style, summary, detail = _stage_download(queue_items, arr_record, import_date)
-    _pipeline_row(3, "Download", icon, style, summary, detail)
-
-    # ── Stage 4: Plex ─────────────────────────────────────────────────────────
-    plex_match = None
-    plex_err = ""
-    if cfg.plex is None:
-        _pipeline_row(4, "Plex", "·", "dim", "Not configured", "add plex: to config.yaml")
-    else:
-        with console.status("[bold]Checking Plex…[/]"):
-            try:
-                plex_match = plex_find_media(cfg.plex, title, media_type)
-            except Exception as e:
-                plex_match = None
-                plex_err = str(e)
-
-        _render_plex_row(plex_match, plex_err if plex_match is None else "")
-
-    console.print()
-    return arr_record, plex_match, is_movie
+            console.print(f"[red]✗[/] {lib.title}: {err}" if err else f"[green]✓[/] Scan queued for '{lib.title}'")
 
 
 @media_app.command("pipeline")
 def pipeline_cmd(
-    query: str = typer.Argument(..., help="Movie or TV show title to look up"),
+    query: str = typer.Argument(None, help="Movie or TV show title to look up"),
+    tmdb: int = typer.Option(0, "--tmdb", help="Exact TMDB ID (needs --type)"),
+    media_type: str = typer.Option("", "--type", "-t", help="'movie' or 'tv' — filters search, required with --tmdb"),
+    pick: int = typer.Option(0, "--pick", "-p", help="Take result N from the search list (no prompt)"),
+    output: _Out = typer.Option(_Out.table, "-o", help="Output format"),
+    no_menu: bool = typer.Option(False, "--no-menu", help="Skip the follow-up action prompt"),
 ) -> None:
-    """Show the complete media pipeline: request → *arr → download → Plex."""
-    cfg  = _load()
-    pick = _seerr_pick(cfg, query)
-    if pick is None:
+    """Trace one title: Seerr request → Radarr/Sonarr → download → Plex.
+
+    [dim]Non-interactive: ambiguous titles exit 2 with candidates — use --pick N or --tmdb ID --type T.[/]
+    """
+    cfg = _load()
+    as_json = output == _Out.json
+    pick_r = _resolve_title(cfg, query, tmdb, media_type, pick, as_json)
+    p = _pipeline_collect(cfg, _target_from_seerr(pick_r))
+    if as_json:
+        _print_json(_pipeline_json(p))
+        return
+    _pipeline_render(p)
+    if _interactive() and not no_menu:
+        _pipeline_menu(cfg, p)
+
+
+# ── forced searches (guard-railed) ───────────────────────────────────────────
+#
+# Seerr sometimes never triggers a search, so atc can force one. Unbounded
+# searches got indexers throttled before (duplicate indexers × a 1,000+ item
+# backlog), so every search path goes through the same rails:
+#   1. media_search.enabled in config.yaml (off by default; --force = one-off)
+#   2. indexer health: refuse when < media_search.min_healthy_pct of the
+#      auto-search indexers are healthy (--force overrides)
+#   3. per-item cooldown with backoff (lib/search_state.py)
+#   4. batches capped at media_search.max_items
+#   5. never search something already downloading or stuck in the queue
+
+def _search_gate(cfg, arr_cfg, label: str, force: bool) -> tuple[bool, str]:
+    """(allowed, message). Message is shown either way."""
+    ms = cfg.media_search
+    if not ms.enabled and not force:
+        return False, ("Forced searches are off ([bold]media_search.enabled: false[/] in config.yaml) "
+                       "— re-run with [bold]--force[/] for a one-off.")
+    try:
+        ih = arr_get_indexer_health(arr_cfg)
+    except Exception as e:
+        msg = f"{label}: couldn't check indexer health ({e})"
+        return force, msg + ("" if force else " — refusing; --force to override")
+    if ih.total == 0:
+        return False, f"{label}: no indexers have automatic search enabled — nothing to search with"
+    msg = f"{label} indexers: {ih.healthy}/{ih.total} healthy"
+    if ih.failing:
+        msg += f" [dim](failing: {', '.join(sorted(ih.failing))})[/]"
+    if ih.ratio * 100 < ms.min_healthy_pct and not force:
+        return False, (msg + f"\n  Below media_search.min_healthy_pct ({ms.min_healthy_pct}%) — indexers are "
+                       "backing off; searching now makes it worse. --force to override.")
+    return True, msg
+
+
+def _targeted_search(cfg, p: _Pipeline, season: int, dry_run: bool, force: bool, yes: bool,
+                     as_json: bool = False) -> dict:
+    """Force one movie / series / season search. Returns a result dict; exits on refusal."""
+    t = p.target
+    is_movie = t.media_type == MEDIA_TYPE_MOVIE
+    label = "Radarr" if is_movie else "Sonarr"
+    arr_cfg = cfg.radarr if is_movie else cfg.sonarr
+    rec = p.arr_record
+    result = {"title": t.title, "media_type": t.media_type, "fired": False, "reason": ""}
+
+    say = econsole.print if as_json else console.print
+
+    def _stop(reason: str, code: int = 0):
+        result["reason"] = reason
+        if as_json:
+            _print_json(result)
+        else:
+            console.print(f"[yellow]⏸[/] {reason}")
+        raise typer.Exit(code)
+
+    if arr_cfg is None:
+        _stop(f"{label} not configured", 1)
+    if rec is None:
+        _stop(f"{t.title} isn't in {label} — request it first: "
+              f"atc media seerr request {t.tmdb_id} --type {t.media_type}", 1)
+    if isinstance(rec, ArrMovieRecord) and rec.has_file and not force:
+        _stop(f"{t.title} already has a file in Radarr")
+    if p.queue_items and not force:
+        q = p.queue_items[0]
+        state = q.tracked_state or q.status
+        _stop(f"{t.title} is already in the {label} queue ({state}) — see `atc media queue`"
+              + (f"; {q.hint}" if q.hint else ""))
+
+    key = f"movie:{rec.arr_id}" if is_movie else f"series:{rec.arr_id}" + (f":s{season}" if season >= 0 else "")
+    state = _load_search_state(cfg.config_path)
+    ok, why = state.can_search(key)
+    if not ok and not force:
+        _stop(f"Searched recently — {why}. --force to override.", EXIT_REFUSED)
+
+    allowed, gate_msg = _search_gate(cfg, arr_cfg, label, force)
+    say(f"  {gate_msg}")
+    if not allowed and not dry_run:
+        _stop("Search refused by guard rail.", EXIT_REFUSED)
+
+    if is_movie:
+        plan = f"MoviesSearch → {t.title}"
+    elif season >= 0:
+        plan = f"SeasonSearch → {t.title} season {season}"
+    else:
+        plan = f"SeriesSearch → {t.title} (all monitored missing episodes)"
+    result["plan"] = plan
+    if dry_run:
+        say(f"  [dim]Dry run — would fire {plan}[/]")
+        result["reason"] = "dry run"
+        return result
+    if not _confirm(f"Fire {plan}?", yes):
+        _stop("Not confirmed.")
+
+    with console.status(f"[bold]Triggering {label} search…[/]"):
+        try:
+            if is_movie:
+                cmd = radarr_search_movies(arr_cfg, [rec.arr_id])
+            elif season >= 0:
+                cmd = sonarr_search_season(arr_cfg, rec.arr_id, season)
+            else:
+                cmd = sonarr_search_series(arr_cfg, rec.arr_id)
+        except Exception as e:
+            econsole.print(f"[red]Error:[/] {e}")
+            raise typer.Exit(1)
+    state.record_search(key)
+    if not as_json:
+        _arr_result(cmd)
+    result.update(fired=True, command=cmd.name, command_id=cmd.command_id)
+    return result
+
+
+@media_app.command("search")
+def media_search_cmd(
+    query: str = typer.Argument(None, help="Movie or TV show title"),
+    tmdb: int = typer.Option(0, "--tmdb", help="Exact TMDB ID (needs --type)"),
+    media_type: str = typer.Option("", "--type", "-t", help="'movie' or 'tv'"),
+    pick: int = typer.Option(0, "--pick", "-p", help="Take result N from the search list"),
+    season: int = typer.Option(-1, "--season", "-s", help="TV: search only this season"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Show the plan and guard-rail checks, fire nothing"),
+    force: bool = typer.Option(False, "--force", help=_FORCE_ONE_HELP),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation"),
+    output: _Out = typer.Option(_Out.table, "-o", help="Output format"),
+) -> None:
+    """Force an indexer search for ONE title Seerr didn't pick up.
+
+    Use when a request sits as "Monitored — missing" and nothing is downloading.
+    Requests themselves still go through Seerr ([bold]atc media seerr request[/]).
+    """
+    cfg = _load()
+    as_json = output == _Out.json
+    pick_r = _resolve_title(cfg, query, tmdb, media_type, pick, as_json)
+    p = _pipeline_collect(cfg, _target_from_seerr(pick_r))
+    if not as_json:
+        _pipeline_render(p)
+    res = _targeted_search(cfg, p, season, dry_run, force, yes, as_json)
+    if as_json:
+        _print_json(res)
+
+
+def _search_missing(cfg, arr_cfg, label: str, limit: int, dry_run: bool, force: bool, yes: bool) -> None:
+    """Search the newest N missing items, skipping queued/cooled-down ones.
+
+    Replaces the old broad MissingMoviesSearch/MissingEpisodeSearch, which fanned
+    out to the whole backlog at once. Each searched item cools down 2h → 8h → 24h
+    (broad tiers), so repeated runs roll forward through the backlog instead of
+    re-hitting the same items. --force does NOT bypass cooldowns here.
+    """
+    is_radarr = arr_cfg.name == "radarr"
+    limit = limit or cfg.media_search.max_items
+    state = _load_search_state(cfg.config_path)
+    with console.status(f"[bold]Fetching {label} missing list + queue…[/]"):
+        missing = arr_get_missing(arr_cfg, page_size=min(250, max(50, limit * 5)))
+        queue = arr_get_queue(arr_cfg)
+    queued = {q.movie_id for q in queue} if is_radarr else {q.episode_id for q in queue}
+    picked, skipped = [], _Counter()
+    for m in missing:
+        if len(picked) >= limit:
+            break
+        if m.arr_id in queued:
+            skipped["in queue"] += 1
+            continue
+        if not state.can_search(f"{'movie' if is_radarr else 'episode'}:{m.arr_id}", broad=True)[0]:
+            skipped["cooldown"] += 1
+            continue
+        picked.append(m)
+
+    console.print()
+    console.rule(f"[bold]{label} · search missing[/]  [dim]newest first · limit {limit}[/]")
+    for m in picked:
+        if is_radarr:
+            console.print(f"    [yellow]→[/] [bold]{m.title}[/] [dim]({m.year}) {m.date}[/]")
+        else:
+            ep = f"S{m.season:02d}E{m.episode:02d}"
+            console.print(f"    [yellow]→[/] [bold]{m.title}[/]  [dim]{ep} {m.episode_title} · {m.date}[/]")
+    if skipped:
+        console.print("  [dim]skipped: " + ", ".join(f"{n} {k}" for k, n in skipped.items()) + "[/]")
+    if not picked:
+        console.print("  [dim]Nothing to search.[/]")
+        return
+
+    allowed, gate_msg = _search_gate(cfg, arr_cfg, label, force)
+    console.print(f"  {gate_msg}")
+    if dry_run:
+        console.print(f"  [dim]Dry run — would search {len(picked)} item(s).[/]")
+        return
+    if not allowed:
+        raise typer.Exit(EXIT_REFUSED)
+    if not _confirm(f"Search {len(picked)} item(s) in {label}?", yes):
+        raise typer.Exit(0)
+    ids = [m.arr_id for m in picked]
+    try:
+        cmd = radarr_search_movies(arr_cfg, ids) if is_radarr else sonarr_search_episodes(arr_cfg, ids)
+    except Exception as e:
+        console.print(f"[red]Error:[/] {e}")
         raise typer.Exit(1)
-    arr_record, plex_match, is_movie = _display_pipeline(cfg, pick)
-    _pipeline_interactive_menu(cfg, arr_record, plex_match, is_movie)
+    for i in ids:
+        state.record_search(f"{'movie' if is_radarr else 'episode'}:{i}", broad=True)
+    _arr_result(cmd)
 
 
 # ── radarr / sonarr ───────────────────────────────────────────────────────────
 
-from lib.search_state import load_state as _load_search_state
-from lib.arr import (
-    get_status as arr_get_status,
-    radarr_scan, radarr_search_missing, radarr_search_movies,
-    sonarr_scan, sonarr_search_missing, sonarr_search_episodes, sonarr_search_series,
-    get_today_imports as arr_get_today_imports,
-)
-
-
-def _arr_result(cmd) -> None:
-    """Print the result of a dispatched Servarr command."""
-    console.print(
-        f"[green]✓[/] Command [bold]{cmd.name}[/] queued "
-        f"(id={cmd.command_id}, status={cmd.status})"
-        + (f" — {cmd.message}" if cmd.message else "")
-    )
-
-
-# ── radarr ────────────────────────────────────────────────────────────────────
-
-radarr_app = typer.Typer(
-    help="Manage Radarr (movies)",
-    no_args_is_help=True,
-    rich_markup_mode="rich",
-)
+radarr_app = typer.Typer(help="Manage Radarr (movies)", no_args_is_help=True, rich_markup_mode="rich")
 media_app.add_typer(radarr_app, name="radarr")
+sonarr_app = typer.Typer(help="Manage Sonarr (TV shows)", no_args_is_help=True, rich_markup_mode="rich")
+media_app.add_typer(sonarr_app, name="sonarr")
 
-
-def _radarr(cfg: Config):
-    if cfg.radarr is None:
-        console.print("[red]No radarr section in config.yaml[/]")
-        raise typer.Exit(1)
-    return cfg.radarr
-
-
-@radarr_app.command("status")
-def radarr_status_cmd() -> None:
-    """Show Radarr version and connectivity."""
-    cfg = _load()
-    with console.status("[bold]Querying Radarr…[/]"):
-        s = arr_get_status(_radarr(cfg))
-    if s.online:
-        console.print(f"[green]✓[/] {s.app_name} {s.version} online")
-    else:
-        console.print(f"[red]✗[/] Radarr offline: {s.error}")
 
 
 @radarr_app.command("scan")
@@ -6076,57 +6358,14 @@ def radarr_scan_cmd() -> None:
 
 @radarr_app.command("search-missing")
 def radarr_search_missing_cmd(
+    limit: int = typer.Option(0, "--limit", "-n", help=_LIMIT_HELP),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Show what would be searched"),
+    force: bool = typer.Option(False, "--force", help=_FORCE_BATCH_HELP),
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation prompt"),
 ) -> None:
-    """Search for all missing movies."""
-    if not ENABLE_ARR_SEARCH:
-        console.print("[yellow]⚑[/] Arr search is disabled (ENABLE_ARR_SEARCH=False).")
-        raise typer.Exit(0)
-    if not yes:
-        if not Confirm.ask("Trigger missing movies search? (may be slow)"):
-            raise typer.Exit(0)
+    """Search the newest N missing movies (capped, cooled-down batches)."""
     cfg = _load()
-    state = _load_search_state(cfg.config_path)
-    allowed, reason = state.can_search("missing_movies", broad=True)
-    if not allowed:
-        console.print(f"[yellow]⏸[/] Search throttled — {reason}")
-        raise typer.Exit(0)
-    with console.status("[bold]Triggering Radarr missing search…[/]"):
-        try:
-            _arr_result(radarr_search_missing(_radarr(cfg)))
-            state.record_search("missing_movies", broad=True)
-        except Exception as e:
-            console.print(f"[red]Error:[/] {e}")
-            raise typer.Exit(1)
-
-
-# ── sonarr ────────────────────────────────────────────────────────────────────
-
-sonarr_app = typer.Typer(
-    help="Manage Sonarr (TV shows)",
-    no_args_is_help=True,
-    rich_markup_mode="rich",
-)
-media_app.add_typer(sonarr_app, name="sonarr")
-
-
-def _sonarr(cfg: Config):
-    if cfg.sonarr is None:
-        console.print("[red]No sonarr section in config.yaml[/]")
-        raise typer.Exit(1)
-    return cfg.sonarr
-
-
-@sonarr_app.command("status")
-def sonarr_status_cmd() -> None:
-    """Show Sonarr version and connectivity."""
-    cfg = _load()
-    with console.status("[bold]Querying Sonarr…[/]"):
-        s = arr_get_status(_sonarr(cfg))
-    if s.online:
-        console.print(f"[green]✓[/] {s.app_name} {s.version} online")
-    else:
-        console.print(f"[red]✗[/] Sonarr offline: {s.error}")
+    _search_missing(cfg, _radarr(cfg), "Radarr", limit, dry_run, force, yes)
 
 
 @sonarr_app.command("scan")
@@ -6143,53 +6382,25 @@ def sonarr_scan_cmd() -> None:
 
 @sonarr_app.command("search-missing")
 def sonarr_search_missing_cmd(
+    limit: int = typer.Option(0, "--limit", "-n", help=_LIMIT_HELP),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Show what would be searched"),
+    force: bool = typer.Option(False, "--force", help=_FORCE_BATCH_HELP),
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation prompt"),
 ) -> None:
-    """Search for all missing monitored episodes."""
-    if not ENABLE_ARR_SEARCH:
-        console.print("[yellow]⚑[/] Arr search is disabled (ENABLE_ARR_SEARCH=False).")
-        raise typer.Exit(0)
-    if not yes:
-        if not Confirm.ask("Trigger missing episodes search? (may be slow)"):
-            raise typer.Exit(0)
+    """Search the newest N missing episodes (capped, cooled-down batches)."""
     cfg = _load()
-    state = _load_search_state(cfg.config_path)
-    allowed, reason = state.can_search("missing_episodes", broad=True)
-    if not allowed:
-        console.print(f"[yellow]⏸[/] Search throttled — {reason}")
-        raise typer.Exit(0)
-    with console.status("[bold]Triggering Sonarr missing search…[/]"):
-        try:
-            _arr_result(sonarr_search_missing(_sonarr(cfg)))
-            state.record_search("missing_episodes", broad=True)
-        except Exception as e:
-            console.print(f"[red]Error:[/] {e}")
-            raise typer.Exit(1)
+    _search_missing(cfg, _sonarr(cfg), "Sonarr", limit, dry_run, force, yes)
 
 
 # ── seerr ─────────────────────────────────────────────────────────────────────
 
-from lib.seerr import (
-    search as seerr_search,
-    request_media as seerr_request_media,
-    list_requests as seerr_list_requests,
-    enrich_tv_seasons as seerr_enrich_tv_seasons,
-    MEDIA_TYPE_MOVIE, MEDIA_TYPE_TV,
-)
-
-seerr_app = typer.Typer(
-    help="Search and request media via Seerr",
-    no_args_is_help=True,
-    rich_markup_mode="rich",
-)
+seerr_app = typer.Typer(help="Search and request media via Seerr", no_args_is_help=True, rich_markup_mode="rich")
 media_app.add_typer(seerr_app, name="seerr")
 
-
-def _seerr(cfg: Config):
-    if cfg.seerr is None:
-        console.print("[red]No seerr section in config.yaml[/]")
-        raise typer.Exit(1)
-    return cfg.seerr
+_SEERR_STATUS_STYLE = {
+    "available": "green", "partially available": "cyan", "processing": "cyan",
+    "pending": "yellow", "deleted": "yellow", "blocklisted": "red",
+}
 
 
 @seerr_app.command("search")
@@ -6198,12 +6409,10 @@ def seerr_search_cmd(
     output: _Out = typer.Option(_Out.table, "-o", help="Output format"),
     json_flag: bool = typer.Option(False, "-j", is_flag=True, hidden=True, help="JSON output (shorthand for -o json)"),
 ) -> None:
-    """Search for movies and TV shows."""
+    """Search for movies and TV shows. JSON includes poster_url (TMDB w500)."""
     if json_flag:
         output = _Out.json
-    cfg = _load()
-    sc = _seerr(cfg)
-
+    sc = _seerr(_load())
     with console.status("[bold]Searching…[/]"):
         try:
             results = seerr_search(sc, query)
@@ -6211,16 +6420,15 @@ def seerr_search_cmd(
             console.print(f"[red]Error:[/] {e}")
             raise typer.Exit(1)
 
+    if output == _Out.json:
+        _print_json([
+            {"id": r.id, "type": r.media_type, "title": r.title, "year": r.year,
+             "overview": r.overview, "status": r.status, "poster_url": r.poster_url}
+            for r in results
+        ])
+        return
     if not results:
         console.print("[dim]No results.[/]")
-        return
-
-    if output == _Out.json:
-        console.print_json(_json.dumps([
-            {"id": r.id, "type": r.media_type, "title": r.title, "year": r.year,
-             "overview": r.overview, "status": r.status}
-            for r in results
-        ]))
         return
 
     t = Table(box=box.SIMPLE, show_header=True, pad_edge=False)
@@ -6231,170 +6439,251 @@ def seerr_search_cmd(
     t.add_column("Status")
     if output == _Out.wide:
         t.add_column("Overview")
-
     for r in results:
-        status_style = {
-            "available": "green",
-            "pending": "yellow",
-            "processing": "cyan",
-            "partially available": "cyan",
-        }.get(r.status, "dim")
         row = [str(r.id), r.media_type, r.title, r.year,
-               f"[{status_style}]{r.status}[/]"]
+               f"[{_SEERR_STATUS_STYLE.get(r.status, 'dim')}]{r.status}[/]"]
         if output == _Out.wide:
             row.append(r.overview)
         t.add_row(*row)
-
     console.print(t)
-    console.print(f"[dim]{len(results)} result(s) — use ID with [bold]atc media seerr request <id> --type movie|tv[/][/]")
+    console.print(f"[dim]{len(results)} result(s) — use ID with "
+                  "[bold]atc media seerr request <id> --type movie|tv[/][/]")
+
+
+def _parse_seasons(raw: str) -> list[int] | None:
+    if not raw:
+        return None
+    try:
+        out: set[int] = set()
+        for part in raw.split(","):
+            part = part.strip()
+            if "-" in part:
+                a, b = part.split("-", 1)
+                out.update(range(int(a), int(b) + 1))
+            elif part:
+                out.add(int(part))
+        return sorted(out)
+    except ValueError:
+        console.print(f"[red]--seasons must look like 1,3 or 2-4 (got {raw!r})[/]")
+        raise typer.Exit(2)
 
 
 @seerr_app.command("request")
 def seerr_request_cmd(
     tmdb_id: int = typer.Argument(..., help="TMDB ID from search results"),
     media_type: str = typer.Option(..., "--type", "-t", help="'movie' or 'tv'"),
+    seasons: str = typer.Option("", "--seasons", help="TV only: e.g. 1,3 or 2-4 (default: all)"),
+    force: bool = typer.Option(False, "--force", help="Skip the already-available/already-requested check"),
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation prompt"),
+    output: _Out = typer.Option(_Out.table, "-o", help="Output format"),
 ) -> None:
-    """Request a movie or TV show by TMDB ID."""
+    """Request a movie or TV show by TMDB ID. Refuses duplicates unless --force."""
     if media_type not in (MEDIA_TYPE_MOVIE, MEDIA_TYPE_TV):
         console.print("[red]--type must be 'movie' or 'tv'[/]")
         raise typer.Exit(1)
+    season_list = _parse_seasons(seasons)
+    if season_list and media_type != MEDIA_TYPE_TV:
+        console.print("[red]--seasons only applies to --type tv[/]")
+        raise typer.Exit(2)
+    as_json = output == _Out.json
+    sc = _seerr(_load())
 
-    cfg = _load()
-    sc = _seerr(cfg)
+    title = f"TMDB {tmdb_id}"
+    if not force:
+        try:
+            chk = seerr_check_requestable(sc, tmdb_id, media_type, season_list)
+        except Exception as e:
+            console.print(f"[red]Error checking existing status:[/] {e} (use --force to skip the check)")
+            raise typer.Exit(1)
+        title = chk.title or title
+        if not chk.ok:
+            if as_json:
+                _print_json({"requested": False, "reason": chk.reason, "tmdb_id": tmdb_id, "type": media_type})
+            else:
+                console.print(f"[yellow]⏸[/] {chk.reason} — not requesting (use --force to request anyway)")
+            return
+        if chk.reason:
+            console.print(f"[dim]{chk.reason}[/]")
+        season_list = chk.seasons if chk.seasons is not None else season_list
 
-    if not yes:
-        confirmed = Confirm.ask(f"Request [bold]{media_type}[/] with TMDB ID [bold]{tmdb_id}[/]?")
-        if not confirmed:
-            raise typer.Exit(0)
+    if season_list:
+        scope = f" seasons {','.join(map(str, season_list))}"
+    else:
+        scope = " (all seasons)" if media_type == MEDIA_TYPE_TV else ""
+    if not _confirm(f"Request [bold]{title}[/] ({media_type}){scope}?", yes):
+        raise typer.Exit(0)
 
     with console.status("[bold]Submitting request…[/]"):
         try:
-            result = seerr_request_media(sc, tmdb_id, media_type)
+            result = seerr_request_media(sc, tmdb_id, media_type, season_list)
         except Exception as e:
             console.print(f"[red]Error:[/] {e}")
             raise typer.Exit(1)
-
-    console.print(
-        f"[green]✓[/] Requested [bold]{result.title}[/] "
-        f"(#{result.request_id}) — status: [bold]{result.status}[/]"
-    )
-
-
-def _seerr_list_body(
-    show_all: bool,
-    tv_only: bool,
-    movies_only: bool,
-    processing_only: bool,
-    output: _Out,
-) -> None:
-    cfg = _load()
-    sc = _seerr(cfg)
-
-    with console.status("[bold]Fetching requests…[/]"):
-        try:
-            reqs = seerr_list_requests(sc)
-        except Exception as e:
-            console.print(f"[red]Error:[/] {e}")
-            raise typer.Exit(1)
-
-    if not show_all:
-        reqs = [r for r in reqs if r.media_status_code != 5]
-    if tv_only:
-        reqs = [r for r in reqs if r.media_type == "tv"]
-    if movies_only:
-        reqs = [r for r in reqs if r.media_type == "movie"]
-    if processing_only:
-        reqs = [r for r in reqs if r.request_status_code == 2 and r.media_status_code != 5]
-
-    if not reqs:
-        console.print("[dim]No requests.[/]")
+    if as_json:
+        _print_json({"requested": True, "request_id": result.request_id, "title": result.title,
+                     "status": result.status, "seasons": season_list or "all"})
         return
-
-    if output == _Out.json:
-        console.print_json(_json.dumps([
-            {
-                "id": r.request_id, "type": r.media_type, "title": r.title,
-                "tmdb_id": r.tmdb_id, "request_status": r.request_status,
-                "media_status": r.media_status, "requested_by": r.requested_by,
-                "created_at": r.created_at,
-            }
-            for r in reqs
-        ]))
-        return
-
-    _REQ_STYLE = {"pending": "yellow", "approved": "green", "declined": "red", "failed": "red"}
-    _MED_STYLE = {
-        "available": "green", "partially available": "cyan",
-        "processing": "cyan", "pending": "yellow",
-    }
-
-    t = Table(box=box.SIMPLE, show_header=True, pad_edge=False)
-    t.add_column("#", justify="right", style="dim")
-    t.add_column("Type", style="dim")
-    t.add_column("Title", style="bold")
-    t.add_column("Req'd By")
-    t.add_column("Date")
-    t.add_column("Request")
-    t.add_column("Media")
-
-    for r in reqs:
-        req_s = _REQ_STYLE.get(r.request_status, "dim")
-        med_s = _MED_STYLE.get(r.media_status, "dim")
-        t.add_row(
-            str(r.request_id),
-            r.media_type,
-            r.title,
-            r.requested_by,
-            r.created_at,
-            f"[{req_s}]{r.request_status}[/]",
-            f"[{med_s}]{r.media_status}[/]",
-        )
-
-    console.print(t)
-    console.print(f"[dim]{len(reqs)} request(s)[/]")
+    console.print(f"[green]✓[/] Requested [bold]{result.title}[/]{scope} "
+                  f"(#{result.request_id}) — status: [bold]{result.status}[/]")
 
 
 @seerr_app.command("list")
 def seerr_list_cmd(
-    show_all: bool = typer.Option(False, "--all", "-a", help="Include fulfilled (available) requests"),
+    show_all: bool = typer.Option(False, "--all", "-a", help="Include fulfilled and declined requests"),
     tv_only: bool = typer.Option(False, "--tv", "-t", help="Series only"),
     movies_only: bool = typer.Option(False, "--movies", "-m", help="Movies only"),
-    processing_only: bool = typer.Option(False, "--processing", "-p", help="Approved and in-flight (not yet available)"),
+    processing_only: bool = typer.Option(False, "--processing", "-p", help="Approved, not yet available"),
+    failed_only: bool = typer.Option(False, "--failed", "-f", help="Failed requests only"),
     output: _Out = typer.Option(_Out.table, "-o", help="Output format"),
     json_flag: bool = typer.Option(False, "-j", is_flag=True, hidden=True, help="JSON output (shorthand for -o json)"),
 ) -> None:
     """List media requests. Unfulfilled only by default.
 
-    [dim]Filters: [bold]-t[/] tv  [bold]-m[/] movies  [bold]-p[/] processing  [bold]-a[/] all[/]
+    [dim]Filters: [bold]-t[/] tv  [bold]-m[/] movies  [bold]-p[/] processing  [bold]-f[/] failed  [bold]-a[/] all[/]
     """
     if json_flag:
         output = _Out.json
-    _seerr_list_body(show_all, tv_only, movies_only, processing_only, output)
+    sc = _seerr(_load())
+    with console.status("[bold]Fetching requests…[/]"):
+        try:
+            # All pages, then filter, then look up titles only for what's shown.
+            reqs = seerr_list_requests(sc, fetch_all=True, enrich=False)
+        except Exception as e:
+            console.print(f"[red]Error:[/] {e}")
+            raise typer.Exit(1)
+        if not show_all:
+            # Unfulfilled = still actionable: not available, not completed, not declined.
+            reqs = [r for r in reqs if r.media_status_code != 5 and r.request_status_code not in (3, 5)]
+        if tv_only:
+            reqs = [r for r in reqs if r.media_type == MEDIA_TYPE_TV]
+        if movies_only:
+            reqs = [r for r in reqs if r.media_type == MEDIA_TYPE_MOVIE]
+        if processing_only:
+            reqs = [r for r in reqs if r.request_status_code == 2 and r.media_status_code != 5]
+        if failed_only:
+            reqs = [r for r in reqs if r.request_status_code == 4]
+        seerr_enrich_titles(sc, reqs)
+
+    if output == _Out.json:
+        _print_json([
+            {"id": r.request_id, "type": r.media_type, "title": r.title, "tmdb_id": r.tmdb_id,
+             "request_status": r.request_status, "media_status": r.media_status,
+             "requested_by": r.requested_by, "created_at": r.created_at}
+            for r in reqs
+        ])
+        return
+    if not reqs:
+        console.print("[dim]No requests.[/]")
+        return
+
+    req_style = {"pending": "yellow", "approved": "green", "completed": "green", "declined": "red", "failed": "red"}
+    t = Table(box=box.SIMPLE, show_header=True, pad_edge=False)
+    for col in ("#", "Type", "Title", "Req'd By", "Date", "Request", "Media"):
+        t.add_column(col, justify="right" if col == "#" else "left",
+                     style="dim" if col in ("#", "Type") else ("bold" if col == "Title" else None))
+    for r in reqs:
+        t.add_row(
+            str(r.request_id), r.media_type, r.title, r.requested_by, r.created_at,
+            f"[{req_style.get(r.request_status, 'dim')}]{r.request_status}[/]",
+            f"[{_SEERR_STATUS_STYLE.get(r.media_status, 'dim')}]{r.media_status}[/]",
+        )
+    console.print(t)
+    console.print(f"[dim]{len(reqs)} request(s)[/]")
 
 
-@seerr_app.command("ls", hidden=True)
-def seerr_ls_cmd(
-    show_all: bool = typer.Option(False, "--all", "-a", help="Include fulfilled (available) requests"),
-    tv_only: bool = typer.Option(False, "--tv", "-t", help="Series only"),
-    movies_only: bool = typer.Option(False, "--movies", "-m", help="Movies only"),
-    processing_only: bool = typer.Option(False, "--processing", "-p", help="Approved and in-flight (not yet available)"),
+# Hidden `ls` alias — repo-wide convention (get/secrets/backup have the same),
+# advertised by `atc tree` via _GROUP_ALIASES.
+seerr_app.command("ls", hidden=True)(seerr_list_cmd)
+
+
+# ── media queue ───────────────────────────────────────────────────────────────
+
+def _queue_rows(cfg, which: str = "") -> list[dict]:
+    rows: list[dict] = []
+    for label, acfg in (("radarr", cfg.radarr), ("sonarr", cfg.sonarr)):
+        if acfg is None or (which and which != label):
+            continue
+        for g in arr_group_queue(arr_get_queue(acfg)):
+            f = g.first
+            rows.append({
+                "service": label,
+                "title": g.title,
+                "series": f.series_title,
+                "items": len(g.items),
+                "status": f.status,
+                "state": f.tracked_state,
+                "progress_pct": round(f.progress_pct, 1),
+                "size_bytes": f.size_bytes,
+                "time_left": f.time_left,
+                "indexer": f.indexer,
+                "added": f.added,
+                "stuck": g.stuck,
+                "reason": f.error_message,
+                "hint": g.hint,
+                "queue_ids": [i.queue_id for i in g.items],
+                "download_id": g.download_id,
+            })
+    return rows
+
+
+@media_app.command("queue")
+def media_queue_cmd(
+    stuck: bool = typer.Option(False, "--stuck", "-s", help="Only items that need attention"),
+    radarr: bool = typer.Option(False, "--radarr", help="Radarr only"),
+    sonarr: bool = typer.Option(False, "--sonarr", help="Sonarr only"),
     output: _Out = typer.Option(_Out.table, "-o", help="Output format"),
-    json_flag: bool = typer.Option(False, "-j", is_flag=True, hidden=True, help="JSON output (shorthand for -o json)"),
 ) -> None:
-    """Alias for [bold]list[/]."""
-    if json_flag:
-        output = _Out.json
-    _seerr_list_body(show_all, tv_only, movies_only, processing_only, output)
+    """Download queue across Radarr + Sonarr, one row per download.
+
+    Season packs show once (with an item count) instead of once per episode.
+    Stuck = import blocked/failed, client warning/error, or an import pending
+    with an error — each with a suggested fix where the *arr's message makes it clear.
+    """
+    cfg = _load()
+    which = "radarr" if radarr and not sonarr else "sonarr" if sonarr and not radarr else ""
+    with console.status("[bold]Fetching queues…[/]"):
+        rows = _queue_rows(cfg, which)
+    if stuck:
+        rows = [r for r in rows if r["stuck"]]
+    if output == _Out.json:
+        _print_json(rows)
+        return
+    if not rows:
+        console.print("[dim]Queue empty.[/]" if not stuck else "[dim]Nothing stuck.[/]")
+        return
+    # Line list, not a table: release names + fix hints are long and a table
+    # collapses to unreadable "…" columns at 80 cols (non-TTY / phone).
+    for r in rows:
+        state = r["state"] or r["status"]
+        style = "red" if r["stuck"] else ("green" if r["progress_pct"] >= 100 else "cyan")
+        eta = f" · ETA {r['time_left']}" if r["time_left"] and r["progress_pct"] < 100 else ""
+        count = f" [dim]×{r['items']}[/]" if r["items"] > 1 else ""
+        console.print(f"  [dim]{r['service'][:1].upper()}[/]  [bold]{r['title']}[/]{count}")
+        meta = f"[{style}]{state}[/] [dim]· {r['progress_pct']:.0f}%{eta}"
+        if output == _Out.wide:
+            meta += f" · {r['indexer']} · added {(r['added'] or '')[:10]}"
+        console.print(f"     {meta}[/]")
+        if r["hint"]:
+            console.print(f"     [yellow]→ {r['hint']}[/]")
+        elif r["reason"]:
+            console.print(f"     [dim]{r['reason'][:120]}[/]")
+    n_stuck = sum(1 for r in rows if r["stuck"])
+    console.print(f"[dim]{len(rows)} download(s)" + (f" · [red]{n_stuck} stuck[/]" if n_stuck else "") + "[/]")
 
 
 # ── media calendar ────────────────────────────────────────────────────────────
 
-from datetime import date as _date, timedelta as _timedelta
-from lib.arr import (
-    get_radarr_calendar, get_sonarr_calendar,
-    CalendarMovie, CalendarEpisode,
-)
+def _calendar_items(cfg, start: _date, end: _date, radarr: bool, sonarr: bool) -> tuple[list, list]:
+    show_all = not (radarr or sonarr)
+    movies: list[CalendarMovie] = []
+    episodes: list[CalendarEpisode] = []
+    if (show_all or radarr) and cfg.radarr:
+        with console.status("[bold]Fetching Radarr calendar…[/]"):
+            movies = get_radarr_calendar(cfg.radarr, start, end)
+    if (show_all or sonarr) and cfg.sonarr:
+        with console.status("[bold]Fetching Sonarr calendar…[/]"):
+            episodes = get_sonarr_calendar(cfg.sonarr, start, end)
+    return movies, episodes
 
 
 @media_app.command("calendar")
@@ -6402,54 +6691,57 @@ def media_calendar_cmd(
     days: int = typer.Argument(7, help="Days to show: positive = ahead, negative = past (default 7)"),
     radarr: bool = typer.Option(False, "--radarr", help="Show only movies"),
     sonarr: bool = typer.Option(False, "--sonarr", help="Show only TV episodes"),
+    pick: int = typer.Option(0, "--pick", "-p", help="Show the pipeline for item N (no prompt)"),
+    output: _Out = typer.Option(_Out.table, "-o", help="Output format"),
 ) -> None:
     """Show Radarr and Sonarr releases. Positive days = upcoming, negative = past."""
     cfg = _load()
-    show_all = not any([radarr, sonarr])
-
+    as_json = output == _Out.json
     today = _date.today()
-    if days >= 0:
-        start, end = today, today + _timedelta(days=days)
-    else:
-        start, end = today + _timedelta(days=days), today
+    start, end = (today, today + _timedelta(days=days)) if days >= 0 else (today + _timedelta(days=days), today)
+    movies, episodes = _calendar_items(cfg, start, end, radarr, sonarr)
 
-    movies:   list[CalendarMovie]   = []
-    episodes: list[CalendarEpisode] = []
-
-    if (show_all or radarr) and cfg.radarr:
-        with console.status("[bold]Fetching Radarr calendar…[/]"):
-            movies = get_radarr_calendar(cfg.radarr, start, end)
-    elif show_all or radarr:
-        console.print("[dim]Radarr not configured — skipping[/]")
-
-    if (show_all or sonarr) and cfg.sonarr:
-        with console.status("[bold]Fetching Sonarr calendar…[/]"):
-            episodes = get_sonarr_calendar(cfg.sonarr, start, end)
-    elif show_all or sonarr:
-        console.print("[dim]Sonarr not configured — skipping[/]")
-
-    if not movies and not episodes:
-        if days >= 0:
-            console.print(f"[dim]Nothing scheduled in the next {days} day(s).[/]")
-        else:
-            console.print(f"[dim]Nothing found in the past {abs(days)} day(s).[/]")
-        return
-
-    # Merge and group by date; keep a flat numbered list for selection
-    from collections import defaultdict
-    by_date: dict[str, list] = defaultdict(list)
+    by_date: dict[str, list] = _defaultdict(list)
     for m in movies:
         by_date[m.release_date].append(m)
     for e in episodes:
         by_date[e.air_date].append(e)
+    numbered = [item for day in sorted(by_date) for item in by_date[day]]
+
+    if pick:
+        if not 1 <= pick <= len(numbered):
+            console.print(f"[red]--pick must be 1..{len(numbered)}[/]")
+            raise typer.Exit(2)
+        p = _pipeline_collect(cfg, _target_from_calendar(numbered[pick - 1]))
+        if as_json:
+            _print_json(_pipeline_json(p))
+        else:
+            _pipeline_render(p)
+            if _interactive():
+                _pipeline_menu(cfg, p)
+        return
+
+    if as_json:
+        out = []
+        for n, item in enumerate(numbered, 1):
+            if isinstance(item, CalendarMovie):
+                out.append({"n": n, "type": "movie", "date": item.release_date, **_asdict(item)})
+            else:
+                out.append({"n": n, "type": "episode", "date": item.air_date, **_asdict(item)})
+        _print_json(out)
+        return
+
+    if not numbered:
+        span = f"in the next {days} day(s)" if days >= 0 else f"in the past {abs(days)} day(s)"
+        console.print(f"[dim]Nothing found {span}.[/]")
+        return
 
     if days >= 0:
         console.rule(f"[bold]Upcoming[/]  [dim]next {days} days · {start} → {end}[/]")
     else:
         console.rule(f"[bold]Past releases[/]  [dim]last {abs(days)} days · {start} → {end}[/]")
     console.print()
-
-    numbered: list = []   # flat ordered list matching displayed numbers
+    n = 0
     for day in sorted(by_date):
         d = _date.fromisoformat(day)
         label = d.strftime("%a %b %d")
@@ -6461,22 +6753,19 @@ def media_calendar_cmd(
             label += " [dim](yesterday)[/]"
         console.print(f"  [bold cyan]{label}[/]")
         for item in by_date[day]:
-            numbered.append(item)
-            n = len(numbered)
+            n += 1
+            icon = "[green]✓[/]" if item.has_file else "[dim]·[/]"
             if isinstance(item, CalendarMovie):
-                icon  = "[green]✓[/]" if item.has_file else "[dim]·[/]"
-                rtype = f"[dim]{item.release_type}[/]"
-                console.print(f"    [dim]{n:>2}.[/] {icon}  [bold]{item.title}[/] [dim]({item.year})[/]  {rtype}  [dim]movie[/]")
+                line = f"[bold]{item.title}[/] [dim]({item.year})[/]  [dim]{item.release_type}[/]  [dim]movie[/]"
             else:
-                icon  = "[green]✓[/]" if item.has_file else "[dim]·[/]"
-                ep    = f"[dim]S{item.season:02d}E{item.episode:02d}[/]"
-                console.print(f"    [dim]{n:>2}.[/] {icon}  [bold]{item.series_title}[/]  {ep}  [dim]{item.title}[/]")
+                ep = f"S{item.season:02d}E{item.episode:02d}"
+                line = f"[bold]{item.series_title}[/]  [dim]{ep}[/]  [dim]{item.title}[/]"
+            console.print(f"    [dim]{n:>2}.[/] {icon}  {line}")
 
-    raw = typer.prompt(
-        "Enter # for pipeline details (or Enter to skip)",
-        default="",
-        show_default=False,
-    ).strip()
+    if not _interactive():
+        console.print("[dim]Use --pick N for pipeline details.[/]")
+        return
+    raw = typer.prompt("Enter # for pipeline details (or Enter to skip)", default="", show_default=False).strip()
     if not raw:
         return
     try:
@@ -6487,15 +6776,12 @@ def media_calendar_cmd(
     if not 1 <= choice <= len(numbered):
         console.print("[red]Out of range — skipping.[/]")
         return
-
-    arr_record, plex_match, is_movie = _display_pipeline_from_calendar(cfg, numbered[choice - 1])
-    _pipeline_interactive_menu(cfg, arr_record, plex_match, is_movie)
+    p = _pipeline_collect(cfg, _target_from_calendar(numbered[choice - 1]))
+    _pipeline_render(p)
+    _pipeline_menu(cfg, p)
 
 
 # ── media status ──────────────────────────────────────────────────────────────
-
-import httpx as _httpx
-
 
 @media_app.command("status")
 def media_status_cmd(
@@ -6504,257 +6790,205 @@ def media_status_cmd(
     seerr:     bool = typer.Option(False, "--seerr",     help="Show only Seerr"),
     plex:      bool = typer.Option(False, "--plex",      help="Show only Plex"),
     tautulli:  bool = typer.Option(False, "--tautulli",  help="Show only Tautulli"),
+    output: _Out = typer.Option(_Out.table, "-o", help="Output format"),
 ) -> None:
-    """Show connectivity status for all media services."""
+    """Connectivity + version for every media service."""
     cfg = _load()
-    # No flags = show all
     show_all = not any([radarr, sonarr, seerr, plex, tautulli])
+    rows: list[dict] = []   # {service, ok, detail}
 
-    console.print()
-    console.rule("[bold]🎬  Media Status[/]")
-    console.print()
+    def _add(name: str, ok: bool, detail: str) -> None:
+        rows.append({"service": name, "ok": ok, "detail": detail})
 
-    def _row(name: str, ok: bool, detail: str) -> None:
-        icon  = "[green]●[/]" if ok else "[red]●[/]"
-        style = "green" if ok else "red"
-        console.print(f"   {icon}  [bold]{name:<10}[/]  [{style}]{detail}[/]")
-
-    if show_all or radarr:
-        if cfg.radarr is None:
-            _row("Radarr", False, "not configured")
-        else:
-            with console.status("Querying Radarr…"):
-                s = arr_get_status(cfg.radarr)
-            _row("Radarr", s.online, f"{s.app_name} {s.version}" if s.online else s.error)
-
-    if show_all or sonarr:
-        if cfg.sonarr is None:
-            _row("Sonarr", False, "not configured")
-        else:
-            with console.status("Querying Sonarr…"):
-                s = arr_get_status(cfg.sonarr)
-            _row("Sonarr", s.online, f"{s.app_name} {s.version}" if s.online else s.error)
-
-    if show_all or seerr:
-        if cfg.seerr is None:
-            _row("Seerr", False, "not configured")
-        else:
-            try:
-                with console.status("Querying Seerr…"):
-                    r = _httpx.get(
-                        f"{cfg.seerr.base_url}/api/v1/settings/public",
-                        verify=cfg.seerr.verify_ssl, timeout=10,
-                    )
-                if r.is_success:
-                    version = r.json().get("applicationVersion", "")
-                    _row("Seerr", True, f"v{version}" if version else "online")
-                else:
-                    _row("Seerr", False, f"HTTP {r.status_code}")
-            except Exception as e:
-                _row("Seerr", False, str(e))
-
-    if show_all or plex:
-        if cfg.plex is None:
-            _row("Plex", False, "not configured")
-        else:
-            try:
-                with console.status("Querying Plex…"):
-                    r = _httpx.get(
-                        f"{cfg.plex.base_url}/identity",
-                        headers={"Accept": "application/json"},
-                        verify=cfg.plex.verify_ssl, timeout=10,
-                    )
-                if r.is_success:
-                    version = (r.json().get("MediaContainer") or {}).get("version", "")
-                    _row("Plex", True, f"v{version}" if version else "online")
-                else:
-                    _row("Plex", False, f"HTTP {r.status_code}")
-            except Exception as e:
-                _row("Plex", False, str(e))
-
-    if show_all or tautulli:
-        if cfg.tautulli is None:
-            _row("Tautulli", False, "not configured")
-        else:
-            from lib.tautulli import get_status as _tautulli_get_status
-            with console.status("Querying Tautulli…"):
-                st = _tautulli_get_status(cfg.tautulli)
-            if st.online:
-                n = st.stream_count
-                streams_str = f"{n} active stream{'s' if n != 1 else ''}"
-                _row("Tautulli", True, streams_str)
+    with console.status("[bold]Querying media services…[/]"):
+        for name, flag, acfg in (("Radarr", radarr, cfg.radarr), ("Sonarr", sonarr, cfg.sonarr)):
+            if not (show_all or flag):
+                continue
+            if acfg is None:
+                _add(name, False, "not configured")
             else:
-                _row("Tautulli", False, st.error)
+                s = arr_get_status(acfg)
+                _add(name, s.online, f"{s.app_name} {s.version}" if s.online else s.error)
 
-    console.print()
-    console.rule()
-    console.print()
+        if show_all or seerr:
+            if cfg.seerr is None:
+                _add("Seerr", False, "not configured")
+            else:
+                try:
+                    v = seerr_get_version(cfg.seerr)
+                    _add("Seerr", True, f"v{v}" if v else "online")
+                except Exception as e:
+                    _add("Seerr", False, str(e))
+
+        if show_all or plex:
+            if cfg.plex is None:
+                _add("Plex", False, "not configured")
+            else:
+                try:
+                    r = _httpx.get(f"{cfg.plex.base_url}/identity", headers={"Accept": "application/json"},
+                                   verify=cfg.plex.verify_ssl, timeout=10)
+                    if r.is_success:
+                        v = (r.json().get("MediaContainer") or {}).get("version", "")
+                        _add("Plex", True, f"v{v}" if v else "online")
+                    else:
+                        _add("Plex", False, f"HTTP {r.status_code}")
+                except Exception as e:
+                    _add("Plex", False, str(e))
+
+        if show_all or tautulli:
+            if cfg.tautulli is None:
+                _add("Tautulli", False, "not configured")
+            else:
+                from lib.tautulli import get_status as _tautulli_get_status
+                st = _tautulli_get_status(cfg.tautulli)
+                n = st.stream_count
+                _add("Tautulli", st.online, f"{n} active stream{'s' if n != 1 else ''}" if st.online else st.error)
+
+    if output == _Out.json:
+        _print_json(rows)
+    else:
+        console.print()
+        console.rule("[bold]🎬  Media Status[/]")
+        console.print()
+        for r in rows:
+            c = "green" if r["ok"] else "red"
+            console.print(f"   [{c}]●[/]  [bold]{r['service']:<10}[/]  [{c}]{r['detail']}[/]")
+        console.print()
+        console.rule()
+        console.print()
+    if any(not r["ok"] and r["detail"] != "not configured" for r in rows):
+        raise typer.Exit(1)
 
 
 # ── media today ───────────────────────────────────────────────────────────────
 
-
 @media_app.command("today")
-def media_today_cmd() -> None:
+def media_today_cmd(
+    output: _Out = typer.Option(_Out.table, "-o", help="Output format"),
+) -> None:
     """Today's media — scheduled releases, requests, and downloads with file details."""
     cfg = _load()
     today = _date.today()
+    errors: list[str] = []
 
-    import re as _re
-    _year_sfx = _re.compile(r"\s*\((\d{4})\)$")
-
-    def _strip_year(raw: str) -> tuple[str, int]:
-        m = _year_sfx.search(raw)
-        return (raw[:m.start()], int(m.group(1))) if m else (raw, 0)
-
-    # ── 1. Fetch ────────────────────────────────────────────────────────────────
     cal_movies: list[CalendarMovie] = []
     cal_episodes: list[CalendarEpisode] = []
     radarr_queue: list = []
     sonarr_queue: list = []
-    radarr_imports: list = []
-    sonarr_imports: list = []
+    imports: list = []
     seerr_reqs: list = []
 
     if cfg.radarr:
         with console.status("[bold]Fetching Radarr…[/]"):
             cal_movies = get_radarr_calendar(cfg.radarr, today, today)
             radarr_queue = arr_get_queue(cfg.radarr)
-            radarr_imports = arr_get_today_imports(cfg.radarr, today)
+            imports += arr_get_today_imports(cfg.radarr, today)
     if cfg.sonarr:
         with console.status("[bold]Fetching Sonarr…[/]"):
             cal_episodes = get_sonarr_calendar(cfg.sonarr, today, today)
             sonarr_queue = arr_get_queue(cfg.sonarr)
-            sonarr_imports = arr_get_today_imports(cfg.sonarr, today)
+            imports += arr_get_today_imports(cfg.sonarr, today)
     if cfg.seerr:
         try:
             with console.status("[bold]Fetching Seerr…[/]"):
-                all_seerr = seerr_list_requests(cfg.seerr)
-            seerr_reqs = [r for r in all_seerr if r.created_at == today.isoformat()]
-        except Exception:
-            pass
+                # Newest first: one page is enough as long as today's requests fit in it.
+                recent = seerr_list_requests(cfg.seerr, take=50, enrich=False)
+                seerr_reqs = [r for r in recent if r.created_at == today.isoformat()]
+                seerr_enrich_titles(cfg.seerr, seerr_reqs)
+        except Exception as e:
+            errors.append(f"seerr: {e}")
 
-    all_imports = radarr_imports + sonarr_imports
+    # ── releases ──
+    releases: list[dict] = []
+    for m in cal_movies:
+        q = next((q for q in radarr_queue if m.arr_id and q.movie_id == m.arr_id), None)
+        status = "downloaded" if m.has_file else (f"downloading {q.progress_pct:.0f}%" if q else "not found")
+        releases.append({"type": "movie", "title": m.title, "year": m.year,
+                         "release_type": m.release_type, "status": status})
+    for e in cal_episodes:
+        title, _ = _strip_year(e.series_title)
+        q = next((q for q in sonarr_queue if e.series_id and q.series_id == e.series_id), None)
+        status = "downloaded" if e.has_file else ("downloading" if q else "not found")
+        releases.append({"type": "episode", "title": title, "season": e.season, "episode": e.episode,
+                         "episode_title": e.title, "status": status})
 
-    # ── 2. Header ───────────────────────────────────────────────────────────────
-    console.rule(f"[bold]📅  Today  ·  {today}[/]")
-
-    # ── 3. Releases ─────────────────────────────────────────────────────────────
-    console.print()
-    console.print("  [bold cyan]Releases[/]")
-    if cal_movies:
-        console.print("  [cyan]Movies[/]")
-        for m in cal_movies:
-            in_q = bool(m.arr_id and any(q.movie_id == m.arr_id for q in radarr_queue))
-            if m.has_file:
-                status = "[green]downloaded[/]"
-            elif in_q:
-                q_item = next((q for q in radarr_queue if q.movie_id == m.arr_id), None)
-                pct = f" {q_item.progress_pct:.0f}%" if q_item else ""
-                status = f"[cyan]downloading{pct}[/]"
-            else:
-                status = "[dim]not found[/]"
-            console.print(f"    [bold]{m.title}[/] [dim]({m.year}) · {m.release_type}[/]  [dim]—[/] {status}")
-    if cal_episodes:
-        console.print("  [cyan]TV[/]")
-        for e in cal_episodes:
-            title, _ = _strip_year(e.series_title)
-            ep = f"S{e.season:02d}E{e.episode:02d}"
-            in_q = bool(e.series_id and any(q.series_id == e.series_id for q in sonarr_queue))
-            if e.has_file:
-                status = "[green]downloaded[/]"
-            elif in_q:
-                status = "[cyan]downloading[/]"
-            else:
-                status = "[dim]not found[/]"
-            console.print(f"    [bold]{title}[/]  [dim]{ep} {e.title}[/]  [dim]—[/] {status}")
-    if not cal_movies and not cal_episodes:
-        console.print("  [dim]Nothing scheduled for today.[/]")
-
-    # ── 4. Requests ─────────────────────────────────────────────────────────────
-    console.print()
-    console.print("  [bold cyan]Requests[/]")
-    req_movies = [r for r in seerr_reqs if r.media_type == "movie"]
-    req_tv     = [r for r in seerr_reqs if r.media_type != "movie"]
-
-    def _req_line(req) -> str:
-        # Media moving past "unknown" means the request was acted on, even if
-        # Jellyseerr left the approval status as "pending" (auto-approve quirk).
-        approved = req.request_status_code >= 2 or req.media_status_code > 1
-        rs_color = "green" if approved else "yellow"
-        rs_label = "approved" if approved else req.request_status
-        ms_color = {5: "green", 4: "yellow", 3: "cyan"}.get(req.media_status_code, "dim")
-        by = f"  [dim]by {req.requested_by}[/]" if req.requested_by else ""
-        return f"[{rs_color}]{rs_label}[/] [dim]·[/] [{ms_color}]{req.media_status}[/]{by}"
-
-    if req_movies:
-        console.print("  [cyan]Movies[/]")
-        for r in req_movies:
-            console.print(f"    [bold]{r.title}[/]  {_req_line(r)}")
-    if req_tv:
-        console.print("  [cyan]TV[/]")
-        for r in req_tv:
-            console.print(f"    [bold]{r.title}[/]  {_req_line(r)}")
-    if not seerr_reqs:
-        console.print("  [dim]No requests today.[/]")
-
-    # ── 5. Downloads ─────────────────────────────────────────────────────────────
-    console.print()
-    console.print("  [bold cyan]Downloads[/]")
-    dl_movies = [imp for imp in all_imports if imp.media_type == "movie"]
-    dl_tv     = [imp for imp in all_imports if imp.media_type == "episode"]
-
-    # Plex — batch unique titles to avoid N+1
-    plex_cache: dict[str, PlexMatch] = {}
-    if cfg.plex and (dl_movies or dl_tv):
-        seen: set[str] = set()
-        to_check: list[tuple[str, str, int]] = []
-        for imp in dl_movies:
+    # ── downloads (+ Plex check, one lookup per unique title) ──
+    plex_cache: dict[str, bool] = {}
+    if cfg.plex:
+        for imp in imports:
             clean, yr = _strip_year(imp.title)
-            if clean.lower() not in seen:
-                seen.add(clean.lower())
-                to_check.append((clean, "movie", yr or imp.year))
-        for imp in dl_tv:
-            clean, yr = _strip_year(imp.title)
-            if clean.lower() not in seen:
-                seen.add(clean.lower())
-                to_check.append((clean, "tv", yr or imp.year))
-        for title, mtype, year in to_check:
-            with console.status(f"[bold]Checking Plex for [cyan]{title}[/]…[/]"):
-                match = plex_find_media(cfg.plex, title, mtype, year)
+            if clean.lower() in plex_cache:
+                continue
+            mtype = MEDIA_TYPE_MOVIE if imp.media_type == "movie" else MEDIA_TYPE_TV
+            year = yr or imp.year
+            with console.status(f"[bold]Checking Plex for [cyan]{clean}[/]…[/]"):
+                match = plex_find_media(cfg.plex, clean, mtype, year)
                 if not match.found and year:
-                    match = plex_find_media(cfg.plex, title, mtype, 0)
-            plex_cache[title.lower()] = match
+                    match = plex_find_media(cfg.plex, clean, mtype, 0)
+            plex_cache[clean.lower()] = match.found
+    downloads: list[dict] = []
+    for imp in imports:
+        clean, yr = _strip_year(imp.title)
+        d = {"type": imp.media_type, "title": clean, "year": yr or imp.year, "quality": imp.quality,
+             "size_bytes": imp.size_bytes, "in_plex": plex_cache.get(clean.lower())}
+        if imp.media_type == "episode":
+            d.update(season=imp.season, episode=imp.episode, episode_title=imp.episode_title)
+        downloads.append(d)
 
-    def _plex_tag(raw_title: str) -> str:
-        if not cfg.plex:
-            return ""
-        clean, _ = _strip_year(raw_title)
-        m = plex_cache.get(clean.lower())
-        if m is None:
-            return ""
-        return "  [green]✓ Plex[/]" if m.found else "  [dim]· not in Plex[/]"
+    requests = [{"type": r.media_type, "title": r.title, "request_status": r.request_status,
+                 "media_status": r.media_status, "requested_by": r.requested_by} for r in seerr_reqs]
 
-    def _file_meta(imp) -> str:
-        parts = [p for p in [imp.quality, _fmt_bytes(imp.size_bytes) if imp.size_bytes else ""] if p]
-        return f"  [dim]{' · '.join(parts)}[/]" if parts else ""
+    if output == _Out.json:
+        _print_json({"date": today.isoformat(), "releases": releases, "requests": requests,
+                     "downloads": downloads, "errors": errors})
+        return
 
-    if dl_movies:
-        console.print("  [cyan]Movies[/]")
-        for imp in dl_movies:
-            clean, yr = _strip_year(imp.title)
-            year_str = f" ({yr or imp.year})" if (yr or imp.year) else ""
-            console.print(f"    [bold]{clean}[/][dim]{year_str}[/]{_file_meta(imp)}{_plex_tag(imp.title)}")
-    if dl_tv:
-        console.print("  [cyan]TV[/]")
-        for imp in dl_tv:
-            clean, _ = _strip_year(imp.title)
-            ep = f"S{imp.season:02d}E{imp.episode:02d}"
-            ep_title = f" · {imp.episode_title}" if imp.episode_title else ""
-            console.print(f"    [bold]{clean}[/]  [dim]{ep}{ep_title}[/]{_file_meta(imp)}{_plex_tag(imp.title)}")
-    if not dl_movies and not dl_tv:
-        console.print("  [dim]Nothing downloaded today.[/]")
+    def _section(name: str, items: list[dict], line, empty: str) -> None:
+        console.print()
+        console.print(f"  [bold cyan]{name}[/]")
+        if not items:
+            console.print(f"  [dim]{empty}[/]")
+            return
+        for kind, label in (("movie", "Movies"), (None, "TV")):
+            group = [i for i in items if (i["type"] == "movie") == (kind == "movie")]
+            if group:
+                console.print(f"  [cyan]{label}[/]")
+                for i in group:
+                    console.print(f"    {line(i)}")
 
+    def _ep(i: dict) -> str:
+        return f"S{i['season']:02d}E{i['episode']:02d}"
+
+    def _rel_line(i: dict) -> str:
+        st = i["status"]
+        color = "green" if st == "downloaded" else "cyan" if st.startswith("downloading") else "dim"
+        if i["type"] == "movie":
+            return f"[bold]{i['title']}[/] [dim]({i['year']}) · {i['release_type']}[/]  [dim]—[/] [{color}]{st}[/]"
+        return f"[bold]{i['title']}[/]  [dim]{_ep(i)} {i['episode_title']}[/]  [dim]—[/] [{color}]{st}[/]"
+
+    def _req_line(i: dict) -> str:
+        rs = i["request_status"]
+        rc = "green" if rs in ("approved", "completed") else "yellow"
+        mc = _SEERR_STATUS_STYLE.get(i["media_status"], "dim")
+        by = f"  [dim]by {i['requested_by']}[/]" if i["requested_by"] else ""
+        return f"[bold]{i['title']}[/]  [{rc}]{rs}[/] [dim]·[/] [{mc}]{i['media_status']}[/]{by}"
+
+    def _dl_line(i: dict) -> str:
+        meta = " · ".join(p for p in [i["quality"], _fmt_bytes(i["size_bytes"]) if i["size_bytes"] else ""] if p)
+        meta = f"  [dim]{meta}[/]" if meta else ""
+        plex_tag = "" if i["in_plex"] is None else ("  [green]✓ Plex[/]" if i["in_plex"] else "  [dim]· not in Plex[/]")
+        if i["type"] == "movie":
+            yr = f" ({i['year']})" if i["year"] else ""
+            return f"[bold]{i['title']}[/][dim]{yr}[/]{meta}{plex_tag}"
+        et = f" · {i['episode_title']}" if i["episode_title"] else ""
+        return f"[bold]{i['title']}[/]  [dim]{_ep(i)}{et}[/]{meta}{plex_tag}"
+
+    console.rule(f"[bold]📅  Today  ·  {today}[/]")
+    _section("Releases", releases, _rel_line, "Nothing scheduled for today.")
+    _section("Requests", requests, _req_line, "No requests today.")
+    _section("Downloads", downloads, _dl_line, "Nothing downloaded today.")
+    for e in errors:
+        console.print(f"  [dim]({e})[/]")
     console.print()
     console.rule()
     console.print()
@@ -6764,165 +6998,102 @@ def media_today_cmd() -> None:
 def media_search_today_cmd(
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation prompt"),
     dry_run: bool = typer.Option(False, "--dry-run", help="Show what would be searched without triggering"),
+    force: bool = typer.Option(False, "--force", help=_FORCE_BATCH_HELP),
 ) -> None:
     """Search for today's calendar releases that haven't been downloaded yet.
 
-    Fetches today's Radarr/Sonarr calendar, skips items already downloaded or
-    actively queued, then fires a single batch search per service — one
-    MoviesSearch command and one EpisodeSearch command.  Uses the search-state
-    cooldown so re-running within the cooldown window won't hammer indexers.
+    Skips items already downloaded, unmonitored, queued, or on cooldown, then
+    fires one batch search per service. Goes through the same guard rails as
+    `atc media search`.
     """
-    if not ENABLE_ARR_SEARCH:
-        console.print("[yellow]⚑[/] Arr search is disabled (ENABLE_ARR_SEARCH=False).")
-        raise typer.Exit(0)
     cfg = _load()
     today = _date.today()
-    search_state = _load_search_state(cfg.config_path)
+    state = _load_search_state(cfg.config_path)
+    movies, episodes = _calendar_items(cfg, today, today, False, False)
+    radarr_queue = arr_get_queue(cfg.radarr) if cfg.radarr and movies else []
+    sonarr_queue = arr_get_queue(cfg.sonarr) if cfg.sonarr and episodes else []
 
-    import re as _re
-    _year_sfx = _re.compile(r"\s*\((\d{4})\)$")
+    def _skip(monitored: bool, has_file: bool, queued: bool, key: str) -> str:
+        if not monitored:
+            return "unmonitored"
+        if has_file:
+            return "downloaded"
+        if queued:
+            return "in queue"
+        ok, why = state.can_search(key)
+        return "" if ok else f"cooldown ({why})"
 
-    def _strip_year(raw: str) -> tuple[str, int]:
-        m = _year_sfx.search(raw)
-        return (raw[:m.start()], int(m.group(1))) if m else (raw, 0)
+    movie_rows = [(m, _skip(m.monitored, m.has_file, any(q.movie_id == m.arr_id for q in radarr_queue),
+                            f"movie:{m.arr_id}")) for m in movies]
+    # Match the queue by episode, not series — a series with one episode
+    # downloading shouldn't block searching a different one.
+    episode_rows = [(e, _skip(e.monitored, e.has_file, any(q.episode_id == e.episode_id for q in sonarr_queue),
+                              f"episode:{e.episode_id}")) for e in episodes]
+    movies_to_search = [m.arr_id for m, skip in movie_rows if not skip and m.arr_id]
+    episodes_to_search = [e.episode_id for e, skip in episode_rows if not skip and e.episode_id]
 
-    # ── Fetch ─────────────────────────────────────────────────────────────────
-    cal_movies: list[CalendarMovie] = []
-    cal_episodes: list[CalendarEpisode] = []
-    radarr_queue: list = []
-    sonarr_queue: list = []
-
-    if cfg.radarr:
-        with console.status("[bold]Fetching Radarr calendar…[/]"):
-            cal_movies = get_radarr_calendar(cfg.radarr, today, today)
-            radarr_queue = arr_get_queue(cfg.radarr)
-    if cfg.sonarr:
-        with console.status("[bold]Fetching Sonarr calendar…[/]"):
-            cal_episodes = get_sonarr_calendar(cfg.sonarr, today, today)
-            sonarr_queue = arr_get_queue(cfg.sonarr)
-
-    # ── Filter to actionable items ────────────────────────────────────────────
-    # movie: (arr_id, title, year, release_type, skip_reason)
-    movie_rows: list[tuple[int, str, int, str, str]] = []
-    for m in cal_movies:
-        if not m.monitored:
-            movie_rows.append((m.arr_id, m.title, m.year, m.release_type, "unmonitored"))
-        elif m.has_file:
-            movie_rows.append((m.arr_id, m.title, m.year, m.release_type, "downloaded"))
-        elif m.arr_id and any(q.movie_id == m.arr_id for q in radarr_queue):
-            movie_rows.append((m.arr_id, m.title, m.year, m.release_type, "in queue"))
-        else:
-            ok, reason = search_state.can_search(f"movie:{m.arr_id}")
-            skip = "" if ok else f"cooldown ({reason})"
-            movie_rows.append((m.arr_id, m.title, m.year, m.release_type, skip))
-
-    # episode: (episode_id, series_title, season, ep_num, ep_title, skip_reason)
-    episode_rows: list[tuple[int, str, int, int, str, str]] = []
-    for e in cal_episodes:
-        title, _ = _strip_year(e.series_title)
-        if not e.monitored:
-            episode_rows.append((e.episode_id, title, e.season, e.episode, e.title, "unmonitored"))
-        elif e.has_file:
-            episode_rows.append((e.episode_id, title, e.season, e.episode, e.title, "downloaded"))
-        elif e.series_id and any(q.series_id == e.series_id for q in sonarr_queue):
-            episode_rows.append((e.episode_id, title, e.season, e.episode, e.title, "in queue"))
-        else:
-            ok, reason = (search_state.can_search(f"episode:{e.episode_id}") if e.episode_id
-                          else (True, ""))
-            skip = "" if ok else f"cooldown ({reason})"
-            episode_rows.append((e.episode_id, title, e.season, e.episode, e.title, skip))
-
-    movies_to_search = [arr_id for arr_id, *_, skip in movie_rows if not skip and arr_id]
-    episodes_to_search = [ep_id for ep_id, *_, skip in episode_rows if not skip and ep_id]
-
-    # ── Display plan ──────────────────────────────────────────────────────────
     console.print()
     console.rule(f"[bold]🔍  Search Today  ·  {today}[/]")
     console.print()
-
-    if not cal_movies and not cal_episodes:
+    if not movies and not episodes:
         console.print("  [dim]Nothing on the calendar for today.[/]")
-        console.print()
-        console.rule()
         console.print()
         return
 
+    def _mark(skip: str) -> tuple[str, str]:
+        return ("[dim]·[/]", f"  [dim]— {skip}[/]") if skip else ("[yellow]→[/]", "")
+
     if movie_rows:
         console.print("  [cyan]Movies[/]")
-        for arr_id, title, year, release_type, skip in movie_rows:
-            label = f"[dim]{release_type}[/]" if release_type else ""
-            if skip:
-                mark = "[dim]·[/]"
-                note = f"  [dim]— {skip}[/]"
-            else:
-                mark = "[yellow]→[/]"
-                note = ""
-            console.print(f"    {mark} [bold]{title}[/] [dim]({year})[/]  {label}{note}")
-
+        for m, skip in movie_rows:
+            mark, note = _mark(skip)
+            console.print(f"    {mark} [bold]{m.title}[/] [dim]({m.year})[/]  [dim]{m.release_type}[/]{note}")
     if episode_rows:
         console.print("  [cyan]TV[/]")
-        for ep_id, title, season, ep_num, ep_title, skip in episode_rows:
-            ep = f"S{season:02d}E{ep_num:02d}"
-            ep_str = f" [dim]· {ep_title}[/]" if ep_title else ""
-            if skip:
-                mark = "[dim]·[/]"
-                note = f"  [dim]— {skip}[/]"
-            else:
-                mark = "[yellow]→[/]"
-                note = ""
-            console.print(f"    {mark} [bold]{title}[/]  [dim]{ep}[/]{ep_str}{note}")
-
+        for e, skip in episode_rows:
+            mark, note = _mark(skip)
+            title, _ = _strip_year(e.series_title)
+            ep_str = f" [dim]· {e.title}[/]" if e.title else ""
+            console.print(f"    {mark} [bold]{title}[/]  [dim]S{e.season:02d}E{e.episode:02d}[/]{ep_str}{note}")
     console.print()
 
     if not movies_to_search and not episodes_to_search:
         console.print("  [dim]Nothing to search — all items are downloaded, queued, or on cooldown.[/]")
         console.print()
-        console.rule()
-        console.print()
         return
 
-    nm = len(movies_to_search)
-    ne = len(episodes_to_search)
-    parts = []
-    if nm:
-        parts.append(f"{nm} movie{'s' if nm != 1 else ''}")
-    if ne:
-        parts.append(f"{ne} episode{'s' if ne != 1 else ''}")
-    summary = " and ".join(parts)
-
-    if dry_run:
-        console.print(f"  [dim]Dry run — would search {summary}.[/]")
-        console.print()
-        return
-
-    if not yes:
-        confirm = typer.confirm(f"  Trigger search for {summary}?", default=False)
-        if not confirm:
-            console.print("  [dim]Aborted.[/]")
-            console.print()
-            return
-
-    # ── Fire searches ─────────────────────────────────────────────────────────
+    jobs = []   # (label, arr_cfg, ids, fire, key_prefix)
     if movies_to_search and cfg.radarr:
-        try:
-            radarr_search_movies(cfg.radarr, movies_to_search)
-            for mid in movies_to_search:
-                search_state.record_search(f"movie:{mid}")
-            console.print(f"  [green]✓[/] Radarr: search triggered for {nm} movie{'s' if nm != 1 else ''}.")
-        except Exception as exc:
-            console.print(f"  [red]✗[/] Radarr search failed: {exc}")
-
+        jobs.append(("Radarr", cfg.radarr, movies_to_search, radarr_search_movies, "movie"))
     if episodes_to_search and cfg.sonarr:
-        try:
-            sonarr_search_episodes(cfg.sonarr, episodes_to_search)
-            for eid in episodes_to_search:
-                search_state.record_search(f"episode:{eid}")
-            console.print(f"  [green]✓[/] Sonarr: search triggered for {ne} episode{'s' if ne != 1 else ''}.")
-        except Exception as exc:
-            console.print(f"  [red]✗[/] Sonarr search failed: {exc}")
+        jobs.append(("Sonarr", cfg.sonarr, episodes_to_search, sonarr_search_episodes, "episode"))
 
-    console.print()
-    console.rule()
+    runnable = []
+    for label, acfg, ids, fire, prefix in jobs:
+        allowed, msg = _search_gate(cfg, acfg, label, force)
+        console.print(f"  {msg}")
+        if allowed:
+            runnable.append((label, acfg, ids, fire, prefix))
+    summary = " and ".join(f"{len(ids)} {'movie' if p == 'movie' else 'episode'}{'s' if len(ids) != 1 else ''}"
+                           for _, _, ids, _, p in runnable)
+    if dry_run:
+        console.print(f"  [dim]Dry run — would search {summary or 'nothing (guard rails)'}.[/]")
+        console.print()
+        return
+    if not runnable:
+        raise typer.Exit(EXIT_REFUSED)
+    if not _confirm(f"  Trigger search for {summary}?", yes):
+        console.print("  [dim]Aborted.[/]")
+        return
+
+    for label, acfg, ids, fire, prefix in runnable:
+        try:
+            fire(acfg, ids)
+            for i in ids:
+                state.record_search(f"{prefix}:{i}")
+            console.print(f"  [green]✓[/] {label}: search triggered for {len(ids)} item(s).")
+        except Exception as exc:
+            console.print(f"  [red]✗[/] {label} search failed: {exc}")
     console.print()
 
 

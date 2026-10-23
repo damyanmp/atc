@@ -54,9 +54,13 @@ class TestRequestStatus:
     def test_code_4_failed(self):
         assert _request_status(4) == "failed"
 
-    def test_unknown_code_falls_back_to_pending(self):
-        assert _request_status(0) == "pending"
-        assert _request_status(99) == "pending"
+    def test_code_5_completed(self):
+        assert _request_status(5) == "completed"
+
+    def test_unknown_code_falls_back_to_unknown(self):
+        # Used to fall back to "pending", which mislabelled completed (5) requests.
+        assert _request_status(0) == "unknown"
+        assert _request_status(99) == "unknown"
 
 
 # ── Jellyseerr auto-approve display logic ─────────────────────────────────────

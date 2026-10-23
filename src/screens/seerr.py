@@ -14,10 +14,11 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "lib"))
 
 from config import Config
 
-_REQ_STATUS_ICON = {"pending": "🟡", "approved": "🟢", "declined": "🔴", "failed": "💥"}
+_REQ_STATUS_ICON = {"pending": "🟡", "approved": "🟢", "completed": "✅", "declined": "🔴", "failed": "💥"}
 _MEDIA_STATUS_ICON = {
     "unknown": "⚪", "pending": "🟡", "processing": "🔵",
     "partially available": "🟤", "available": "🟢",
+    "blocklisted": "⛔", "deleted": "🗑",
 }
 
 
