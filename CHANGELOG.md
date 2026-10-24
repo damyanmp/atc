@@ -7,6 +7,9 @@ track breaking config/CLI changes.
 
 ## [Unreleased]
 
+### Security
+- Env files (`.env`, `.env.*`, `*.env`) are gitignored, and a tracked `.githooks/pre-commit` runs gitleaks on staged changes and blocks commits that contain secrets. Enable once per clone with `git config core.hooksPath .githooks` (needs `gitleaks` on PATH).
+
 ## [0.3.0] - 2026-10-24
 
 ### Breaking
