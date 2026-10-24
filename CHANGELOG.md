@@ -7,6 +7,45 @@ track breaking config/CLI changes.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-24
+
+### Breaking
+- **The mobile QR wire format changed.** `mobile_qr` payloads are now
+  passphrase-encrypted (`ATCQR1:` + base64; scrypt-derived AES-256-GCM, with
+  a fresh salt and nonce on every run). A scanner that reads the old plaintext
+  YAML QR has to be updated; the ATCQR1 format is documented in the repo.
+- **SSH host-key verification is now on by default.** `verify_host_keys`
+  defaults to `true`. A config that never set it used to connect with
+  `StrictHostKeyChecking=no`. Set it to `false` explicitly only when you
+  mean it.
+
+### Security
+- The mobile QR config no longer embeds plaintext Proxmox/Plex/Tautulli/*arr/
+  Seerr/Portainer/Beszel credentials, either in the terminal QR or in a
+  `--save` PNG. You are prompted for the passphrase (min 8 chars, typed twice);
+  it is never written to disk or passed as an argument.
+- The UniFi write helpers (`delete_port_forward`, `update_port_forward`,
+  `update_firewall_zone_v1`, `update_firewall_policy_v1`,
+  `delete_firewall_policy_v1`, `create_firewall_policy_v1`) are now
+  **dry-run by default**. They return a `UniFiWritePlan` (method, URL, body)
+  and send nothing unless called with `dry_run=False` or via
+  `execute_write_plan()`. A new `cli._unifi_apply()` guard is in place for
+  future write commands: it prints the plan, honours `--dry-run`, and sends
+  only with `-y/--yes` or an interactive confirm.
+
+### Added
+- `atc acars` shows Pi-hole FTL's own diagnostic messages
+  (`/api/info/messages`: rate limits, certificate mismatch, gravity/list
+  failures, disk, NTP and more) for every configured Pi-hole instance.
+
+### Fixed
+- `atc upgrade` now recovers when the remote history was rewritten (a
+  force-push after a PII scrub). It used to fail on `--ff-only` every time.
+- `atc quick list` and the TUI now parse quick-site's new card-based directory
+  page, keeping the old format as a fallback. They used to report
+  "nothing published".
+
+
 ### Media overhaul
 
 **Fixed**

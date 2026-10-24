@@ -1,6 +1,6 @@
 [project]
 name = "atc"
-version = "0.2.0"
+version = "0.3.0"
 description = "Air Traffic Control — homelab CLI for Proxmox, VMs, LXCs, and DSM"
 license = "MIT"
 requires-python = ">=3.11"
