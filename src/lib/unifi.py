@@ -103,27 +103,87 @@ def _get_v1(cfg: UniFiConfig, path: str):
     return result
 
 
-def _write_v1(cfg: UniFiConfig, method: str, path: str, json_body: dict | None = None):
-    """PUT/DELETE against the integration v1 API. Requires api_key auth."""
-    base = f"{cfg.base_url}/proxy/network/integration/v1" if cfg.udm else f"{cfg.base_url}/integration/v1"
-    url = f"{base}{path}"
-    with _client(cfg) as client:
-        r = client.request(method, url, headers=_auth_headers(cfg), json=json_body)
-        if not r.is_success:
-            raise RuntimeError(f"UniFi v1 {method} {path} HTTP {r.status_code}: {r.text[:300]}")
-        return r.json() if r.text else None
+# ── Write guard ───────────────────────────────────────────────────────────────
+#
+# Every helper that mutates controller state (PUT/POST/DELETE) is dry-run by
+# default: it builds a UniFiWritePlan describing the exact request it would
+# send and returns that instead of sending anything.  Sending requires the
+# caller to pass dry_run=False explicitly (or hand a plan to
+# execute_write_plan()).  This makes an accidental firewall/port-forward
+# change impossible from a careless call site.
+
+@dataclass(frozen=True)
+class UniFiWritePlan:
+    """A fully-resolved write request that has NOT been sent."""
+    method: str
+    api: str            # "v1" (integration API) or "legacy"
+    path: str           # API path relative to the api's base
+    url: str            # absolute URL the request would hit
+    body: dict | None = None
+
+    def describe(self) -> str:
+        """Human-readable preview: method, endpoint and JSON body."""
+        lines = [f"{self.method} {self.url}"]
+        if self.body is not None:
+            lines.append(json.dumps(self.body, indent=2, sort_keys=True, default=str))
+        return "\n".join(lines)
+
+    def as_dict(self) -> dict:
+        return {"method": self.method, "api": self.api, "path": self.path,
+                "url": self.url, "body": self.body}
 
 
-def _write_legacy(cfg: UniFiConfig, method: str, path: str, json_body: dict | None = None):
-    """PUT/POST/DELETE against a legacy UniFi API path (cookie or api_key auth)."""
-    url = f"{cfg.base_url}{_api_prefix(cfg)}{path}"
+def _v1_base(cfg: UniFiConfig) -> str:
+    return f"{cfg.base_url}/proxy/network/integration/v1" if cfg.udm else f"{cfg.base_url}/integration/v1"
+
+
+def _plan_v1(cfg: UniFiConfig, method: str, path: str, json_body: dict | None = None) -> UniFiWritePlan:
+    return UniFiWritePlan(method=method.upper(), api="v1", path=path,
+                          url=f"{_v1_base(cfg)}{path}", body=json_body)
+
+
+def _plan_legacy(cfg: UniFiConfig, method: str, path: str, json_body: dict | None = None) -> UniFiWritePlan:
+    return UniFiWritePlan(method=method.upper(), api="legacy", path=path,
+                          url=f"{cfg.base_url}{_api_prefix(cfg)}{path}", body=json_body)
+
+
+def execute_write_plan(cfg: UniFiConfig, plan: UniFiWritePlan):
+    """Send a previously-built UniFiWritePlan. This is the only code path that
+    issues a mutating request to the controller."""
+    if plan.api not in ("v1", "legacy"):
+        raise ValueError(f"Unknown UniFi API kind: {plan.api!r}")
     with _client(cfg) as client:
-        if not cfg.api_key:
+        if plan.api == "legacy" and not cfg.api_key:
             _login(client, cfg)
-        r = client.request(method, url, headers=_auth_headers(cfg), json=json_body)
+        r = client.request(plan.method, plan.url, headers=_auth_headers(cfg), json=plan.body)
         if not r.is_success:
-            raise RuntimeError(f"UniFi {method} {path} HTTP {r.status_code}: {r.text[:300]}")
+            label = "UniFi v1" if plan.api == "v1" else "UniFi"
+            raise RuntimeError(f"{label} {plan.method} {plan.path} HTTP {r.status_code}: {r.text[:300]}")
         return r.json() if r.text else None
+
+
+def _write_v1(cfg: UniFiConfig, method: str, path: str, json_body: dict | None = None,
+              *, dry_run: bool = True):
+    """PUT/POST/DELETE against the integration v1 API. Requires api_key auth.
+
+    dry_run=True (default) returns the UniFiWritePlan without sending.
+    """
+    plan = _plan_v1(cfg, method, path, json_body)
+    if dry_run:
+        return plan
+    return execute_write_plan(cfg, plan)
+
+
+def _write_legacy(cfg: UniFiConfig, method: str, path: str, json_body: dict | None = None,
+                  *, dry_run: bool = True):
+    """PUT/POST/DELETE against a legacy UniFi API path (cookie or api_key auth).
+
+    dry_run=True (default) returns the UniFiWritePlan without logging in or sending.
+    """
+    plan = _plan_legacy(cfg, method, path, json_body)
+    if dry_run:
+        return plan
+    return execute_write_plan(cfg, plan)
 
 
 # ── Data models ───────────────────────────────────────────────────────────────
@@ -381,18 +441,25 @@ def fetch_port_forwards(cfg: UniFiConfig, site: str = "default") -> list[dict]:
     return data.get("data", [])
 
 
-def delete_port_forward(cfg: UniFiConfig, site: str, forward_id: str) -> None:
-    """Delete a port-forward rule by its _id (legacy REST API)."""
-    _write_legacy(cfg, "DELETE", f"/api/s/{site}/rest/portforward/{forward_id}")
+def delete_port_forward(cfg: UniFiConfig, site: str, forward_id: str, *, dry_run: bool = True):
+    """Delete a port-forward rule by its _id (legacy REST API).
+
+    Dry-run by default: returns a UniFiWritePlan. Pass dry_run=False to send.
+    """
+    return _write_legacy(cfg, "DELETE", f"/api/s/{site}/rest/portforward/{forward_id}", dry_run=dry_run)
 
 
-def update_port_forward(cfg: UniFiConfig, site: str, current: dict, updated_fields: dict) -> dict:
+def update_port_forward(cfg: UniFiConfig, site: str, current: dict, updated_fields: dict,
+                        *, dry_run: bool = True):
     """Update a port-forward rule. `current` is a raw dict from fetch_port_forwards();
     the legacy REST API expects the full object (including _id) on PUT.
+
+    Dry-run by default: returns a UniFiWritePlan. Pass dry_run=False to send.
     """
     body = dict(current)
     body.update(updated_fields)
-    return _write_legacy(cfg, "PUT", f"/api/s/{site}/rest/portforward/{body['_id']}", body)
+    return _write_legacy(cfg, "PUT", f"/api/s/{site}/rest/portforward/{body['_id']}", body,
+                         dry_run=dry_run)
 
 
 def fetch_networks(cfg: UniFiConfig, site: str = "default") -> list[UniFiNetwork]:
@@ -557,13 +624,18 @@ def fetch_firewall_zones_v1(cfg: UniFiConfig, site_id: str) -> list[UniFiFirewal
     ]
 
 
-def update_firewall_zone_v1(cfg: UniFiConfig, site_id: str, zone_id: str, updated_fields: dict) -> dict:
-    """Fetch the current zone, merge updated_fields (shallow) into it, PUT the full object back."""
+def update_firewall_zone_v1(cfg: UniFiConfig, site_id: str, zone_id: str, updated_fields: dict,
+                            *, dry_run: bool = True):
+    """Fetch the current zone, merge updated_fields (shallow) into it, PUT the full object back.
+
+    Dry-run by default: the current zone is still read (GET) so the plan shows the
+    exact body, but nothing is written. Pass dry_run=False to send the PUT.
+    """
     current = _get_v1(cfg, f"/sites/{site_id}/firewall/zones/{zone_id}")
     current.pop("id", None)
     current.pop("metadata", None)
     current.update(updated_fields)
-    return _write_v1(cfg, "PUT", f"/sites/{site_id}/firewall/zones/{zone_id}", current)
+    return _write_v1(cfg, "PUT", f"/sites/{site_id}/firewall/zones/{zone_id}", current, dry_run=dry_run)
 
 
 def fetch_firewall_policies_v1(
@@ -608,27 +680,38 @@ def fetch_firewall_policies_v1(
     return sorted(policies, key=lambda x: (x.src_zone_name, x.dst_zone_name, x.index))
 
 
-def update_firewall_policy_v1(cfg: UniFiConfig, site_id: str, policy_id: str, updated_fields: dict) -> dict:
+def update_firewall_policy_v1(cfg: UniFiConfig, site_id: str, policy_id: str, updated_fields: dict,
+                              *, dry_run: bool = True):
     """Fetch the current policy, merge updated_fields (shallow) into it, PUT the full object back.
 
     The integration v1 API expects the full policy object on PUT, not a partial patch.
+    Dry-run by default: the current policy is still read (GET) so the plan shows the
+    exact body, but nothing is written. Pass dry_run=False to send the PUT.
     """
     current = _get_v1(cfg, f"/sites/{site_id}/firewall/policies/{policy_id}")
     current.pop("id", None)
     current.pop("index", None)
     current.pop("metadata", None)
     current.update(updated_fields)
-    return _write_v1(cfg, "PUT", f"/sites/{site_id}/firewall/policies/{policy_id}", current)
+    return _write_v1(cfg, "PUT", f"/sites/{site_id}/firewall/policies/{policy_id}", current,
+                     dry_run=dry_run)
 
 
-def delete_firewall_policy_v1(cfg: UniFiConfig, site_id: str, policy_id: str) -> None:
-    """Delete a firewall policy by its id (integration v1 API)."""
-    _write_v1(cfg, "DELETE", f"/sites/{site_id}/firewall/policies/{policy_id}")
+def delete_firewall_policy_v1(cfg: UniFiConfig, site_id: str, policy_id: str, *, dry_run: bool = True):
+    """Delete a firewall policy by its id (integration v1 API).
+
+    Dry-run by default: returns a UniFiWritePlan. Pass dry_run=False to send.
+    """
+    return _write_v1(cfg, "DELETE", f"/sites/{site_id}/firewall/policies/{policy_id}", dry_run=dry_run)
 
 
-def create_firewall_policy_v1(cfg: UniFiConfig, site_id: str, body: dict) -> dict:
-    """Create a new firewall policy (integration v1 API). Returns the created policy."""
-    return _write_v1(cfg, "POST", f"/sites/{site_id}/firewall/policies", body)
+def create_firewall_policy_v1(cfg: UniFiConfig, site_id: str, body: dict, *, dry_run: bool = True):
+    """Create a new firewall policy (integration v1 API).
+
+    Dry-run by default: returns a UniFiWritePlan. With dry_run=False, sends the
+    POST and returns the created policy.
+    """
+    return _write_v1(cfg, "POST", f"/sites/{site_id}/firewall/policies", body, dry_run=dry_run)
 
 
 # ── Export ────────────────────────────────────────────────────────────────────

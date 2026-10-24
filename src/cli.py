@@ -45,6 +45,7 @@ from lib.pihole import (
 from lib.unifi import fetch_clients as unifi_fetch_clients
 from lib.unifi import fetch_client_stats as unifi_fetch_client_stats
 from lib.unifi import fetch_switch_ports as unifi_fetch_switch_ports
+from lib.unifi import UniFiWritePlan, execute_write_plan as unifi_execute_write_plan
 from lib.influxdb import write_points as influx_write_points
 from lib.nginx_proxy_manager import (
     list_proxy_hosts as npm_list_proxy_hosts,
@@ -2514,6 +2515,26 @@ def _unifi_cfg(cfg):
         console.print("[red]No unifi config in config.yaml[/]")
         raise typer.Exit(1)
     return cfg.unifi
+
+
+def _unifi_apply(unifi_cfg, plan: UniFiWritePlan, *, yes: bool = False, dry_run: bool = False):
+    """Single guarded entry point for any CLI command that mutates UniFi.
+
+    Build the plan with a lib.unifi write helper (they are dry-run by default),
+    then hand it here. The exact method/endpoint/body is always printed first.
+    Nothing is sent when dry_run is set, or unless the user passes -y/--yes or
+    confirms interactively (non-interactive sessions without -y never send).
+    Returns the controller response, or None when nothing was sent.
+    """
+    econsole.print("[bold]UniFi write plan:[/]")
+    econsole.print(plan.describe(), markup=False, highlight=False)
+    if dry_run:
+        econsole.print("[yellow]Dry run — nothing sent.[/]")
+        return None
+    if not _confirm(f"Send {plan.method} to the UniFi controller?", yes):
+        econsole.print("[yellow]Aborted — nothing sent.[/]")
+        return None
+    return unifi_execute_write_plan(unifi_cfg, plan)
 
 
 def _print_clients_table(clients: list) -> None:
