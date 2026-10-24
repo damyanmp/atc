@@ -1,0 +1,12 @@
+#!/bin/sh
+# Block commits that contain secrets (API keys, tokens, passwords, private keys).
+# Enable once per clone:  git config core.hooksPath .githooks
+# Needs gitleaks on PATH: https://github.com/gitleaks/gitleaks
+# Bypass for a known false positive: add a `gitleaks:allow` comment on that line,
+# or list it in .gitleaksignore. `git commit --no-verify` skips the check entirely.
+if ! command -v gitleaks >/dev/null 2>&1; then
+  echo "pre-commit: gitleaks is not installed, so the commit was blocked." >&2
+  echo "  Install it (https://github.com/gitleaks/gitleaks) and commit again." >&2
+  exit 1
+fi
+exec gitleaks git --pre-commit --staged --redact --no-banner --verbose
