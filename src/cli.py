@@ -4125,30 +4125,41 @@ def _acars_fetch_prometheus(cfg) -> list[dict]:
 _ACARS_LOG_WINDOW_MINUTES = 15  # "current", not historical — see atc blackbox for the deep dump
 
 
-_ACARS_PORT_LINKDOWN_WARN = 3   # cumulative since switch boot — a handful is normal churn
+_ACARS_PORT_LINKDOWN_WARN = 3   # link-down events within _ACARS_PORT_WINDOW_HOURS — a handful is normal churn
 _ACARS_PORT_LINKDOWN_CRIT = 8   # this many flaps points at a flaky link/NIC, not routine churn
+_ACARS_PORT_WINDOW_HOURS = 24   # port counter deltas are measured over this rolling window
 
 
-def _acars_fetch_unifi(cfg) -> list[dict]:
+def _acars_fetch_unifi(cfg, state_file: Path | None = None, now: float | None = None) -> list[dict]:
     """Devices offline/rebooted/firmware-updated, plus per-port link-flap and error
-    counters on switches. Returns [{text, severity}], raises on error.
+    counter *increases* on switches. Returns [{text, severity}], raises on error.
 
     Port counters (link_down_count, rx_errors, tx_errors) are cumulative since the
-    switch's own last boot, not windowed like the device-reboot check above — there is
-    no delta/reset endpoint, so a count found here can reflect an old event, not
-    something that just happened. Still useful as a standing signal: a port with
-    many link-down events or any hardware error count is worth a look, and this is
-    exactly the kind of switch-side symptom (e.g. a flapping host NIC) that otherwise
-    only surfaces via manual `atc unifi` digging after the fact — see 2026-10-09
-    gripen incident, where Ramstein port 14 (gripen's uplink) logged 9 link-down
-    events during the node's hang and acars said nothing about it.
+    switch's own last boot and the controller has no reset endpoint, so raw totals
+    would keep alerting on a weeks-old flap. Instead each run's counters are stored
+    in `state_file` (see lib.acars_state) and we alert on the increase within the
+    last _ACARS_PORT_WINDOW_HOURS. First run, or the first run after a switch
+    reboot (counter or uptime went down), only records a baseline. With no
+    `state_file`, there is no history and no port alerts at all.
+
+    This is the switch-side symptom (e.g. a flapping host NIC) that otherwise only
+    surfaces via manual `atc unifi` digging — see the 2026-10-09 incident, where a
+    node's switch uplink port logged 9 link-down events during the node's hang and
+    acars said nothing about it.
     """
     import time
+    from lib import acars_state
     from lib.unifi import fetch_devices
 
     result = []
-    now = int(time.time())
+    now_f = time.time() if now is None else now
+    now = int(now_f)
     since = now - (_ACARS_LOG_WINDOW_MINUTES * 60)
+    window_s = _ACARS_PORT_WINDOW_HOURS * 3600
+    window = f"{_ACARS_PORT_WINDOW_HOURS}h"
+
+    state = acars_state.load_state(state_file) if state_file else {"switches": {}}
+    acars_state.prune(state, now_f, window_s)
 
     for d in fetch_devices(cfg, site=cfg.site):
         if d.state != 1:
@@ -4166,31 +4177,50 @@ def _acars_fetch_unifi(cfg) -> list[dict]:
 
         if d.type != "usw":
             continue
-        for p in (d.raw or {}).get("port_table", []):
-            if not p.get("enable", True) or not p.get("up", False):
+        raw = d.raw or {}
+        # Record every port (not just up ones) so a port that comes back up
+        # already has a baseline; only alert on enabled+up ports, as before.
+        counters: dict[str, tuple[int, int, int]] = {}
+        alertable: dict[str, str] = {}
+        for p in raw.get("port_table", []):
+            idx = p.get("port_idx")
+            if idx is None:
                 continue
-            link_down = int(p.get("link_down_count", 0) or 0)
-            rx_err = int(p.get("rx_errors", 0) or 0)
-            tx_err = int(p.get("tx_errors", 0) or 0)
-            port_name = p.get("name") or f"Port {p.get('port_idx')}"
-            port_label = f"{d.name} {port_name}"
+            counters[str(idx)] = (
+                int(p.get("link_down_count", 0) or 0),
+                int(p.get("rx_errors", 0) or 0),
+                int(p.get("tx_errors", 0) or 0),
+            )
+            if p.get("enable", True) and p.get("up", False):
+                alertable[str(idx)] = p.get("name") or f"Port {idx}"
 
-            if rx_err or tx_err:
+        switch_key = raw.get("mac") or f"name:{d.name}"
+        deltas = acars_state.record_and_diff(state, switch_key, now_f, d.uptime, counters, window_s)
+
+        for idx, port_name in alertable.items():
+            if idx not in deltas:
+                continue
+            d_link, d_rx, d_tx = deltas[idx]
+            port_label = f"{d.name} {port_name}"
+            if d_rx > 0 or d_tx > 0:
                 result.append({
-                    "text": f"{port_label} — rx_errors={rx_err} tx_errors={tx_err} (cumulative since switch boot)",
+                    "text": f"{port_label} — rx_errors +{d_rx} tx_errors +{d_tx} in last {window}",
                     "severity": "CRIT",
                 })
-            if link_down >= _ACARS_PORT_LINKDOWN_CRIT:
+            if d_link >= _ACARS_PORT_LINKDOWN_CRIT:
                 result.append({
-                    "text": f"{port_label} — {link_down} link-down events (cumulative since switch boot, flaky link/NIC on connected device)",
+                    "text": f"{port_label} — {d_link} link-down events in last {window}"
+                            " (flaky link/NIC on connected device)",
                     "severity": "CRIT",
                 })
-            elif link_down >= _ACARS_PORT_LINKDOWN_WARN:
+            elif d_link >= _ACARS_PORT_LINKDOWN_WARN:
                 result.append({
-                    "text": f"{port_label} — {link_down} link-down events (cumulative since switch boot)",
+                    "text": f"{port_label} — {d_link} link-down events in last {window}",
                     "severity": "WARN",
                 })
 
+    if state_file:
+        acars_state.save_state(state_file, state)
     return result
 
 
@@ -4224,17 +4254,60 @@ _PIHOLE_MESSAGE_SEVERITY = {
     "CONNECTION_ERROR": "CRIT",   # FTL lost DB/upstream connectivity
 }
 
+# FTL keeps messages until someone dismisses them in the UI, so acars drops
+# ones older than this (still visible in the Pi-hole UI) — except disk
+# messages, since disk space doesn't fix itself.
+_ACARS_PIHOLE_MSG_MAX_AGE_HOURS = 24
+_PIHOLE_MESSAGE_KEEP_ANY_AGE = {"DISK_MESSAGE", "DISK_EXTENDED"}
 
-def _acars_fetch_pihole_messages(cfgs) -> list[dict]:
+
+def _acars_age_label(age_s: float) -> str:
+    """Floored age label: "<1m ago", "5m ago", "2h ago", "3d ago"."""
+    age_s = max(0.0, age_s)
+    if age_s < 60:
+        return "<1m ago"
+    if age_s < 3600:
+        return f"{int(age_s // 60)}m ago"
+    if age_s < 86400:
+        return f"{int(age_s // 3600)}h ago"
+    return f"{int(age_s // 86400)}d ago"
+
+
+def _acars_msg_timestamp(m: dict) -> float | None:
+    """The message's unix timestamp, or None if missing/invalid."""
+    import math
+
+    ts = m.get("timestamp")
+    if isinstance(ts, bool):
+        return None
+    try:
+        ts = float(ts)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(ts) or ts <= 0:
+        return None
+    return ts
+
+
+def _acars_fetch_pihole_messages(cfgs, now: float | None = None) -> list[dict]:
     """Pi-hole FTL's own diagnostic message feed (GET /api/info/messages),
     across ALL configured instances, not just the primary. Returns
     [{text, severity}], raises only if every instance failed (a single bad
     instance is folded into the text as its own WARN-less entry so the
-    others still get reported — mirrors fetch_seen_ips_all's pattern)."""
+    others still get reported — mirrors fetch_seen_ips_all's pattern).
+
+    Each text ends with the message's age, e.g. "(2h ago)". Messages older
+    than _ACARS_PIHOLE_MSG_MAX_AGE_HOURS are dropped, except the disk types
+    in _PIHOLE_MESSAGE_KEEP_ANY_AGE. A message with no usable timestamp is
+    kept and marked "(age unknown)" rather than silently hidden."""
     import asyncio as _asyncio
+    import time
 
     from lib.pihole import fetch_messages_all
 
+    if now is None:
+        now = time.time()
+    max_age_s = _ACARS_PIHOLE_MSG_MAX_AGE_HOURS * 3600
     result = []
     per_instance = _asyncio.run(fetch_messages_all(cfgs))
     all_failed = all(isinstance(msgs, BaseException) for _, msgs in per_instance)
@@ -4245,8 +4318,16 @@ def _acars_fetch_pihole_messages(cfgs) -> list[dict]:
             result.append({"text": f"{name} — messages fetch failed: {msgs}", "severity": "WARN"})
             continue
         for m in msgs:
-            sev = _PIHOLE_MESSAGE_SEVERITY.get(m.get("type", ""), "WARN")
-            result.append({"text": f"{name}: [{m.get('type', '?')}] {m.get('plain', '')}", "severity": sev})
+            mtype = m.get("type", "")
+            ts = _acars_msg_timestamp(m)
+            if ts is None:
+                age = "age unknown"
+            else:
+                if now - ts > max_age_s and mtype not in _PIHOLE_MESSAGE_KEEP_ANY_AGE:
+                    continue
+                age = _acars_age_label(now - ts)
+            sev = _PIHOLE_MESSAGE_SEVERITY.get(mtype, "WARN")
+            result.append({"text": f"{name}: [{mtype or '?'}] {m.get('plain', '')} ({age})", "severity": sev})
     return result
 
 
@@ -4348,8 +4429,9 @@ def cmd_acars(
             · Prometheus · Pi-hole instance up/down · Pi-hole FTL diagnostic
             messages (RATE_LIMIT, CERTIFICATE_DOMAIN_MISMATCH, LOAD, LIST/
             gravity failures, DISK_MESSAGE, NTP, etc — across ALL configured
-            instances, not just the primary) · UniFi device state/firmware
-            · Beszel host resources (CPU/Mem/Disk) + API token expiry
+            instances, not just the primary; older than 24h dropped except
+            disk messages) · UniFi device state/firmware + switch port
+            link-down/error increases in the last 24h · Beszel host resources (CPU/Mem/Disk) + API token expiry
             · Loki syslog/pihole log events (last 15 min — live, not historical;
             see `atc blackbox` for a deep historical dump)
             · Media: stuck Radarr/Sonarr queue items, *arr health errors,
@@ -4386,7 +4468,8 @@ def cmd_acars(
         if cfg.pihole_instances:
             coros["pihole_messages"] = _sync(_acars_fetch_pihole_messages, cfg.pihole_instances)
         if cfg.unifi:
-            coros["unifi"] = _sync(_acars_fetch_unifi, cfg.unifi)
+            from lib.acars_state import state_path as _acars_state_path
+            coros["unifi"] = _sync(_acars_fetch_unifi, cfg.unifi, _acars_state_path(cfg.config_path))
         if cfg.beszel:
             coros["beszel"] = _sync(
                 _acars_fetch_beszel, cfg.beszel,
