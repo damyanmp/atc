@@ -7,6 +7,10 @@ track breaking config/CLI changes.
 
 ## [Unreleased]
 
+### Changed
+- `atc acars` UniFi port alerts are now based on recent change, not lifetime totals. Link-down and rx/tx error counters are compared against a rolling 24h history stored in `acars_state.json` next to `config.yaml`. An old flap stops alerting once it leaves the window, and a switch reboot (counter or uptime going down) starts a new baseline. The first run after upgrading only records a baseline and raises no port alerts.
+- `atc acars` Pi-hole FTL messages now end with their age, e.g. `(2h ago)`. Messages older than 24h are dropped (they stay visible in the Pi-hole UI), except `DISK_MESSAGE`/`DISK_EXTENDED`. Messages without a usable timestamp are kept and marked `(age unknown)`.
+
 ### Security
 - Env files (`.env`, `.env.*`, `*.env`) are gitignored, and a tracked `.githooks/pre-commit` runs gitleaks on staged changes and blocks commits that contain secrets. Enable once per clone with `git config core.hooksPath .githooks` (needs `gitleaks` on PATH).
 

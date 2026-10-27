@@ -1,5 +1,7 @@
 config.yaml
 guest_users.yaml
+# acars port-counter history; lands here only with a legacy repo-root config.yaml
+acars_state.json
 # Homelab-specific automation (CouchDB host, vault layout) lives in the
 # private pentagon-management repo, not here — never let stray local
 # copies get staged into this (sharable) repo.

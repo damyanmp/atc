@@ -399,6 +399,17 @@ re-synced via `uv sync` automatically after a successful pull.
 Equivalent to running `git pull && uv sync` by hand in the repo directory —
 `atc upgrade` just wraps that with a status check and safety guards.
 
+### Upgrading notes
+
+- **Unreleased — `atc acars` alerts on recent change.** UniFi port alerts now
+  use the counter increase over the last 24h instead of the totals since the
+  switch booted. History lives in `acars_state.json` next to `config.yaml`, so
+  the first run after upgrading only records a baseline and shows no port
+  alerts. Pi-hole FTL messages older than 24h no longer appear, except disk
+  messages. Alert text changed, for example `… link-down events in last 24h`
+  and a trailing `(2h ago)`, so update any wrapper that matches on the old
+  `cumulative since switch boot` wording. The `-o json` shape is unchanged.
+
 ## Supported integration versions
 
 Each integration targets a specific API generation of that service — see
