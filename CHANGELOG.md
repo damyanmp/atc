@@ -8,6 +8,7 @@ track breaking config/CLI changes.
 ## [Unreleased]
 
 ### Fixed
+- `atc docker logs --since` (and `atc blackbox`'s per-container log window) now actually limit by time. The seconds value was passed straight to Docker's `since`, which is an absolute Unix timestamp, so `--since 7200` meant "since 1970" and every call fetched the container's full history, limited only by `--tail`. A large `-n` on a noisy container could exhaust host memory. Log text is also printed without Rich markup parsing, so lines like `[AF_INET]` show as-is.
 - `atc update nodes`/`hosts` now flag a pending reboot on Proxmox VE and plain Debian. The check used to rely only on Ubuntu's `/var/run/reboot-required`, which Debian-based Proxmox never writes, so nodes running an old kernel with a newer one installed showed "no reboot". It now also compares `uname -r` with the newest `/boot/vmlinuz-*` and prints the reason (e.g. `kernel 7.0.0-3-pve running, 7.0.14-29-pve installed`).
 
 ### Changed

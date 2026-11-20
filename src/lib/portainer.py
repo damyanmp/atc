@@ -176,6 +176,25 @@ def upload_to_container(
             )
 
 
+def log_query_params(since_seconds: int, tail: int, now: float | None = None) -> dict:
+    """Docker /logs query params for "last `tail` lines from the past `since_seconds`".
+
+    Docker's `since` is an absolute Unix timestamp, not a relative window —
+    passing the raw seconds count (e.g. 7200) meant "since 1970" and returned
+    the container's entire history. since_seconds <= 0 means no time filter.
+    """
+    params = {
+        "stdout": "true",
+        "stderr": "true",
+        "timestamps": "true",
+        "tail": max(1, int(tail)),
+    }
+    if since_seconds > 0:
+        ts = time.time() if now is None else now
+        params["since"] = max(0, int(ts) - int(since_seconds))
+    return params
+
+
 def fetch_container_logs(
     cfg: PortainerConfig,
     env_id: int,
@@ -184,13 +203,7 @@ def fetch_container_logs(
     tail: int = 200,
 ) -> str:
     """Fetch the last `tail` lines of container logs from the past `since_seconds`."""
-    params = {
-        "stdout": "true",
-        "stderr": "true",
-        "timestamps": "true",
-        "since": since_seconds,
-        "tail": tail,
-    }
+    params = log_query_params(since_seconds, tail)
     with _client(cfg) as client:
         r = client.get(
             f"{cfg.base_url}/api/endpoints/{env_id}/docker/containers/{container_id}/logs",

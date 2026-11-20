@@ -4905,7 +4905,9 @@ def docker_logs(
         logs = fetch_container_logs(pt_cfg, c.env_id, c.id, since_seconds=since, tail=tail)
 
     console.print(f"[dim]── {c.name} ({c.env_name}) — last {tail} line(s) ──[/]")
-    console.print(logs)
+    # Raw log text: no Rich markup/highlighting (lines like "[AF_INET]" or
+    # "[UNDEF]" otherwise get parsed as markup tags).
+    console.print(logs, markup=False, highlight=False)
 
 
 @docker_app.command("stacks")

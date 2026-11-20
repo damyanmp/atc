@@ -181,3 +181,26 @@ class TestInferComposeStacks:
         ]
         stacks = infer_compose_stacks(containers)
         assert [s.env_id for s in stacks] == [1, 2]
+
+
+class TestLogQueryParams:
+    """Docker's /logs `since` is an absolute Unix timestamp, not a window."""
+
+    def test_since_is_now_minus_window(self):
+        from lib.portainer import log_query_params
+        p = log_query_params(7200, 200, now=1_800_000_000)
+        assert p["since"] == 1_800_000_000 - 7200
+
+    def test_since_never_raw_seconds(self):
+        from lib.portainer import log_query_params
+        p = log_query_params(3600, 50)
+        assert p["since"] > 1_600_000_000  # a real recent timestamp, not 3600
+
+    def test_zero_window_means_no_time_filter(self):
+        from lib.portainer import log_query_params
+        assert "since" not in log_query_params(0, 50, now=1_800_000_000)
+
+    def test_tail_passed_through_and_floored(self):
+        from lib.portainer import log_query_params
+        assert log_query_params(60, 300, now=1e9)["tail"] == 300
+        assert log_query_params(60, 0, now=1e9)["tail"] == 1
