@@ -7,6 +7,9 @@ track breaking config/CLI changes.
 
 ## [Unreleased]
 
+### Fixed
+- `atc update nodes`/`hosts` now flag a pending reboot on Proxmox VE and plain Debian. The check used to rely only on Ubuntu's `/var/run/reboot-required`, which Debian-based Proxmox never writes, so nodes running an old kernel with a newer one installed showed "no reboot". It now also compares `uname -r` with the newest `/boot/vmlinuz-*` and prints the reason (e.g. `kernel 7.0.0-3-pve running, 7.0.14-29-pve installed`).
+
 ### Changed
 - `atc acars` UniFi port alerts are now based on recent change, not lifetime totals. Link-down and rx/tx error counters are compared against a rolling 24h history stored in `acars_state.json` next to `config.yaml`. An old flap stops alerting once it leaves the window, and a switch reboot (counter or uptime going down) starts a new baseline. The first run after upgrading only records a baseline and raises no port alerts.
 - `atc acars` Pi-hole FTL messages now end with their age, e.g. `(2h ago)`. Messages older than 24h are dropped (they stay visible in the Pi-hole UI), except `DISK_MESSAGE`/`DISK_EXTENDED`. Messages without a usable timestamp are kept and marked `(age unknown)`.

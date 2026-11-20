@@ -42,6 +42,7 @@ from lib.pihole import (
     trigger_gravity_all,
     fetch_seen_ips_all,
 )
+from lib.reboot import REBOOT_CHECK_CMD, parse_reboot_check
 from lib.unifi import fetch_clients as unifi_fetch_clients
 from lib.unifi import fetch_client_stats as unifi_fetch_client_stats
 from lib.unifi import fetch_switch_ports as unifi_fetch_switch_ports
@@ -1627,21 +1628,18 @@ def _confirm_and_update(targets: list[UpdateTarget], cfg: Config, yes: bool, ver
             return f"sudo bash -c '{base_cmd}'"
         return base_cmd
 
-    # (target, success, needs_reboot, failed_units, output_lines)
-    results: list[tuple[UpdateTarget, bool, bool, list[str], list[str]]] = []
+    # (target, success, needs_reboot reason ("" = no), failed_units, output_lines)
+    results: list[tuple[UpdateTarget, bool, str, list[str], list[str]]] = []
 
-    async def _post_checks(target: UpdateTarget) -> tuple[bool, list[str]]:
-        reboot_r = await run_command(
-            target.host,
-            "test -f /var/run/reboot-required && cat /var/run/reboot-required.pkgs 2>/dev/null || true",
-            cfg.ssh, user=target.user,
-        )
+    async def _post_checks(target: UpdateTarget) -> tuple[str, list[str]]:
+        # Kernel-vs-running compare + Ubuntu flag; the flag alone misses Proxmox/Debian.
+        reboot_r = await run_command(target.host, REBOOT_CHECK_CMD, cfg.ssh, user=target.user)
         failed_r = await run_command(
             target.host,
             "systemctl --failed --no-legend 2>/dev/null | awk '{print ($1~/\\./) ? $1 : $2}'",
             cfg.ssh, user=target.user,
         )
-        needs_reboot = bool(reboot_r.stdout.strip())
+        needs_reboot = parse_reboot_check(reboot_r.stdout)
         _NOISE_UNITS = {"motd-news.service", "apt-news.service", "ua-timer.service"}
         failed_units = [
             u for u in failed_r.stdout.strip().splitlines()
@@ -1825,7 +1823,7 @@ def _print_update_summary(
                 for l in relevant:
                     console.print(f"    [dim]{l}[/]")
         if needs_reboot:
-            console.print(f"\n[yellow]⚠️  {guest_name} requires a reboot:[/]")
+            console.print(f"\n[yellow]⚠️  {guest_name} requires a reboot[/] [dim]({needs_reboot})[/]")
             console.print(f"    ssh {user}@{target.host} reboot")
         if failed_units:
             console.print(f"\n[red]❌  {guest_name} — failed units:[/]")
