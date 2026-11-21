@@ -249,6 +249,20 @@ SECTIONS: list[SectionSpec] = [
         ],
     ),
     SectionSpec(
+        key="dockhand",
+        title="Dockhand (Docker management — Portainer successor, preview)",
+        help="Token: Dockhand UI → avatar → API tokens (needs your password; tokens start "
+             "with dh_). After saving, the wizard checks the token and can register Docker "
+             "hosts in Dockhand for you (local socket, Hawser agent, or direct TCP).",
+        fields=[
+            FieldSpec("host", "Dockhand host/IP"),
+            FieldSpec("port", "Port", kind="int", default=3000),
+            FieldSpec("https", "Use HTTPS?", kind="bool", default=False, required=False),
+            FieldSpec("api_token", "API token (dh_...)", secret=True, secret_key="dockhand-api-token"),
+            FieldSpec("verify_ssl", "Verify SSL?", kind="bool", default=False, required=False),
+        ],
+    ),
+    SectionSpec(
         key="nginx_proxy_manager",
         title="Nginx Proxy Manager",
         help="Needs either a token, or both email+password.",
@@ -362,3 +376,74 @@ def merge_config(existing: dict, updates: dict) -> dict:
     merged = dict(existing)
     merged.update(updates)
     return merged
+
+
+# ── Dockhand environments (hosts) ────────────────────────────────────────────
+# Used by `atc init dockhand` after the connection is saved, to register Docker hosts
+# in Dockhand itself. These live in Dockhand's DB, not in config.yaml.
+
+@dataclass
+class EnvKind:
+    key: str            # Dockhand connectionType
+    label: str
+    help: str
+
+
+DOCKHAND_ENV_KINDS: list[EnvKind] = [
+    EnvKind("hawser-standard", "Hawser agent, standard mode",
+            "Agent listens on the host (port 2376, token-protected); Dockhand connects in. "
+            "Simplest on a LAN."),
+    EnvKind("hawser-edge", "Hawser agent, edge mode",
+            "Agent dials out to Dockhand over a WebSocket; the host opens no ports. "
+            "Use for hosts behind NAT or off-LAN."),
+    EnvKind("socket", "Local socket on the Dockhand server",
+            "The Docker daemon Dockhand itself runs on (socket mounted into its container)."),
+    EnvKind("direct", "Direct Docker API over TCP",
+            "An already-exposed Docker API (e.g. tcp://host:2375). No agent; plain TCP is "
+            "unauthenticated, so prefer Hawser."),
+]
+
+
+def env_kind(key: str) -> EnvKind | None:
+    return next((k for k in DOCKHAND_ENV_KINDS if k.key == key), None)
+
+
+_ENV_NAME_RE = __import__("re").compile(r"^[A-Za-z0-9][A-Za-z0-9 ._-]{0,62}$")
+
+
+def validate_env_name(name: str, existing: list[str]) -> str:
+    """'' if the name is usable, else a reason."""
+    if not _ENV_NAME_RE.match(name or ""):
+        return "use 1-63 letters, digits, space, '.', '_' or '-' (start with a letter/digit)"
+    if name.lower() in {e.lower() for e in existing}:
+        return f"an environment named '{name}' already exists in Dockhand"
+    return ""
+
+
+def build_dockhand_environment(kind: str, answers: dict) -> dict:
+    """POST /api/environments body for one host. Pure; raises ValueError on bad input."""
+    if env_kind(kind) is None:
+        raise ValueError(f"unknown environment kind {kind!r}")
+    name = str(answers.get("name", "")).strip()
+    if not name:
+        raise ValueError("name is required")
+    body: dict = {"name": name, "connectionType": kind}
+    if kind == "socket":
+        body["socketPath"] = answers.get("socket_path") or "/var/run/docker.sock"
+    elif kind in ("hawser-standard", "direct"):
+        host = str(answers.get("host", "")).strip()
+        if not host:
+            raise ValueError("host is required")
+        body["host"] = host
+        body["port"] = int(answers.get("port") or (2376 if kind == "hawser-standard" else 2375))
+        body["protocol"] = "https" if answers.get("tls") else "http"
+        if kind == "hawser-standard":
+            if not answers.get("hawser_token"):
+                raise ValueError("hawser_token is required for standard mode")
+            body["hawserToken"] = answers["hawser_token"]
+        if answers.get("tls") and answers.get("tls_skip_verify"):
+            body["tlsSkipVerify"] = True
+    # hawser-edge: name + type only; the agent token is minted after the env exists
+    if answers.get("labels"):
+        body["labels"] = str(answers["labels"])
+    return body

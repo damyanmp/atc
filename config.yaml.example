@@ -263,9 +263,10 @@ portainer:
   verify_ssl: false
 
 dockhand:
-  # Dockhand — eventual Portainer replacement (lib/dockhand.py, dev branch).
-  # Generate a token: Dockhand UI → Profile (avatar) → API tokens → Generate token.
-  # All Dockhand tokens start with "dh_".
+  # Dockhand — Portainer replacement candidate (lib/dockhand.py).
+  # Easiest: `atc init dockhand` — saves this section, checks the token, and can
+  # register Docker hosts (local socket, Hawser standard/edge agent, direct TCP).
+  # Token: Dockhand UI → avatar → API tokens (needs your password; starts with "dh_").
   host: 192.168.x.x
   port: 3000
   https: false

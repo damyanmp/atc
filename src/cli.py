@@ -797,6 +797,152 @@ def _run_section_wizard(spec) -> object:
     return build_list_section(spec, instances)
 
 
+# ── Dockhand: verify the connection, then register Docker hosts ──────────────
+
+def _dockhand_cfg_from_section(section: dict):
+    """DockhandConfig from a freshly built config section (resolves the keychain sentinel)."""
+    from config import DockhandConfig, _resolve_secret
+
+    return DockhandConfig(
+        host=section["host"],
+        port=int(section.get("port", 3000)),
+        https=bool(section.get("https", False)),
+        api_token=_resolve_secret(section["api_token"], "dockhand/api_token"),
+        verify_ssl=bool(section.get("verify_ssl", False)),
+    )
+
+
+def _dockhand_verify(dcfg) -> list | None:
+    """Print a connection check; returns the environments list, or None on failure."""
+    from lib.dockhand import verify_connection
+
+    ok, msg, envs = verify_connection(dcfg)
+    if not ok:
+        console.print(f"  [red]✗ Dockhand check failed:[/] {msg}")
+        console.print("  [dim]Saved anyway — fix the value and re-run 'atc init dockhand'.[/]")
+        return None
+    console.print(f"  [green]✓[/] Dockhand {msg}")
+    for e in envs:
+        console.print(f"    • {e.name} [dim]({e.connection_type or '?'}{', ' + e.host if e.host else ''})[/]")
+    return envs
+
+
+def _prompt_choice(label: str, options: list[tuple[str, str, str]], default: int = 1) -> str:
+    """Numbered menu of (key, label, help); returns the chosen key."""
+    for i, (_, lab, hlp) in enumerate(options, start=1):
+        console.print(f"  {i}. {lab}")
+        if hlp:
+            console.print(f"     [dim]{hlp}[/]")
+    while True:
+        raw = Prompt.ask(f"  {label}", default=str(default)).strip()
+        if raw.isdigit() and 1 <= int(raw) <= len(options):
+            return options[int(raw) - 1][0]
+        console.print(f"    [red]Pick 1-{len(options)}.[/]")
+
+
+def _dockhand_add_host(dcfg, existing_names: list[str]) -> str | None:
+    """Interactive: register one Docker host in Dockhand. Returns its name, or None if skipped."""
+    import secrets as _secrets
+
+    from lib import dockhand as dh
+    from lib.config_sections import DOCKHAND_ENV_KINDS, build_dockhand_environment, validate_env_name
+
+    console.print("\n[bold]New Docker host[/]")
+    kind = _prompt_choice("Connection type", [(k.key, k.label, k.help) for k in DOCKHAND_ENV_KINDS])
+
+    while True:
+        name = Prompt.ask("  Name (shown in atc and Dockhand)").strip()
+        why = validate_env_name(name, existing_names)
+        if not why:
+            break
+        console.print(f"    [red]{why}[/]")
+
+    answers: dict = {"name": name}
+    if kind == "socket":
+        answers["socket_path"] = Prompt.ask("  Socket path (inside the Dockhand container)",
+                                            default="/var/run/docker.sock")
+    elif kind in ("hawser-standard", "direct"):
+        answers["host"] = Prompt.ask("  Host/IP of the Docker host")
+        answers["port"] = int(Prompt.ask("  Port", default=str(dh.HAWSER_PORT if kind == "hawser-standard" else 2375)))
+        answers["tls"] = Confirm.ask("  Use TLS?", default=False)
+        if answers["tls"]:
+            answers["tls_skip_verify"] = Confirm.ask("  Skip TLS certificate verification?", default=False)
+
+    if kind == "hawser-standard":
+        if Confirm.ask("  Is a Hawser agent already running on that host?", default=False):
+            answers["hawser_token"] = Prompt.ask("  Agent TOKEN", password=True).strip()
+        else:
+            token = _secrets.token_urlsafe(32)
+            answers["hawser_token"] = token
+            console.print("\n  Run this on the Docker host, then come back:\n")
+            console.print(dh.hawser_run_command("hawser-standard", token), markup=False, highlight=False)
+            console.print("\n  [dim]The token is stored in Dockhand only; atc doesn't keep it.[/]")
+            Prompt.ask("  Press Enter once the agent is running", default="", show_default=False)
+
+    try:
+        body = build_dockhand_environment(kind, answers)
+    except ValueError as ex:
+        console.print(f"  [red]✗ {ex}[/]")
+        return None
+
+    if kind != "hawser-edge":
+        while True:
+            ok, msg = dh.test_environment_config(dcfg, {k: v for k, v in body.items() if k != "name"})
+            if ok:
+                console.print(f"  [green]✓[/] {msg}")
+                break
+            console.print(f"  [red]✗ Connection test failed:[/] {msg}")
+            choice = _prompt_choice("What now", [("retry", "Test again", ""),
+                                                ("save", "Save it anyway (fix later in Dockhand)", ""),
+                                                ("skip", "Skip this host", "")])
+            if choice == "skip":
+                return None
+            if choice == "save":
+                break
+
+    env_id = dh.add_environment(dcfg, body)
+    console.print(f"  [green]✓[/] Registered [cyan]{name}[/] in Dockhand (id {env_id})")
+
+    if kind == "hawser-edge":
+        token = dh.create_hawser_token(dcfg, env_id, f"atc-init-{name}")
+        console.print("\n  Run this on the Docker host (it dials out; no ports to open):\n")
+        console.print(dh.hawser_run_command("hawser-edge", token, dh.edge_connect_url(dcfg)),
+                      markup=False, highlight=False)
+        console.print("\n  [dim]This token is shown once. Dockhand keeps it; atc doesn't.[/]")
+        Prompt.ask("  Press Enter once the agent is running", default="", show_default=False)
+        ok, msg = False, ""
+        for _ in range(10):
+            ok, msg = dh.test_environment(dcfg, env_id)
+            if ok:
+                break
+            time.sleep(3)
+        console.print(f"  [green]✓[/] Agent connected" if ok
+                      else f"  [yellow]! Not connected yet:[/] {msg} [dim](check the agent's logs)[/]")
+    return name
+
+
+def _dockhand_hosts_wizard(dcfg, envs: list) -> None:
+    """Offer to register Docker hosts after the Dockhand connection is saved."""
+    names = [e.name for e in envs]
+    if not Confirm.ask("\nRegister a Docker host in Dockhand now?", default=not names):
+        return
+    while True:
+        added = _dockhand_add_host(dcfg, names)
+        if added:
+            names.append(added)
+        if not Confirm.ask("Add another Docker host?", default=False):
+            break
+
+
+def _post_section(spec_key: str, section: object) -> None:
+    """Section-specific follow-up after the wizard built a section."""
+    if spec_key == "dockhand" and isinstance(section, dict) and section.get("host"):
+        dcfg = _dockhand_cfg_from_section(section)
+        envs = _dockhand_verify(dcfg)
+        if envs is not None:
+            _dockhand_hosts_wizard(dcfg, envs)
+
+
 @app.command("init")
 def cmd_init(
     section: str | None = typer.Argument(
@@ -835,11 +981,18 @@ def cmd_init(
         if spec is None:
             console.print(f"[red]Unknown section '{section}'.[/] Run 'atc init' with no argument to see the menu.")
             raise typer.Exit(1)
+        if spec.key == "dockhand" and isinstance(existing.get("dockhand"), dict) and existing["dockhand"].get("host"):
+            console.print(f"[dim]Dockhand is already configured ({existing['dockhand']['host']}).[/]")
+            if _prompt_choice("What now", [("hosts", "Add Docker hosts to it", ""),
+                                           ("reconfigure", "Reconfigure the connection", "")]) == "hosts":
+                _post_section("dockhand", existing["dockhand"])
+                return
         result = _run_section_wizard(spec)
         merged = merge_config(existing, {spec.key: result})
         with open(cfg_path, "w") as f:
             _yaml.dump(merged, f, sort_keys=False, default_flow_style=False)
         console.print(f"\n[green]✓[/] Wrote [cyan]{spec.key}[/] to {cfg_path}")
+        _post_section(spec.key, result)
         return
 
     # Interactive menu mode
@@ -890,6 +1043,8 @@ def cmd_init(
         _yaml.dump(merged, f, sort_keys=False, default_flow_style=False)
 
     console.print(f"\n[green]✓[/] Configured {len(selected)} section(s) → {cfg_path}")
+    for key, section in updates.items():
+        _post_section(key, section)
     console.print("[dim]Run 'atc get hosts' to verify.[/]")
 
 

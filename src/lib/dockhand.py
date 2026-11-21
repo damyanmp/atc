@@ -159,6 +159,97 @@ def health_check(cfg: DockhandConfig) -> bool:
         return client.get("/api/health", headers=_headers(cfg)).is_success
 
 
+# ── setup helpers (atc init dockhand) ───────────────────────────────────────
+
+HAWSER_IMAGE = "ghcr.io/finsys/hawser"
+HAWSER_PORT = 2376
+
+
+def verify_connection(cfg: DockhandConfig) -> tuple[bool, str, list[DockhandEnvironment]]:
+    """Check reachability AND that the token works. Returns (ok, message, environments).
+
+    /api/health answers without auth, so a bad token only shows up on an authenticated call.
+    """
+    try:
+        if not health_check(cfg):
+            return False, f"no healthy Dockhand at {cfg.base_url}", []
+        with _client(cfg) as client:
+            r = client.get("/api/environments", headers=_headers(cfg))
+        if r.status_code == 401:
+            return False, "Dockhand is up but rejected the API token (401)", []
+        _check(r, "environments")
+        envs = fetch_environments(cfg)
+        return True, f"connected, {len(envs)} environment(s)", envs
+    except (httpx.HTTPError, RuntimeError) as ex:
+        return False, f"{type(ex).__name__}: {str(ex)[:200]}", []
+
+
+def test_environment_config(cfg: DockhandConfig, body: dict) -> tuple[bool, str]:
+    """Try a connection config WITHOUT saving it (POST /api/environments/test).
+
+    Dockhand reports connection failures as HTTP 200 {success:false, error}, so this returns
+    (ok, message) instead of raising.
+    """
+    with _client(cfg, timeout=30) as client:
+        r = client.post("/api/environments/test", headers=_headers(cfg), json=body)
+    if not r.is_success:
+        return False, f"HTTP {r.status_code}: {r.text[:200]}"
+    j = r.json()
+    if j.get("success"):
+        info = j.get("info") or {}
+        ver = info.get("serverVersion") or info.get("version") or info.get("ServerVersion") or ""
+        return True, f"reachable{f', Docker {ver}' if ver else ''}"
+    return False, str(j.get("error") or j)[:300]
+
+
+def add_environment(cfg: DockhandConfig, body: dict) -> int:
+    """Register an environment (POST /api/environments). Returns its id."""
+    with _client(cfg, timeout=30) as client:
+        r = _check(client.post("/api/environments", headers=_headers(cfg), json=body),
+                   f"add environment ({body.get('name')})")
+    return int(r.json()["id"])
+
+
+def test_environment(cfg: DockhandConfig, env_id: int) -> tuple[bool, str]:
+    """Test a saved environment (POST /api/environments/{id}/test)."""
+    with _client(cfg, timeout=30) as client:
+        r = client.post(f"/api/environments/{env_id}/test", headers=_headers(cfg))
+    if not r.is_success:
+        return False, f"HTTP {r.status_code}: {r.text[:200]}"
+    j = r.json()
+    return bool(j.get("success")), str(j.get("error") or "ok")[:300]
+
+
+def create_hawser_token(cfg: DockhandConfig, env_id: int, name: str) -> str:
+    """Mint an edge-agent token for an environment. The plaintext is returned only once."""
+    with _client(cfg, timeout=30) as client:
+        r = _check(client.post("/api/hawser/tokens", headers=_headers(cfg),
+                               json={"name": name, "environmentId": env_id}), "hawser token")
+    return r.json()["token"]
+
+
+def edge_connect_url(cfg: DockhandConfig) -> str:
+    """WebSocket URL an edge-mode Hawser agent dials out to."""
+    scheme = "wss" if cfg.https else "ws"
+    return f"{scheme}://{cfg.host}:{cfg.port}/api/hawser/connect"
+
+
+def hawser_run_command(mode: str, token: str, connect_url: str = "", version: str = "latest") -> str:
+    """docker run line for the agent host. dockhand.update=false keeps Dockhand from
+    auto-updating its own agent, which drops the connection mid-update and hangs."""
+    lines = ["docker run -d --name hawser --restart unless-stopped"]
+    if mode == "hawser-standard":
+        lines.append(f"-p {HAWSER_PORT}:{HAWSER_PORT}")
+    else:
+        lines.append(f"-e DOCKHAND_SERVER_URL={connect_url}")
+    lines += [f"-e TOKEN={token}",
+              "-v /var/run/docker.sock:/var/run/docker.sock",
+              "--tmpfs /tmp",
+              "--label dockhand.update=false",
+              f"{HAWSER_IMAGE}:{version}"]
+    return " \\\n  ".join(lines)
+
+
 # ── environments & containers ───────────────────────────────────────────────
 
 def fetch_environments(cfg: DockhandConfig) -> list[DockhandEnvironment]:
@@ -170,7 +261,7 @@ def fetch_environments(cfg: DockhandConfig) -> list[DockhandEnvironment]:
             id=e["id"],
             name=e.get("name", str(e["id"])),
             connection_type=e.get("connectionType", ""),
-            host=e.get("host") or e.get("socketPath") or "",
+            host=(e.get("socketPath") or "") if e.get("connectionType") == "socket" else (e.get("host") or ""),
         )
         for e in r.json()
     ]

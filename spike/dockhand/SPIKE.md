@@ -84,6 +84,24 @@ matches the running version.
 - `env: [A=${A}]` (flow style with `${}`) is invalid YAML for go-yaml. Use block-style
   lists.
 
+## `atc init dockhand` (setup wizard)
+
+- Writes the `dockhand:` section. The token goes to the keychain as
+  `dockhand-api-token`, the same key as `config.yaml.example`.
+- Checks the token with an authenticated call. `/api/health` alone would pass with a
+  bad token.
+- Offers to register Docker hosts in Dockhand: Hawser standard, Hawser edge, the local
+  socket, or direct TCP.
+  - Standard mode: generates the agent token and prints the `docker run` line.
+  - Edge mode: mints the token in Dockhand and waits for the agent to dial in.
+  - Every config is tested before it's saved (`POST /api/environments/test`). On a
+    failure you can retry, save anyway, or skip. Duplicate names are refused.
+- Re-running `atc init dockhand` once it's configured offers "add hosts" without
+  re-entering the token.
+- Agent tokens live in Dockhand only; atc never stores them.
+- End-to-end run (all 4 host types, a failing host, a re-run, duplicate-name refusal):
+  `RESULTS-init-wizard.md`.
+
 ## Files
 
 - `sandbox.sh up|down`: Dockhand + Hawser on loopback (`HW_TOKEN_FILE` = 0600 env file
