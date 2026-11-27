@@ -5,6 +5,7 @@ import asyncio
 import difflib
 import getpass
 import json as _json
+import os
 import subprocess
 import sys
 import time
@@ -26,7 +27,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(Path(__file__).parent / "lib"))
 
 from config import (
-    Config, load_config,
+    Config, load_config, default_config_path,
     secret_set, secret_delete, secret_verify, secret_repair, secrets_scan_config, secrets_list,
     secrets_migrate_encryption, keyring_backend_status,
     secret_is_local_only, secret_set_local_only,
@@ -2463,6 +2464,149 @@ def secrets_rm(
 ) -> None:
     """Alias for 'delete'."""
     secrets_delete(key=key, yes=yes)
+
+
+# ── export / import (move an install to a new machine) ───────────────────────
+
+def _bundle_config_dir() -> Path:
+    """Where import writes config files: $ATC_CONFIG's dir, else ~/.config/atc.
+
+    Deliberately never the legacy repo-root location — a fresh install
+    should land in the XDG dir, outside any git working tree.
+    """
+    env_path = os.environ.get("ATC_CONFIG")
+    if env_path:
+        return Path(env_path).expanduser().parent
+    return Path(os.environ.get("XDG_CONFIG_HOME", "~/.config")).expanduser() / "atc"
+
+
+def _prompt_new_passphrase() -> str:
+    from lib.bundle import MIN_PASSPHRASE_LEN
+    while True:
+        p1 = getpass.getpass("Bundle passphrase: ")
+        if len(p1) < MIN_PASSPHRASE_LEN:
+            console.print(f"[yellow]Too short — use at least {MIN_PASSPHRASE_LEN} characters.[/]")
+            continue
+        if getpass.getpass("Repeat passphrase: ") != p1:
+            console.print("[yellow]Passphrases don't match — try again.[/]")
+            continue
+        return p1
+
+
+@app.command("export")
+def export_cmd(
+    out: Path | None = typer.Argument(None, help="Output file (default: ./atc-export-<host>-<date>.atcbundle)"),
+    force: bool = typer.Option(False, "--force", help="Overwrite an existing output file"),
+) -> None:
+    """Export all secrets + config into ONE passphrase-encrypted file.
+
+    For moving atc to a new machine. Bundles every keychain secret (index,
+    local_only flags, auth PIN) and config.yaml + guest_users.yaml +
+    guest_update_cmds.yaml. scrypt + AES-256-GCM; nothing is written in
+    plaintext. Restore with [bold]atc import <file>[/] on the new machine,
+    then delete the file.
+    """
+    import keyring
+    import socket
+    from lib import bundle as bn
+
+    config_dir = default_config_path().parent
+    if out is None:
+        out = Path(f"atc-export-{socket.gethostname().split('.')[0]}-{datetime.now():%Y%m%d}.atcbundle")
+    out = out.expanduser()
+    if out.exists() and not force:
+        console.print(f"[red]{out} already exists.[/] Use --force to overwrite.")
+        raise typer.Exit(1)
+
+    b, missing = bn.collect(keyring, KEYCHAIN_SERVICE, config_dir)
+    if not b.secrets and not b.files:
+        console.print(f"[red]Nothing to export[/] (no secrets indexed, no config in {config_dir}).")
+        raise typer.Exit(1)
+
+    console.print(f"[bold]Config dir:[/] {config_dir}")
+    console.print(f"  files:   {', '.join(b.files) or '[yellow]none[/]'}")
+    console.print(f"  secrets: {len(b.secrets)} ({len(b.local_only)} local_only)"
+                  f"{'  + auth PIN' if b.pin else ''}")
+    if missing:
+        console.print(f"[yellow]! {len(missing)} key(s) referenced but not in keychain (not exported):[/] "
+                      f"{', '.join(missing)}")
+
+    passphrase = _prompt_new_passphrase()
+    with console.status("Encrypting (scrypt)…"):
+        sealed = bn.seal(b, passphrase)
+        # Prove the file opens before telling the user to rely on it.
+        if bn.unseal(sealed, passphrase).secrets != b.secrets:
+            console.print("[red]✗ Self-check failed — bundle did not round-trip. Nothing written.[/]")
+            raise typer.Exit(1)
+
+    fd = os.open(out, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(sealed + "\n")
+    os.chmod(out, 0o600)
+    console.print(f"[green]✓[/] Wrote [cyan]{out.resolve()}[/] (0600, encrypted, verified).")
+    console.print("[dim]Move it to the new machine, run `atc import <file>`, then delete it on both ends.[/]")
+
+
+@app.command("import")
+def import_cmd(
+    src: Path = typer.Argument(..., help="Bundle file from `atc export`"),
+    overwrite: bool = typer.Option(
+        False, "--overwrite", help="Replace secrets/PIN that already exist with a different value"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Decrypt and show what would change; write nothing"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation"),
+) -> None:
+    """Restore secrets + config from an `atc export` bundle.
+
+    Secrets go into this machine's keychain backend. Config files land in
+    ~/.config/atc (or $ATC_CONFIG's dir); a differing existing file is
+    renamed to <name>.bak-<timestamp> first. Existing secrets with a
+    different value are kept unless --overwrite.
+    """
+    import keyring
+    from lib import bundle as bn
+
+    src = src.expanduser()
+    if not src.is_file():
+        console.print(f"[red]{src} not found.[/]")
+        raise typer.Exit(1)
+    passphrase = getpass.getpass("Bundle passphrase: ")
+    try:
+        with console.status("Decrypting (scrypt)…"):
+            b = bn.unseal(src.read_text(), passphrase)
+    except bn.BundleError as e:
+        console.print(f"[red]✗ {e}[/]")
+        raise typer.Exit(1) from None
+
+    config_dir = _bundle_config_dir()
+    p = bn.plan(b, keyring, KEYCHAIN_SERVICE, config_dir)
+    console.print(f"[bold]Bundle:[/] from [cyan]{b.source_host}[/] at {b.created}")
+    console.print(f"[bold]Target:[/] {config_dir}  ·  keyring: {type(keyring.get_keyring()).__name__}")
+    console.print(f"  files:   write {p.files_written or '—'}  ·  unchanged {p.files_same or '—'}")
+    if p.files_backed_up:
+        console.print(f"  [yellow]backup first:[/] {', '.join(p.files_backed_up)}")
+    console.print(f"  secrets: {len(p.secrets_added)} new · {len(p.secrets_same)} unchanged · "
+                  f"{len(p.secrets_skipped)} differ")
+    if p.secrets_skipped:
+        verb = "will be REPLACED" if overwrite else "kept as-is (use --overwrite to replace)"
+        console.print(f"  [yellow]differ, {verb}:[/] {', '.join(p.secrets_skipped)}")
+    if p.pin != "none":
+        pin_state = "replaced" if (p.pin == "skipped" and overwrite) else p.pin
+        console.print(f"  auth PIN: {pin_state}")
+
+    if dry_run:
+        console.print("[dim]Dry run — nothing written.[/]")
+        return
+    if not yes and not Confirm.ask("Apply?"):
+        raise typer.Exit(0)
+
+    r = bn.apply(b, keyring, KEYCHAIN_SERVICE, config_dir, overwrite=overwrite)
+    if r.verify_failed:
+        console.print(f"[red]✗ Read-back failed for:[/] {', '.join(r.verify_failed)}")
+        raise typer.Exit(1)
+    n = len(r.secrets_added) + len(r.secrets_replaced)
+    console.print(f"[green]✓[/] {n} secret(s) written and read back, "
+                  f"{len(r.files_written)} file(s) written to {config_dir}.")
+    console.print("[dim]Next: `atc acars` to confirm everything resolves, then delete the bundle file.[/]")
 
 
 # ── auth ──────────────────────────────────────────────────────────────────────

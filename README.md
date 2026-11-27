@@ -376,6 +376,29 @@ atc  Air Traffic Control — homelab management CLI
         containers with their version status.
 ```
 
+## Moving to a new machine
+
+Secrets live in the OS keychain (macOS Keychain, or the encrypted file
+backend on Linux), so they don't travel with a repo clone or a dotfile copy.
+
+```bash
+# old machine
+atc export                 # -> ./atc-export-<host>-<date>.atcbundle (0600)
+# copy the file over (AirDrop/scp), then on the new machine:
+atc import <file> --dry-run
+atc import <file>
+atc acars                  # everything should resolve
+rm <file>                  # on both machines
+```
+
+The bundle holds every indexed secret, `local_only` flags, the auth PIN and
+`config.yaml` + `guest_users.yaml` + `guest_update_cmds.yaml`, encrypted with
+scrypt + AES-256-GCM under a passphrase (12+ chars). Config lands in
+`~/.config/atc` (or `$ATC_CONFIG`'s dir); a differing existing file is
+renamed to `*.bak-<timestamp>` first. Secrets that already exist with a
+different value are kept unless you pass `--overwrite`. Runtime state and the
+Linux `keyring.key` are not exported.
+
 ## Updating
 
 ```bash
