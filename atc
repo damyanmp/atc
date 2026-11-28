@@ -30,7 +30,13 @@ else
     CONFIG_FILE="$SCRIPT_DIR/config.yaml"
 fi
 
-if [[ ! -f "$CONFIG_FILE" ]]; then
+# Commands that create the config (or need none) must run without one.
+case "${1:-}" in
+    import|init|export|--help|-h|"") _NEEDS_CONFIG=0 ;;
+    *) _NEEDS_CONFIG=1 ;;
+esac
+
+if [[ "$_NEEDS_CONFIG" == 1 && ! -f "$CONFIG_FILE" ]]; then
     echo "Error: config.yaml not found."
     echo "Copy the template and fill in your values, then put it at"
     echo "~/.config/atc/config.yaml (recommended) or set \$ATC_CONFIG:"
